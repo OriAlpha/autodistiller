@@ -90,7 +90,7 @@ def check_dataset_available(spec: DatasetSpec) -> None:
     rules tighten.
     """
     if spec.source == "hub":
-        # `datasets` v3 dropped un-namespaced canonical ids -- plain 'wikitext'
+        # `datasets` v3 dropped un-namespaced canonical ids. Plain 'wikitext'
         # now fails with an opaque URI parsing error deep inside the library.
         if "/" not in spec.path:
             raise ValueError(
@@ -173,7 +173,7 @@ def load_multiple_choice(
          "answer_index": 0}
 
     Choices normally carry their own leading space: scoring appends them to the
-    context verbatim so tokenisation matches what a real prompt would produce.
+    context verbatim so tokenization matches what a real prompt would produce.
 
     ``transform`` adapts a hub dataset's native schema into that shape; see
     :mod:`autodistiller.evaluation.preprocessors`.

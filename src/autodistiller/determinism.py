@@ -1,7 +1,7 @@
 """Seeding and determinism controls.
 
 Phase 1's milestone is a *trustworthy* baseline. A baseline that moves by 0.3
-perplexity between identical runs cannot be used to judge whether a quantised
+perplexity between identical runs cannot be used to judge whether a quantized
 candidate regressed, so runs are seeded and cuDNN autotuning is pinned.
 """
 

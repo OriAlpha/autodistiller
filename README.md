@@ -2,6 +2,11 @@
 
 **Automatically find the best LLM deployment configuration for your hardware and quality constraints.**
 
+[![CI](https://github.com/OriAlpha/autodistiller/actions/workflows/ci.yml/badge.svg)](https://github.com/OriAlpha/autodistiller/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/autodistiller)](https://pypi.org/project/autodistiller/)
+[![Python](https://img.shields.io/pypi/pyversions/autodistiller)](https://pypi.org/project/autodistiller/)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+
 AutoDistiller is the automation layer *above* established compression and serving backends. You
 provide a model, a deployment backend, hardware and constraints; AutoDistiller evaluates realistic
 candidates, benchmarks them in the target runtime, and recommends the best qualifying
@@ -40,6 +45,12 @@ constrained optimization, experiment cache, Pareto analysis, export) are on the
 ## Setup
 
 AutoDistiller uses [uv](https://docs.astral.sh/uv/) as its standard project and dependency manager.
+
+```bash
+pip install autodistiller
+```
+
+Or, for development on the project itself:
 
 ```bash
 uv sync
@@ -214,6 +225,10 @@ uv run ruff check . && uv run ruff format --check .
 The suite runs on CPU in a few seconds against a tiny model built in-process, so the full
 load → evaluate → record → compare path is covered without downloading anything.
 
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the full workflow, and
+[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) for community expectations. Security issues go through
+[SECURITY.md](SECURITY.md) rather than the public tracker.
+
 ---
 
 ## Releasing
@@ -276,4 +291,4 @@ are not merged.
 
 ## License
 
-Apache-2.0
+Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).

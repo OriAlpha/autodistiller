@@ -1,0 +1,41 @@
+name: Feature request
+description: Suggest a capability, backend, or evaluation task
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do
+      description: The deployment problem you are stuck on, not just the feature you have in mind.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would help
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Evaluation tasks or metrics
+        - Compression backend
+        - Deployment backend (vLLM, llama.cpp, other)
+        - Hardware support
+        - CLI or reporting
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Anything else
+      description: >
+        Model, hardware and constraints you are working under. AutoDistiller is
+        an orchestration layer over existing compression and serving libraries,
+        so if a library already does this, link it.

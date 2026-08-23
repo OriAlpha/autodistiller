@@ -2,10 +2,10 @@
 
 Phase 1 exposes the evaluation engine:
 
-* ``autodistiller env`` -- what hardware and software stack will be recorded
-* ``autodistiller evaluate`` -- measure a model and save a run record
-* ``autodistiller compare`` -- check a candidate against a baseline
-* ``autodistiller runs`` / ``show`` -- browse past runs
+    env       what hardware and software stack will be recorded
+    evaluate  measure a model and save a run record
+    compare   check a candidate against a baseline
+    runs/show browse past runs
 
 The ``optimize`` command from the roadmap arrives once Phases 2-5 land; it will
 call the same evaluation engine underneath.

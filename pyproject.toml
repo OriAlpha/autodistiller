@@ -4,14 +4,25 @@ version = "0.1.0"
 description = "Automatically find the best LLM deployment configuration for your hardware and quality constraints."
 readme = "README.md"
 requires-python = ">=3.10,<3.14"
-license = { text = "Apache-2.0" }
-authors = [{ name = "AutoDistiller contributors" }]
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "Suhas", email = "41699212+OriAlpha@users.noreply.github.com" }]
+maintainers = [{ name = "Suhas", email = "41699212+OriAlpha@users.noreply.github.com" }]
 keywords = ["llm", "quantization", "evaluation", "vllm", "deployment", "optimization"]
 classifiers = [
     "Development Status :: 3 - Alpha",
+    "Environment :: GPU :: NVIDIA CUDA",
     "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
 ]
 
 dependencies = [
@@ -39,7 +50,9 @@ autodistiller = "autodistiller.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/OriAlpha/autodistiller"
+Repository = "https://github.com/OriAlpha/autodistiller"
 Issues = "https://github.com/OriAlpha/autodistiller/issues"
+Changelog = "https://github.com/OriAlpha/autodistiller/blob/main/CHANGELOG.md"
 
 [dependency-groups]
 dev = [

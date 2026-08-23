@@ -2,7 +2,7 @@
 
 Public multiple-choice datasets each ship their own schema. Rather than teach the
 loader about every one, a task names a preprocessor and the loader resolves it
-here. Names, not function objects, keep a ``RunConfig`` serialisable and hashable
+here. Names, not function objects, keep a ``RunConfig`` serializable and hashable
 -- which is what lets Phase 6 cache on it.
 """
 

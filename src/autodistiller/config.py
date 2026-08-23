@@ -1,11 +1,10 @@
 """Reproducible run configuration.
 
-A ``RunConfig`` is the complete, serialisable description of an evaluation:
+A ``RunConfig`` is the complete, serializable description of an evaluation:
 which model, which tasks, which decoding settings, which seed. Two identical
-configs on identical hardware must produce identical numbers -- that property is
-what Phase 6's experiment cache will be built on, so the config hash
-deliberately excludes cosmetic fields (label, output directory) that do not
-affect results.
+configs on identical hardware must produce identical numbers. Phase 6's
+experiment cache will be built on that, so the config hash deliberately excludes
+cosmetic fields (label, output directory) that do not affect results.
 """
 
 from __future__ import annotations
@@ -99,7 +98,7 @@ class MultipleChoiceTask(StrictModel):
         description=(
             "Named row transform applied before column mapping, for hub datasets whose "
             "schema is not already (context, choices, answer_index). Referenced by name "
-            "rather than by function so configs stay serialisable and hashable."
+            "rather than by function so configs stay serializable and hashable."
         ),
     )
 
@@ -114,9 +113,9 @@ class BaselineInferenceSpec(StrictModel):
     """A greedy generation smoke test.
 
     Timings recorded here come from Transformers, not a serving runtime. They
-    exist to prove the model actually runs and to catch gross regressions --
-    never to make deployment performance claims. Phase 2 measures those inside
-    vLLM instead.
+    exist to prove the model actually runs and to catch gross regressions, never
+    to make deployment performance claims. Phase 2 measures those inside vLLM
+    instead.
     """
 
     enabled: bool = True
@@ -166,7 +165,7 @@ class RunConfig(StrictModel):
         payload = self.model_dump(mode="json", exclude=set(self._HASH_EXCLUDED))
         return hash_obj(payload)
 
-    # -- serialisation ---------------------------------------------------
+    # Serialization
     def to_yaml(self) -> str:
         return yaml.safe_dump(self.model_dump(mode="json"), sort_keys=False, allow_unicode=True)
 

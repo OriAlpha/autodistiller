@@ -2,7 +2,7 @@
 
 Phase 1 only needs to *record* the hardware a measurement ran on. Phase 2 turns
 this into deployment profiling, so the shape of the data is deliberately richer
-than Phase 1 strictly requires -- compute capability and VRAM are what later
+than Phase 1 strictly requires: compute capability and VRAM are what later
 phases filter candidates on.
 """
 

@@ -1,14 +1,14 @@
 """Quality regression reporting.
 
 A baseline is only worth establishing if something later gets compared against
-it. This module answers one question -- *did quality hold?* -- and, just as
-importantly, refuses to answer it when the two runs are not comparable.
+it. This module answers one question, did quality hold, and refuses to answer
+it when the two runs are not comparable.
 
 Retention is direction-aware, so ``1.0`` always means "as good as the baseline"
 whether the metric is accuracy (higher is better) or perplexity (lower is
 better). A candidate at ``retention = 0.98`` kept 98% of the baseline's quality
 on that metric, and ``--min-retention 0.95`` is the constraint Phase 5 will
-optimise under.
+optimize under.
 """
 
 from __future__ import annotations

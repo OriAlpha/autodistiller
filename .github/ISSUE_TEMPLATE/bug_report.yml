@@ -1,0 +1,45 @@
+name: Bug report
+description: Something produced a wrong number, crashed, or behaved unexpectedly
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you expected, and what you got instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce
+      description: The exact command, or the config file you passed to --config.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: Output of `uv run autodistiller env`. This pins down hardware, CUDA and library versions.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: record
+    attributes:
+      label: Run record (optional)
+      description: >
+        If a run produced the problem, attach `runs/<run_id>/record.json`.
+        It contains the exact config, dataset fingerprints and model commit.
+        It also contains your hostname and hardware, so check before posting.
+      render: json
+
+  - type: textarea
+    id: traceback
+    attributes:
+      label: Traceback (optional)
+      render: python

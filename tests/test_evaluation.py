@@ -2,7 +2,7 @@
 
 The window planner gets its own tests because a subtle off-by-one there silently
 scores tokens twice or skips them, which shifts perplexity without any error
-being raised -- exactly the failure mode a "trustworthy baseline" must not have.
+being raised, which is the failure mode a trustworthy baseline must not have.
 """
 
 from __future__ import annotations
@@ -276,7 +276,7 @@ def test_perplexity_rejects_stride_larger_than_window(loaded_tiny, text_corpus_f
 
 
 def test_batched_perplexity_matches_unbatched(loaded_tiny, text_corpus_file: Path):
-    """Batching is an optimisation; it must not move the number."""
+    """Batching is an optimization; it must not move the number."""
     dataset = DatasetSpec(source="text", path=str(text_corpus_file))
     single = evaluate_perplexity(
         loaded_tiny,

@@ -8,9 +8,9 @@ reproducible.
 
 Two metrics are reported, both standard in the evaluation literature:
 
-* ``acc`` -- argmax over summed log-probability.
-* ``acc_norm`` -- argmax over log-probability per character, which stops long
-  answers from being penalised simply for having more tokens.
+    acc       argmax over summed log-probability
+    acc_norm  argmax over log-probability per character, so long answers are
+              not penalized simply for having more tokens
 """
 
 from __future__ import annotations
@@ -49,14 +49,14 @@ def _encode_pair(
 
     Encoding the concatenation (rather than the two halves separately) keeps any
     token that merges across the boundary attributed the way a real prompt would
-    tokenise it.
+    tokenize it.
     """
     context_ids = tokenizer(context, add_special_tokens=True)["input_ids"]
     full_ids = tokenizer(context + continuation, add_special_tokens=True)["input_ids"]
 
     n_continuation = len(full_ids) - len(context_ids)
     if n_continuation <= 0:
-        # Degenerate tokenisation (e.g. the continuation merged entirely into the
+        # Degenerate tokenization (e.g. the continuation merged entirely into the
         # last context token). Fall back to scoring the final token.
         n_continuation = 1
 

@@ -18,7 +18,7 @@ DIGEST_LENGTH = 16
 
 
 def _canonical(obj: Any) -> Any:
-    """Recursively normalise an object into something json.dumps can order."""
+    """Recursively normalize an object into something json.dumps can order."""
     if isinstance(obj, Mapping):
         return {str(k): _canonical(obj[k]) for k in sorted(obj, key=str)}
     if isinstance(obj, (list, tuple)):
@@ -33,7 +33,7 @@ def _canonical(obj: Any) -> Any:
 
 
 def hash_obj(obj: Any, *, length: int = DIGEST_LENGTH) -> str:
-    """Hash any JSON-ish object with key order and float formatting normalised."""
+    """Hash any JSON-ish object with key order and float formatting normalized."""
     payload = json.dumps(_canonical(obj), sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:length]
 

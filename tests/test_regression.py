@@ -165,7 +165,7 @@ def test_library_upgrade_is_reported():
 
 
 def test_changed_architecture_is_informational():
-    """Expected after compression -- worth stating, not worth blocking."""
+    """Expected after compression: worth stating, not worth blocking."""
     report = compare_runs(
         _record("base", architecture_fingerprint="arch-1"),
         _record("cand", architecture_fingerprint="arch-2"),

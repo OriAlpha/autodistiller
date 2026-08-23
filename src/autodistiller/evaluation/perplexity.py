@@ -1,17 +1,15 @@
-"""Strided perplexity -- the cheap screening metric.
+"""Strided perplexity, the cheap screening metric.
 
 Perplexity is the roadmap's first filter: it costs one forward pass per window
-and catches a broken quantisation immediately, long before an expensive
+and catches a broken quantization immediately, long before an expensive
 deployment benchmark is worth running.
 
-Two implementation details matter for trustworthiness:
+Windows are strided, so each token is scored once and with as much left context
+as the window allows. Naive chunking scores the first token of every chunk with
+no context at all and inflates the result.
 
-* **Strided windows.** Tokens are scored with as much left context as the window
-  allows, and each token is scored exactly once. Naive chunking scores the first
-  tokens of every chunk with no context and inflates perplexity.
-* **Chunked cross-entropy.** Logits for a 2048-token window over a 150k
-  vocabulary are >1 GiB. The fp32 upcast for the loss is done in slices so peak
-  memory stays bounded on small GPUs.
+Cross-entropy is computed in slices. Logits for a 2048-token window over a 150k
+vocabulary run past 1 GiB, and the fp32 upcast for the loss would double it.
 """
 
 from __future__ import annotations
@@ -87,8 +85,8 @@ def _windows(n_tokens: int, max_length: int, stride: int) -> list[tuple[int, int
     The step is capped at ``max_length - 1`` rather than ``max_length``. A step
     equal to the window would make each window begin exactly where its scored
     region begins, leaving that first token with no context and quietly dropping
-    it from the average -- one lost token per window, and an inflated score for
-    the ones next to it.
+    it from the average: one lost token per window, and an inflated score for the
+    ones next to it.
     """
     if n_tokens < 2:
         return []
@@ -114,8 +112,8 @@ def _batches(plan: list[tuple[int, int, int]], batch_size: int) -> list[list[tup
 
     Windows of different lengths cannot share a batch without padding, and the
     padded positions would need masking. Since only the first and last windows
-    can differ in length, grouping by length costs almost nothing -- and unlike
-    filtering, it never drops a window.
+    can differ in length, grouping by length costs almost nothing, and unlike
+    filtering it never drops a window.
     """
     batches: list[list[tuple[int, int, int]]] = []
     current: list[tuple[int, int, int]] = []
@@ -179,7 +177,7 @@ def evaluate_perplexity(
     input_ids = encoded["input_ids"][0]
     n_tokens = int(input_ids.numel())
     if n_tokens < 2:
-        raise ValueError(f"{corpus.source}: corpus tokenises to {n_tokens} tokens, need >= 2")
+        raise ValueError(f"{corpus.source}: corpus tokenizes to {n_tokens} tokens, need >= 2")
 
     plan = _windows(n_tokens, max_length, stride)
     accumulator = _NLLAccumulator()
@@ -251,9 +249,9 @@ def evaluate_perplexity(
     )
 
 
-def summarise(result: TaskResult) -> str:
+def summarize(result: TaskResult) -> str:
     ppl = result.metric("perplexity")
     return f"{result.name}: ppl={ppl.format() if ppl else 'n/a'} over {result.n_tokens} tokens"
 
 
-__all__ = ["evaluate_perplexity", "summarise"]
+__all__ = ["evaluate_perplexity", "summarize"]

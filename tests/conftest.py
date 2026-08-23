@@ -1,9 +1,9 @@
 """Shared fixtures.
 
-The important one is ``tiny_model``: a real (randomly initialised) Llama and a
+The important one is ``tiny_model``: a real (randomly initialized) Llama and a
 real trained tokenizer, saved to disk. It exercises the genuine load ->
 evaluate -> record path in about a second and needs no network, so the
-end-to-end behaviour is covered by ordinary unit tests rather than only by
+end-to-end behavior is covered by ordinary unit tests rather than only by
 manual runs against a downloaded model.
 """
 

@@ -1,6 +1,6 @@
 """AutoDistiller: automated LLM deployment optimization.
 
-Phase 1 provides the evaluation engine -- the trustworthy baseline every later
+Phase 1 provides the evaluation engine: the trustworthy baseline every later
 phase measures against.
 """
 

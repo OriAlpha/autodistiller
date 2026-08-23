@@ -1,8 +1,8 @@
 """Hugging Face model loading.
 
-AutoDistiller does not implement model loading cleverness -- it delegates to
-Transformers and concentrates on *recording exactly what got loaded*, because
-that identity is what every later comparison depends on.
+Loading is delegated to Transformers. What matters here is recording exactly
+what got loaded, because that identity is what every later comparison depends
+on.
 """
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ MAX_DEFAULT_CONTEXT = 2048
 
 Modern configs advertise 128k+ contexts. Evaluating perplexity at that width
 would allocate enormous logit buffers for no screening benefit, and 2048 is the
-window the quantisation literature conventionally reports against -- so the
+window the quantization literature conventionally reports against, so the
 automatic choice is capped and always written into the run record.
 """
 
@@ -119,8 +119,7 @@ def _architecture_fingerprint(model: Any) -> str:
 
     This identifies the *structure* that was loaded. Two runs whose
     architecture fingerprints differ are not comparable, regardless of what the
-    repo id says -- which is exactly the check that catches a silently changed
-    revision.
+    repo id says. That is the check that catches a silently changed revision.
     """
     entries = [
         (name, tuple(param.shape), str(param.dtype))
