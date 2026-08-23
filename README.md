@@ -2,7 +2,7 @@
 
 **Automatically find the best LLM deployment configuration for your hardware and quality constraints.**
 
-[![CI](https://github.com/OriAlpha/autodistiller/actions/workflows/ci.yml/badge.svg)](https://github.com/OriAlpha/autodistiller/actions/workflows/ci.yml)
+[![CI](https://github.com/OriAlpha/Autodistiller/actions/workflows/ci.yml/badge.svg)](https://github.com/OriAlpha/Autodistiller/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/autodistiller)](https://pypi.org/project/autodistiller/)
 [![Python](https://img.shields.io/pypi/pyversions/autodistiller)](https://pypi.org/project/autodistiller/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)

@@ -31,5 +31,5 @@ First release. Phase 1 of the roadmap: the evaluation engine.
 - Metadata capture for hardware, CUDA, and library versions.
 - CLI: `env`, `tasks`, `evaluate`, `compare`, `runs`, `show`.
 
-[Unreleased]: https://github.com/OriAlpha/autodistiller/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/OriAlpha/autodistiller/releases/tag/v0.1.0
+[Unreleased]: https://github.com/OriAlpha/Autodistiller/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/OriAlpha/Autodistiller/releases/tag/v0.1.0

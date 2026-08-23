@@ -49,10 +49,10 @@ vllm = ["vllm>=0.6"]
 autodistiller = "autodistiller.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/OriAlpha/autodistiller"
-Repository = "https://github.com/OriAlpha/autodistiller"
-Issues = "https://github.com/OriAlpha/autodistiller/issues"
-Changelog = "https://github.com/OriAlpha/autodistiller/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/OriAlpha/Autodistiller"
+Repository = "https://github.com/OriAlpha/Autodistiller"
+Issues = "https://github.com/OriAlpha/Autodistiller/issues"
+Changelog = "https://github.com/OriAlpha/Autodistiller/blob/main/CHANGELOG.md"
 
 [dependency-groups]
 dev = [

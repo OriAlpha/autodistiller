@@ -14,7 +14,7 @@ AutoDistiller is pre-1.0. Only the latest release gets security fixes.
 Please do not open a public issue.
 
 Report privately through GitHub:
-[Security > Report a vulnerability](https://github.com/OriAlpha/autodistiller/security/advisories/new).
+[Security > Report a vulnerability](https://github.com/OriAlpha/Autodistiller/security/advisories/new).
 
 Expect an acknowledgement within a few days. If a fix is needed, we will agree a
 disclosure timeline with you and credit you in the advisory unless you would

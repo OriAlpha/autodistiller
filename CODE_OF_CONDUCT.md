@@ -68,7 +68,7 @@ All complaints will be reviewed and investigated promptly and fairly.
 All community leaders are obligated to respect the privacy and security of the
 reporter of any incident.
 
-[report]: https://github.com/OriAlpha/autodistiller/security/advisories/new
+[report]: https://github.com/OriAlpha/Autodistiller/security/advisories/new
 
 ## Enforcement Guidelines
 
