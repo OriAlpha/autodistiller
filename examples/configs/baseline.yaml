@@ -1,0 +1,70 @@
+# A complete AutoDistiller run configuration.
+#
+#   uv run autodistiller evaluate --config examples/configs/baseline.yaml
+#
+# Every field that can move a number lives here, and the config hash covers all
+# of them. `label` and `output_dir` are deliberately excluded from the hash:
+# renaming a run must not invalidate its cached result.
+
+model:
+  id: Qwen/Qwen3-0.6B
+  # Pin a commit for a genuinely reproducible baseline. Without this, the run
+  # records whichever commit the hub served, which is honest but not pinned.
+  revision: null
+  dtype: auto            # auto | float32 | float16 | bfloat16
+  device: auto           # auto | cpu | cuda | cuda:1
+  trust_remote_code: false
+  attn_implementation: null
+  max_position_embeddings: null
+
+tasks:
+  # Cheap screening: catches a broken configuration in seconds.
+  - kind: perplexity
+    name: wikitext2
+    dataset:
+      source: hub
+      path: Salesforce/wikitext
+      name: wikitext-2-raw-v1
+      split: test
+      text_column: text
+      limit: 256
+    max_length: 2048     # null -> the model's context length, capped at 2048
+    stride: null         # null -> max_length (capped at max_length - 1)
+    batch_size: 1
+
+  # Downstream signal on a public benchmark.
+  - kind: multiple_choice
+    name: arc_easy
+    dataset:
+      source: hub
+      path: allenai/ai2_arc
+      name: ARC-Easy
+      split: test
+      limit: 256
+    preprocessor: arc
+    batch_size: 8
+
+  # Your own eval set. This is usually the one that decides whether a
+  # compressed candidate is actually deployable for your use case.
+  - kind: multiple_choice
+    name: deployment_qa
+    dataset:
+      source: jsonl
+      path: examples/datasets/deployment_qa.jsonl
+      split: test
+    batch_size: 8
+
+baseline_inference:
+  enabled: true
+  prompts:
+    - "The capital of France is"
+    - "Explain in one sentence why the sky appears blue:"
+    - "def fibonacci(n):"
+  max_new_tokens: 32
+  warmup_runs: 1
+  repeats: 3
+  capture_output: true
+
+seed: 1234
+label: fp16-baseline
+output_dir: runs

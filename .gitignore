@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# uv
+# uv.lock IS committed - the roadmap requires pinned, reproducible dependencies.
+
+# Tooling
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# AutoDistiller output
+runs/
+*.local.yaml
+
+# Model and dataset caches
+.cache/
+hf_cache/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

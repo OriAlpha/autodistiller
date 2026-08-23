@@ -1,0 +1,183 @@
+"""Reproducible run configuration.
+
+A ``RunConfig`` is the complete, serialisable description of an evaluation:
+which model, which tasks, which decoding settings, which seed. Two identical
+configs on identical hardware must produce identical numbers -- that property is
+what Phase 6's experiment cache will be built on, so the config hash
+deliberately excludes cosmetic fields (label, output directory) that do not
+affect results.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Annotated, Literal
+
+import yaml
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from .metadata.hashing import hash_obj
+
+DType = Literal["auto", "float32", "float16", "bfloat16"]
+
+
+class StrictModel(BaseModel):
+    """Reject unknown keys so a typo in a YAML config fails loudly."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class ModelSpec(StrictModel):
+    """Which weights to load and how."""
+
+    model_config = ConfigDict(extra="forbid", protected_namespaces=())
+
+    id: str = Field(description="Hugging Face repo id or local path")
+    revision: str | None = Field(default=None, description="Branch, tag or commit sha")
+    dtype: DType = "auto"
+    device: str = Field(default="auto", description="'auto', 'cpu', 'cuda', or 'cuda:1'")
+    trust_remote_code: bool = False
+    attn_implementation: str | None = Field(
+        default=None, description="e.g. 'sdpa', 'eager', 'flash_attention_2'"
+    )
+    max_position_embeddings: int | None = Field(
+        default=None, description="Override the context length reported by the model config"
+    )
+
+
+class DatasetSpec(StrictModel):
+    """Where evaluation text comes from.
+
+    ``source`` distinguishes a Hugging Face hub dataset from local files, which
+    is how "task/custom evaluation datasets" stay a single code path.
+    """
+
+    source: Literal["hub", "jsonl", "text"] = "hub"
+    path: str = Field(description="Hub dataset id, or a local file path for jsonl/text")
+    name: str | None = Field(default=None, description="Hub dataset config name")
+    split: str = "test"
+    text_column: str = "text"
+    limit: int | None = Field(default=None, ge=1, description="Cap on documents/examples")
+
+    @field_validator("limit")
+    @classmethod
+    def _reject_zero(cls, value: int | None) -> int | None:
+        if value is not None and value < 1:
+            raise ValueError("limit must be >= 1")
+        return value
+
+
+class PerplexityTask(StrictModel):
+    """Strided perplexity: the cheap screening metric of the roadmap."""
+
+    kind: Literal["perplexity"] = "perplexity"
+    name: str
+    dataset: DatasetSpec
+    max_length: int | None = Field(
+        default=None, description="Window size; defaults to the model context length (capped)"
+    )
+    stride: int | None = Field(
+        default=None,
+        description="Window step. Defaults to max_length (disjoint windows, fastest).",
+    )
+    batch_size: int = Field(default=1, ge=1)
+    doc_separator: str = "\n\n"
+
+
+class MultipleChoiceTask(StrictModel):
+    """Log-likelihood multiple choice: accuracy on a real downstream task."""
+
+    kind: Literal["multiple_choice"] = "multiple_choice"
+    name: str
+    dataset: DatasetSpec
+    batch_size: int = Field(default=1, ge=1)
+    context_column: str = "context"
+    choices_column: str = "choices"
+    answer_column: str = "answer_index"
+    preprocessor: str | None = Field(
+        default=None,
+        description=(
+            "Named row transform applied before column mapping, for hub datasets whose "
+            "schema is not already (context, choices, answer_index). Referenced by name "
+            "rather than by function so configs stay serialisable and hashable."
+        ),
+    )
+
+
+TaskSpec = Annotated[
+    PerplexityTask | MultipleChoiceTask,
+    Field(discriminator="kind"),
+]
+
+
+class BaselineInferenceSpec(StrictModel):
+    """A greedy generation smoke test.
+
+    Timings recorded here come from Transformers, not a serving runtime. They
+    exist to prove the model actually runs and to catch gross regressions --
+    never to make deployment performance claims. Phase 2 measures those inside
+    vLLM instead.
+    """
+
+    enabled: bool = True
+    prompts: list[str] = Field(
+        default_factory=lambda: [
+            "The capital of France is",
+            "Explain in one sentence why the sky appears blue:",
+            "def fibonacci(n):",
+        ]
+    )
+    max_new_tokens: int = Field(default=32, ge=1)
+    warmup_runs: int = Field(default=1, ge=0)
+    repeats: int = Field(default=1, ge=1)
+    capture_output: bool = Field(
+        default=True, description="Store generated text so drift is human-inspectable"
+    )
+
+
+class RunConfig(StrictModel):
+    """The full, hashable description of an evaluation run."""
+
+    model_config = ConfigDict(extra="forbid", protected_namespaces=())
+
+    model: ModelSpec
+    tasks: list[TaskSpec] = Field(default_factory=list)
+    baseline_inference: BaselineInferenceSpec = Field(default_factory=BaselineInferenceSpec)
+    seed: int = 1234
+    label: str | None = Field(default=None, description="Human label; excluded from the hash")
+    output_dir: Path = Field(default=Path("runs"), description="Excluded from the hash")
+
+    # Fields that describe bookkeeping rather than computation. Changing these
+    # must not invalidate a cached result.
+    _HASH_EXCLUDED = ("label", "output_dir")
+
+    @field_validator("tasks")
+    @classmethod
+    def _unique_task_names(cls, tasks: list[TaskSpec]) -> list[TaskSpec]:
+        seen: set[str] = set()
+        for task in tasks:
+            if task.name in seen:
+                raise ValueError(f"duplicate task name: {task.name!r}")
+            seen.add(task.name)
+        return tasks
+
+    @property
+    def fingerprint(self) -> str:
+        payload = self.model_dump(mode="json", exclude=set(self._HASH_EXCLUDED))
+        return hash_obj(payload)
+
+    # -- serialisation ---------------------------------------------------
+    def to_yaml(self) -> str:
+        return yaml.safe_dump(self.model_dump(mode="json"), sort_keys=False, allow_unicode=True)
+
+    def save(self, path: Path) -> Path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(self.to_yaml(), encoding="utf-8")
+        return path
+
+    @classmethod
+    def from_yaml(cls, path: Path | str) -> RunConfig:
+        raw = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raise ValueError(f"{path}: expected a YAML mapping at the top level")
+        return cls.model_validate(raw)
