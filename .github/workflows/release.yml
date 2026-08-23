@@ -1,0 +1,45 @@
+name: Release
+
+# Publishes to PyPI when a GitHub release is published. Cut a release from a
+# tag matching the pyproject version (e.g. v0.2.0) and this does the rest.
+on:
+  release:
+    types: [published]
+
+jobs:
+  # A bad version on PyPI cannot be replaced or reused, so the tests that gate
+  # merges also gate publishing.
+  test:
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    needs: test
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      # Trusted Publishing: PyPI verifies this workflow via OIDC, so there is
+      # no API token to store, leak or rotate.
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      # PyPI rejects a re-upload of an existing version and version numbers can
+      # never be reused, so a tag/version mismatch has to fail before the build.
+      - name: Check the tag matches the packaged version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(grep -m1 '^version' pyproject.toml | cut -d'"' -f2)"
+          if [ "$tag" != "$pkg" ]; then
+            echo "::error::tag '$tag' does not match pyproject version '$pkg'"
+            exit 1
+          fi
+
+      - name: Build sdist and wheel
+        run: uv build
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

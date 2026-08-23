@@ -216,6 +216,21 @@ load → evaluate → record → compare path is covered without downloading any
 
 ---
 
+## Releasing
+
+Releases publish to PyPI automatically via
+[Trusted Publishing](https://docs.pypi.org/trusted-publishers/) — there is no API token to store
+or rotate.
+
+1. Bump `version` in `pyproject.toml` (`__version__` reads it from package metadata, so there is
+   nothing else to keep in sync).
+2. Commit, then tag and push: `git tag v0.2.0 && git push --tags`
+3. Publish a GitHub release for that tag.
+
+[`release.yml`](.github/workflows/release.yml) then re-runs the full test suite, checks the tag
+matches the packaged version, builds an sdist and wheel with `uv build`, and uploads. PyPI version
+numbers can never be reused, so both gates run before anything is uploaded.
+
 ## Roadmap
 
 | Phase | Scope | Status |
