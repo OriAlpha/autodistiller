@@ -140,3 +140,19 @@ from Windows against a server inside WSL it reported 1.11 GiB while `nvidia-smi`
 on the same device reported 6.8 GiB. AutoDistiller samples through NVML instead,
 which reports the device the way `nvidia-smi` does. See `device_vram_bytes` in
 `metadata/hardware.py`.
+
+## Related: compression environments
+
+Compression runs isolated too, for the same reason vLLM does. `llmcompressor`
+caps `transformers<=5.14.1` while AutoDistiller runs 5.15.x, so installing it
+into the main environment would downgrade transformers and change the stack
+every recorded baseline was measured against.
+
+`autodistiller compress` shells out through `uv run --with llmcompressor`, which
+builds and caches that environment automatically. To reuse a prepared one
+instead:
+
+```bash
+uv run autodistiller compress --model Qwen/Qwen3-0.6B --method fp8 \
+  --compress-python ~/compress-env/bin/python
+```

@@ -17,7 +17,7 @@ algorithm. It composes them, measures them under real deployment conditions, and
 
 ---
 
-## Status: Phase 1 — Evaluation Engine
+## Status: Phases 1–3
 
 Phase 1 is complete and usable on its own. Its milestone is deliberately unglamorous:
 
@@ -35,10 +35,21 @@ good as the baseline it is measured against. So Phase 1 ships:
 | Baseline inference smoke test | [`evaluation/baseline_inference.py`](src/autodistiller/evaluation/baseline_inference.py) |
 | Quality regression reporting | [`regression.py`](src/autodistiller/regression.py) |
 | Model / dataset / library / hardware metadata | [`metadata/`](src/autodistiller/metadata) |
+| Deployment benchmarking in the real serving runtime | [`serving/`](src/autodistiller/serving) |
+| NVIDIA hardware profiles and format capabilities | [`metadata/profiles.py`](src/autodistiller/metadata/profiles.py) |
+| Compression through existing backends | [`compression/`](src/autodistiller/compression) |
 
-Phases 2–10 (hardware profiling, vLLM benchmarking, compression adapters, candidate generation,
-constrained optimization, experiment cache, Pareto analysis, export) are on the
-[roadmap](#roadmap) below.
+Phases 4–10 (candidate generation, constrained optimization, experiment cache, Pareto analysis,
+export) are on the [roadmap](#roadmap) below.
+
+### On isolation
+
+AutoDistiller imports neither vLLM nor llmcompressor. Serving runtimes and compression backends
+have heavy, mutually incompatible pins — llmcompressor caps `transformers<=5.14.1` while
+AutoDistiller runs 5.15.x — and quietly downgrading a library would change the stack every recorded
+baseline was measured against. So both run in their own environments: vLLM over HTTP, compression
+as a subprocess. A useful side effect is that llama.cpp needs no new benchmark client in Phase 9,
+because it speaks the same OpenAI API.
 
 ---
 
@@ -104,7 +115,31 @@ uv run autodistiller evaluate \
   --task ppl:path/to/your/domain_corpus.txt
 ```
 
-### 3. Check a candidate against the baseline
+### 3. Benchmark it in the runtime you will deploy
+
+```bash
+uv run autodistiller benchmark --endpoint http://localhost:8000 --backend vllm --concurrency 1,4,16
+```
+
+Reports TTFT, per-token decode latency, throughput and VRAM at each concurrency level. These are
+deployment claims, measured inside vLLM. Running on Windows? See
+[docs/vllm-on-wsl.md](docs/vllm-on-wsl.md).
+
+### 4. Compress it
+
+```bash
+uv run autodistiller methods
+```
+
+```bash
+uv run autodistiller compress --model Qwen/Qwen3-0.6B --method int4-awq --calibration wikitext2
+```
+
+`methods` lists what this GPU and serving backend can actually use — hardware support (does the
+silicon have the tensor cores?) and backend support (does the runtime have a kernel?) are checked
+separately, because a method can pass one and fail the other.
+
+### 5. Check a candidate against the baseline
 
 ```bash
 uv run autodistiller compare <baseline_run_id> <candidate_run_id> --min-retention 0.95
@@ -112,7 +147,7 @@ uv run autodistiller compare <baseline_run_id> <candidate_run_id> --min-retentio
 
 Exits non-zero when quality did not hold, so it drops straight into CI.
 
-### 4. Browse what you have measured
+### 6. Browse what you have measured
 
 ```bash
 uv run autodistiller runs
@@ -251,9 +286,9 @@ numbers can never be reused, so both gates run before anything is uploaded.
 | Phase | Scope | Status |
 |---|---|---|
 | 1 | Evaluation engine | **done** |
-| 2 | Hardware & deployment profiling (vLLM) | next |
-| 3 | Compression backend integration (LLM Compressor adapters) | planned |
-| 4 | Candidate generator | planned |
+| 2 | Hardware & deployment profiling (vLLM) | **done** |
+| 3 | Compression backend integration (LLM Compressor adapters) | **done** |
+| 4 | Candidate generator | next |
 | 5 | Constrained optimization | planned |
 | 6 | Persistent experiment cache | planned |
 | 7 | Pareto analysis | planned |

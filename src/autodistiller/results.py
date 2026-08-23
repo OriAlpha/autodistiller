@@ -94,6 +94,57 @@ class InferenceResult(BaseModel):
     peak_vram_bytes: int | None = None
 
 
+class CompressionRecipe(BaseModel):
+    """What was asked for.
+
+    Complete enough to reproduce the artifact: algorithm, scheme, what was left
+    alone, and a fingerprint of the calibration data. Calibration text changes
+    the produced weights, so two artifacts with the same method but different
+    calibration are not the same artifact.
+    """
+
+    method: str
+    scheme: str
+    algorithm: str
+    weight_bits: int
+    activation_bits: int
+    ignore: list[str] = Field(default_factory=list)
+    needs_calibration: bool = False
+    n_calibration_samples: int = 0
+    max_seq_length: int = 0
+    calibration_fingerprint: str | None = None
+
+    @property
+    def label(self) -> str:
+        return f"{self.method} ({self.scheme})"
+
+    def describe(self) -> str:
+        return f"W{self.weight_bits}A{self.activation_bits}"
+
+
+class CompressionArtifact(BaseModel):
+    """What was produced, and by which stack."""
+
+    recipe: CompressionRecipe
+    backend: str
+    source_model: str
+    output_dir: str
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    artifact_bytes: int | None = None
+    duration_s: float = 0.0
+    versions: dict[str, str] = Field(default_factory=dict)
+
+    @property
+    def artifact_gib(self) -> float | None:
+        return self.artifact_bytes / 1024**3 if self.artifact_bytes else None
+
+    def compression_ratio(self, baseline_bytes: int | None) -> float | None:
+        """How much smaller than the uncompressed weights, if known."""
+        if not baseline_bytes or not self.artifact_bytes:
+            return None
+        return baseline_bytes / self.artifact_bytes
+
+
 class LatencyStats(BaseModel):
     """Distribution of a latency measurement, in seconds."""
 
@@ -201,6 +252,7 @@ class RunRecord(BaseModel):
     tasks: list[TaskResult] = Field(default_factory=list)
     baseline_inference: InferenceResult | None = None
     deployment: DeploymentBenchmark | None = None
+    compression: CompressionArtifact | None = None
     total_duration_s: float = 0.0
 
     def task(self, name: str) -> TaskResult | None:

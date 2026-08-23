@@ -30,3 +30,4 @@ hf_cache/
 .idea/
 .DS_Store
 Thumbs.db
+artifacts/

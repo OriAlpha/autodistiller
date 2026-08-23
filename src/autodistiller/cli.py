@@ -22,6 +22,8 @@ from rich.progress import BarColumn, Progress, SpinnerColumn, TaskID, TextColumn
 
 from .config import (
     BaselineInferenceSpec,
+    CompressionSpec,
+    DatasetSpec,
     DeploymentSpec,
     ModelSpec,
     MultipleChoiceTask,
@@ -36,6 +38,7 @@ from .metadata.profiles import PROFILES, profile_from_gpu
 from .regression import DEFAULT_MIN_RETENTION, compare_runs
 from .reporting.console import (
     console,
+    render_compression,
     render_deployment,
     render_environment,
     render_hardware,
@@ -359,6 +362,121 @@ def show(
         typer.echo(record.to_json())
     else:
         render_run(record, verbose=verbose)
+
+
+@app.command()
+def methods(
+    backend: str = typer.Option("vllm", "--backend", "-b", help="Serving backend to check against"),
+    all_hardware: bool = typer.Option(
+        False, "--all", help="Ignore the detected GPU and list every method"
+    ),
+) -> None:
+    """List compression methods and whether they are usable here."""
+    from rich.table import Table
+
+    from .compression.methods import available_methods
+
+    hardware = detect_hardware()
+    profile = None
+    if not all_hardware and hardware.gpus:
+        profile = profile_from_gpu(hardware.gpus[0])
+
+    table = Table(header_style="bold")
+    table.add_column("Method")
+    table.add_column("Bits")
+    table.add_column("Scheme")
+    table.add_column("Algorithm")
+    table.add_column("Calibration")
+    table.add_column("Usable here")
+
+    for entry in available_methods(profile=profile, backend=backend):
+        method = entry.method
+        table.add_row(
+            method.name,
+            method.describe_size(),
+            method.scheme,
+            method.algorithm,
+            "required" if method.needs_calibration else "-",
+            "[green]yes[/green]"
+            if entry.available
+            else f"[red]no[/red] [dim]({'; '.join(entry.reasons)})[/dim]",
+        )
+
+    console.print(table)
+    if profile is not None:
+        console.print()
+        console.print(
+            f"Checked against [cyan]{profile.name}[/cyan] "
+            f"({profile.architecture}) and backend [cyan]{backend}[/cyan]."
+        )
+
+
+@app.command()
+def compress(
+    model: str = typer.Option(..., "--model", "-m", help="Hugging Face id or local path"),
+    method: str = typer.Option(..., "--method", help="See `autodistiller methods`"),
+    calibration: str | None = typer.Option(
+        None, "--calibration", help="Calibration corpus: a preset name, ppl:PATH, or a hub id"
+    ),
+    samples: int = typer.Option(128, "--samples", help="Calibration samples"),
+    max_seq_length: int = typer.Option(2048, help="Calibration sequence length"),
+    output_dir: Path | None = typer.Option(None, "--output-dir", "-o"),
+    artifacts_root: Path = typer.Option(Path("artifacts"), "--artifacts-root"),
+    compress_backend: str = typer.Option("llmcompressor", "--compress-backend"),
+    serving_backend: str = typer.Option("vllm", "--serving-backend"),
+    compress_python: str | None = typer.Option(
+        None, "--compress-python", help="Reuse an interpreter that already has the backend"
+    ),
+    trust_remote_code: bool = typer.Option(False),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Produce a compressed artifact through an existing compression backend."""
+    _configure_logging(verbose)
+
+    from .compression.backend import CompressionError
+    from .compression.pipeline import run_compression
+
+    calibration_spec: DatasetSpec | None = None
+    if calibration:
+        try:
+            resolved = resolve_tasks([calibration], limit=samples)[0]
+            calibration_spec = resolved.dataset
+        except (ValueError, FileNotFoundError) as exc:
+            raise typer.BadParameter(f"--calibration: {exc}") from exc
+
+    spec = CompressionSpec(
+        method=method,
+        backend=compress_backend,
+        calibration=calibration_spec,
+        num_calibration_samples=samples,
+        max_seq_length=max_seq_length,
+        output_dir=output_dir,
+        python_executable=compress_python,
+    )
+
+    hardware = detect_hardware()
+    profile = profile_from_gpu(hardware.gpus[0]) if hardware.gpus else None
+
+    try:
+        artifact = run_compression(
+            ModelSpec(id=model, trust_remote_code=trust_remote_code),
+            spec,
+            output_root=artifacts_root,
+            profile=profile,
+            serving_backend=serving_backend,
+            progress=lambda message: console.print(f"[dim]|[/dim] {message}"),
+        )
+    except (KeyError, ValueError, RuntimeError, CompressionError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+
+    console.print()
+    console.print(render_compression(artifact))
+    console.print()
+    console.print(
+        f"[dim]Serve it with:[/dim] vllm serve {artifact.output_dir} "
+        f"--port 8000 --max-model-len 4096"
+    )
 
 
 @app.command()

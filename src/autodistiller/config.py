@@ -169,6 +169,33 @@ class DeploymentSpec(StrictModel):
         return levels
 
 
+class CompressionSpec(StrictModel):
+    """Which compression to apply, and with what calibration data.
+
+    Runs in an isolated environment: llmcompressor caps transformers below the
+    version AutoDistiller uses, and downgrading it in the main environment
+    would change the stack every recorded baseline was measured against.
+    """
+
+    method: str = Field(description="See `autodistiller methods`")
+    backend: str = "llmcompressor"
+    calibration: DatasetSpec | None = Field(
+        default=None, description="Required for calibrated methods (GPTQ, AWQ, INT8 activations)"
+    )
+    num_calibration_samples: int = Field(default=128, ge=1)
+    max_seq_length: int = Field(default=2048, ge=1)
+    ignore: list[str] = Field(
+        default_factory=lambda: ["lm_head"],
+        description="Modules left uncompressed. lm_head is quantization-sensitive.",
+    )
+    output_dir: Path | None = Field(
+        default=None, description="Defaults to a directory named after the method"
+    )
+    python_executable: str | None = Field(
+        default=None, description="Reuse a prepared interpreter instead of `uv run --with`"
+    )
+
+
 class RunConfig(StrictModel):
     """The full, hashable description of an evaluation run."""
 
@@ -178,6 +205,7 @@ class RunConfig(StrictModel):
     tasks: list[TaskSpec] = Field(default_factory=list)
     baseline_inference: BaselineInferenceSpec = Field(default_factory=BaselineInferenceSpec)
     deployment: DeploymentSpec | None = None
+    compression: CompressionSpec | None = None
     seed: int = 1234
     label: str | None = Field(default=None, description="Human label; excluded from the hash")
     output_dir: Path = Field(default=Path("runs"), description="Excluded from the hash")

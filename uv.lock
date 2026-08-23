@@ -338,6 +338,7 @@ version = "0.1.1"
 source = { editable = "." }
 dependencies = [
     { name = "accelerate" },
+    { name = "compressed-tensors" },
     { name = "datasets" },
     { name = "httpx" },
     { name = "huggingface-hub" },
@@ -371,6 +372,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "accelerate", specifier = ">=0.33" },
+    { name = "compressed-tensors", specifier = ">=0.17.0" },
     { name = "datasets", specifier = ">=2.20" },
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "huggingface-hub", specifier = ">=0.24" },

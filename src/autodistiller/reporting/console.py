@@ -193,6 +193,37 @@ def render_deployment(benchmark) -> Table:
     return table
 
 
+def render_compression(artifact) -> Table:
+    """Render a produced artifact and the recipe that made it."""
+    recipe = artifact.recipe
+    table = Table(
+        title=f"Compression artifact - {recipe.label}",
+        title_justify="left",
+        show_header=False,
+        box=None,
+    )
+    table.add_column(style="cyan", no_wrap=True)
+    table.add_column()
+
+    table.add_row("Source model", artifact.source_model)
+    table.add_row("Method", f"{recipe.method} ({recipe.describe()})")
+    table.add_row("Algorithm", recipe.algorithm)
+    table.add_row("Left uncompressed", ", ".join(recipe.ignore) or "-")
+    if recipe.needs_calibration:
+        table.add_row(
+            "Calibration",
+            f"{recipe.n_calibration_samples} samples @ {recipe.max_seq_length} tokens"
+            f" (fingerprint {recipe.calibration_fingerprint})",
+        )
+    else:
+        table.add_row("Calibration", "not required")
+    table.add_row("Artifact", artifact.output_dir)
+    table.add_row("Size on disk", _gib(artifact.artifact_bytes))
+    table.add_row("Backend", f"{artifact.backend} {artifact.versions.get(artifact.backend, '')}")
+    table.add_row("Duration", f"{artifact.duration_s:.1f}s")
+    return table
+
+
 def render_run(record: RunRecord, *, verbose: bool = False) -> None:
     """Print a full run record."""
     status_style = "green" if record.status == "ok" else "red"
@@ -216,6 +247,10 @@ def render_run(record: RunRecord, *, verbose: bool = False) -> None:
     if (panel := render_baseline_inference(record)) is not None:
         console.print()
         console.print(panel)
+
+    if record.compression is not None:
+        console.print()
+        console.print(render_compression(record.compression))
 
     if record.deployment is not None:
         console.print()
@@ -305,6 +340,7 @@ def render_regression(report: RegressionReport) -> None:
 
 __all__ = [
     "console",
+    "render_compression",
     "render_deployment",
     "render_environment",
     "render_hardware",

@@ -373,17 +373,31 @@ def test_device_vram_is_consistent_or_absent():
 
 
 @pytest.mark.gpu
-def test_nvml_sees_memory_torch_cannot():
-    """The reason the sampler uses NVML.
+def test_nvml_tracks_real_allocations():
+    """The sampler must actually move when memory is taken.
 
-    torch.cuda.mem_get_info describes only the calling process's CUDA context,
-    so it under-reports memory held by a serving runtime in another process
-    (or inside the WSL guest). NVML reports the device, like nvidia-smi.
+    A reading that never changes is worse than no reading, because it looks
+    like a measurement. (An earlier version sampled through torch, which cannot
+    see memory held by a server in another process and reported a flat 1.11 GiB
+    at every concurrency level.)
     """
-    from autodistiller.metadata.hardware import current_vram_bytes, device_vram_bytes
+    import torch
 
-    nvml = device_vram_bytes(0)
-    torch_reading = current_vram_bytes(0)
-    if nvml is None or torch_reading is None:
-        pytest.skip("no NVIDIA device")
-    assert (nvml[1] - nvml[0]) >= (torch_reading[1] - torch_reading[0])
+    from autodistiller.metadata.hardware import device_vram_bytes
+
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA device")
+
+    before = device_vram_bytes(0)
+    assert before is not None
+
+    block = torch.zeros(256 * 1024 * 1024 // 4, dtype=torch.float32, device="cuda")  # 256 MiB
+    torch.cuda.synchronize()
+    try:
+        after = device_vram_bytes(0)
+        assert after is not None
+        used_before, used_after = before[1] - before[0], after[1] - after[0]
+        assert used_after > used_before
+    finally:
+        del block
+        torch.cuda.empty_cache()
