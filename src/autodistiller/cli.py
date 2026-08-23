@@ -34,10 +34,11 @@ from .config import (
 from .evaluation.registry import PRESETS, resolve_tasks
 from .metadata.environment import collect_environment
 from .metadata.hardware import detect_hardware
-from .metadata.profiles import PROFILES, profile_from_gpu
+from .metadata.profiles import PROFILES, GPUProfile, profile_from_gpu, resolve_profile
 from .regression import DEFAULT_MIN_RETENTION, compare_runs
 from .reporting.console import (
     console,
+    render_candidates,
     render_compression,
     render_deployment,
     render_environment,
@@ -476,6 +477,123 @@ def compress(
     console.print(
         f"[dim]Serve it with:[/dim] vllm serve {artifact.output_dir} "
         f"--port 8000 --max-model-len 4096"
+    )
+
+
+@app.command()
+def candidates(
+    model: str = typer.Option(..., "--model", "-m", help="Hugging Face id or local path"),
+    backend: str = typer.Option("vllm", "--backend", "-b"),
+    max_vram: str | None = typer.Option(
+        None, "--max-vram", help="Memory budget, e.g. 8GiB. Defaults to the detected GPU."
+    ),
+    concurrency: int = typer.Option(
+        1, "--concurrency", help="Concurrent sequences the KV cache must hold"
+    ),
+    context: str | None = typer.Option(
+        None, "--context", help="Comma-separated context lengths (default 2048,4096,8192)"
+    ),
+    method: list[str] | None = typer.Option(
+        None, "--method", help="Restrict to these methods. Repeatable."
+    ),
+    max_candidates: int = typer.Option(25, "--max-candidates"),
+    no_baseline: bool = typer.Option(False, "--no-baseline", help="Skip the uncompressed entry"),
+    hide_rejected: bool = typer.Option(False, "--hide-rejected"),
+    profile_name: str | None = typer.Option(
+        None, "--profile", help="Target a GPU you do not have, e.g. a100-80gb"
+    ),
+    as_json: bool = typer.Option(False, "--json"),
+) -> None:
+    """Generate the search space: what is worth measuring, and what is not."""
+    from .candidates import generate_candidates, load_shape
+    from .candidates.memory import parse_size
+
+    try:
+        shape = load_shape(model)
+    except Exception as exc:
+        raise typer.BadParameter(f"could not read the config for {model!r}: {exc}") from exc
+
+    hardware = detect_hardware()
+    profile: GPUProfile | None
+    if profile_name:
+        try:
+            profile = resolve_profile(profile_name)
+        except KeyError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+    else:
+        profile = profile_from_gpu(hardware.gpus[0]) if hardware.gpus else None
+
+    budget = None
+    if max_vram:
+        try:
+            budget = parse_size(max_vram)
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+
+    context_lengths = None
+    if context:
+        try:
+            context_lengths = tuple(int(p) for p in context.split(",") if p.strip())
+        except ValueError as exc:
+            raise typer.BadParameter(f"--context must be integers: {exc}") from exc
+
+    try:
+        result = generate_candidates(
+            shape,
+            backend=backend,
+            profile=profile,
+            budget_bytes=budget,
+            methods=tuple(method) if method else None,
+            context_lengths=context_lengths,
+            concurrency=concurrency,
+            include_baseline=not no_baseline,
+            max_candidates=max_candidates,
+        )
+    except KeyError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+    if as_json:
+        typer.echo(
+            json.dumps(
+                {
+                    "model": result.model_id,
+                    "backend": result.backend,
+                    "budget_bytes": result.budget_bytes,
+                    "concurrency": result.concurrency,
+                    "accepted": [
+                        {
+                            "id": c.id,
+                            "method": c.method,
+                            "max_model_len": c.max_model_len,
+                            "kv_dtype": c.kv_dtype,
+                            "estimated_bytes": c.estimate.total_bytes,
+                        }
+                        for c in result.accepted
+                    ],
+                    "rejected": [
+                        {"id": r.candidate.id, "reasons": list(r.reasons)} for r in result.rejected
+                    ],
+                },
+                indent=2,
+            )
+        )
+        return
+
+    console.print(f"[dim]|[/dim] {shape.describe()}")
+    console.print()
+    console.print(render_candidates(result, show_rejected=not hide_rejected))
+    console.print()
+    console.print(
+        f"{len(result.accepted)} of {result.n_considered} configurations fit"
+        + (f" in {result.budget_bytes / 1024**3:.1f} GiB" if result.budget_bytes else "")
+        + f" at concurrency {result.concurrency}."
+    )
+    if result.rejected:
+        summary = ", ".join(f"{k} ({v})" for k, v in result.rejection_summary().items())
+        console.print(f"[dim]Rejected for: {summary}[/dim]")
+    console.print(
+        "[dim]Memory figures are estimates from the model config, "
+        "used to screen before expensive runs.[/dim]"
     )
 
 

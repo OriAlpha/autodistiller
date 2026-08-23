@@ -17,7 +17,7 @@ algorithm. It composes them, measures them under real deployment conditions, and
 
 ---
 
-## Status: Phases 1–3
+## Status: Phases 1–4
 
 Phase 1 is complete and usable on its own. Its milestone is deliberately unglamorous:
 
@@ -38,9 +38,10 @@ good as the baseline it is measured against. So Phase 1 ships:
 | Deployment benchmarking in the real serving runtime | [`serving/`](src/autodistiller/serving) |
 | NVIDIA hardware profiles and format capabilities | [`metadata/profiles.py`](src/autodistiller/metadata/profiles.py) |
 | Compression through existing backends | [`compression/`](src/autodistiller/compression) |
+| Candidate generation and memory screening | [`candidates/`](src/autodistiller/candidates) |
 
-Phases 4–10 (candidate generation, constrained optimization, experiment cache, Pareto analysis,
-export) are on the [roadmap](#roadmap) below.
+Phases 5–10 (constrained optimization, experiment cache, Pareto analysis, export) are on the
+[roadmap](#roadmap) below.
 
 ### On isolation
 
@@ -139,7 +140,21 @@ uv run autodistiller compress --model Qwen/Qwen3-0.6B --method int4-awq --calibr
 silicon have the tensor cores?) and backend support (does the runtime have a kernel?) are checked
 separately, because a method can pass one and fail the other.
 
-### 5. Check a candidate against the baseline
+### 5. See the search space before spending on it
+
+```bash
+uv run autodistiller candidates --model Qwen/Qwen3-0.6B --max-vram 8GiB --concurrency 16
+```
+
+Enumerates compression method × context length × KV cache dtype, then filters by hardware support,
+backend support, and estimated memory. Rejected configurations are listed *with their reasons* —
+a shorter list with no explanation is not an explainable search space.
+
+Memory is estimated from the model's config alone, so a whole search space costs a few kilobytes
+rather than a download per candidate. On Qwen3-0.6B the estimates land within 2% of the artifacts
+that were actually produced, and the KV-cache figure matches what vLLM reports at startup.
+
+### 6. Check a candidate against the baseline
 
 ```bash
 uv run autodistiller compare <baseline_run_id> <candidate_run_id> --min-retention 0.95
@@ -147,7 +162,7 @@ uv run autodistiller compare <baseline_run_id> <candidate_run_id> --min-retentio
 
 Exits non-zero when quality did not hold, so it drops straight into CI.
 
-### 6. Browse what you have measured
+### 7. Browse what you have measured
 
 ```bash
 uv run autodistiller runs
@@ -288,8 +303,8 @@ numbers can never be reused, so both gates run before anything is uploaded.
 | 1 | Evaluation engine | **done** |
 | 2 | Hardware & deployment profiling (vLLM) | **done** |
 | 3 | Compression backend integration (LLM Compressor adapters) | **done** |
-| 4 | Candidate generator | next |
-| 5 | Constrained optimization | planned |
+| 4 | Candidate generator | **done** |
+| 5 | Constrained optimization | next |
 | 6 | Persistent experiment cache | planned |
 | 7 | Pareto analysis | planned |
 | 8 | Export & reproducibility | planned |

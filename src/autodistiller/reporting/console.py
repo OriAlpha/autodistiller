@@ -224,6 +224,56 @@ def render_compression(artifact) -> Table:
     return table
 
 
+def render_candidates(candidate_set, *, show_rejected: bool = True) -> Table:
+    """Render the generated search space.
+
+    Rejected candidates are shown with their reasons: a shorter list with no
+    explanation is not an explainable search space.
+    """
+    table = Table(
+        title=f"Candidates for {candidate_set.model_id} on {candidate_set.backend}",
+        title_justify="left",
+        header_style="bold",
+    )
+    table.add_column("#", justify="right", style="dim")
+    table.add_column("Candidate")
+    table.add_column("Context", justify="right")
+    table.add_column("KV", justify="right")
+    table.add_column("Weights", justify="right")
+    table.add_column("KV cache", justify="right")
+    table.add_column("Est. total", justify="right")
+    table.add_column("Status")
+
+    for index, candidate in enumerate(candidate_set.accepted, start=1):
+        estimate = candidate.estimate
+        table.add_row(
+            str(index),
+            Text(candidate.method or "baseline", style="bold" if candidate.is_baseline else ""),
+            f"{candidate.max_model_len:,}",
+            candidate.kv_dtype,
+            _gib(estimate.weights_bytes),
+            _gib(estimate.kv_cache_bytes),
+            _gib(estimate.total_bytes),
+            Text("fits", style="green"),
+        )
+
+    if show_rejected:
+        for rejection in candidate_set.rejected:
+            candidate = rejection.candidate
+            table.add_row(
+                "-",
+                Text(candidate.method or "baseline", style="dim"),
+                Text(f"{candidate.max_model_len:,}", style="dim"),
+                Text(candidate.kv_dtype, style="dim"),
+                Text(_gib(candidate.estimate.weights_bytes), style="dim"),
+                Text(_gib(candidate.estimate.kv_cache_bytes), style="dim"),
+                Text(_gib(candidate.estimate.total_bytes), style="dim"),
+                Text("; ".join(rejection.reasons), style="yellow"),
+            )
+
+    return table
+
+
 def render_run(record: RunRecord, *, verbose: bool = False) -> None:
     """Print a full run record."""
     status_style = "green" if record.status == "ok" else "red"
@@ -340,6 +390,7 @@ def render_regression(report: RegressionReport) -> None:
 
 __all__ = [
     "console",
+    "render_candidates",
     "render_compression",
     "render_deployment",
     "render_environment",
