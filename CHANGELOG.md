@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-08-23
+
+### Fixed
+
+- Ship the `py.typed` marker in the wheel. 0.1.0 advertised the
+  `Typing :: Typed` classifier but omitted the marker, so type checkers
+  silently ignored the package's annotations for anyone installing from PyPI.
+
 ## [0.1.0] - 2026-08-23
 
 First release. Phase 1 of the roadmap: the evaluation engine.
@@ -31,5 +39,6 @@ First release. Phase 1 of the roadmap: the evaluation engine.
 - Metadata capture for hardware, CUDA, and library versions.
 - CLI: `env`, `tasks`, `evaluate`, `compare`, `runs`, `show`.
 
-[Unreleased]: https://github.com/OriAlpha/Autodistiller/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/OriAlpha/Autodistiller/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/OriAlpha/Autodistiller/releases/tag/v0.1.1
 [0.1.0]: https://github.com/OriAlpha/Autodistiller/releases/tag/v0.1.0
