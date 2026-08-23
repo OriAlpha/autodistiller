@@ -30,6 +30,8 @@ logger = logging.getLogger(__name__)
 
 RUNNER = Path(__file__).with_name("_runner.py")
 DEFAULT_TIMEOUT_S = 3600
+DEFAULT_TORCH_INDEX = "https://download.pytorch.org/whl/cu128"
+"""CUDA wheels for the isolated environment. See ``_command`` for why."""
 
 ProgressFn = Callable[[str], None]
 
@@ -119,13 +121,13 @@ class LLMCompressorBackend(CompressionBackend):
         python_executable: str | None = None,
         requirement: str = "llmcompressor",
         python_version: str = "3.12",
-        torch_backend: str | None = "auto",
+        torch_index: str | None = DEFAULT_TORCH_INDEX,
         timeout_s: int = DEFAULT_TIMEOUT_S,
     ) -> None:
         self.python_executable = python_executable
         self.requirement = requirement
         self.python_version = python_version
-        self.torch_backend = torch_backend
+        self.torch_index = torch_index
         self.timeout_s = timeout_s
 
     def _command(self) -> list[str]:
@@ -138,17 +140,19 @@ class LLMCompressorBackend(CompressionBackend):
                 "uv is not on PATH. Install uv, or pass --compress-python pointing at "
                 "an interpreter that already has llmcompressor."
             )
-        return [
-            uv,
-            "run",
-            "--quiet",
-            "--python",
-            self.python_version,
-            "--with",
-            self.requirement,
-            "python",
-            str(RUNNER),
-        ]
+        command = [uv, "run", "--quiet", "--python", self.python_version]
+        if self.torch_index:
+            # Without this the ephemeral environment resolves a CPU-only torch:
+            # `uv run` has no --torch-backend flag and does not read
+            # UV_TORCH_BACKEND. Quantization then runs on CPU, slowly, and AWQ
+            # fails outright because it requires an accelerator.
+            #
+            # The index strategy matters as much as the index. uv defaults to
+            # first-match, which would take every package from the torch mirror
+            # and pin transformers back to 4.x.
+            command += ["--index", self.torch_index, "--index-strategy", "unsafe-best-match"]
+        command += ["--with", self.requirement, "python", str(RUNNER)]
+        return command
 
     def available(self) -> tuple[bool, str]:
         if self.python_executable:
@@ -167,10 +171,6 @@ class LLMCompressorBackend(CompressionBackend):
         command = self._command()
 
         env = dict(os.environ)
-        if self.torch_backend:
-            # The ephemeral environment does not inherit the project's torch
-            # index, so without this it would resolve a CPU build.
-            env.setdefault("UV_TORCH_BACKEND", self.torch_backend)
 
         if progress is not None:
             progress(f"{self.name}: {job.method.name} ({job.method.scheme}) -> {job.output_dir}")

@@ -41,6 +41,9 @@ class CompressionMethod:
     """rtn | gptq | awq. Round-to-nearest needs no calibration data; the others
     fit weights against sample activations and do."""
 
+    # Scheme names are not free-form: they must be preset names the compression
+    # backend recognizes. See test_schemes_are_real_preset_names.
+
     required_capability: str = "int8"
     """Numeric format the hardware must support. See ``capabilities_for``."""
 
@@ -121,14 +124,16 @@ METHODS: dict[str, CompressionMethod] = {
             notes="Dynamic activation scales, so no calibration pass. Ada (sm_89) or newer.",
         ),
         CompressionMethod(
-            name="fp8-weight-only",
-            description="FP8 weights, 16-bit activations",
+            name="fp8-static",
+            description="FP8 weights and activations with static per-tensor scales",
             weight_bits=8,
-            activation_bits=16,
-            scheme="FP8_WEIGHT",
+            activation_bits=8,
+            scheme="FP8",
             algorithm="rtn",
             required_capability="fp8",
-            needs_calibration=False,
+            needs_calibration=True,
+            notes="Static scales are calibrated once, so this needs data but "
+            "avoids per-token scale computation at inference time.",
         ),
     )
 }

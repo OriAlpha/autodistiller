@@ -321,3 +321,37 @@ def test_runner_rejects_an_unknown_algorithm():
     payload = json.loads(completed.stdout)
     assert payload["ok"] is False
     assert "voodoo" in payload["error"]
+
+
+def test_schemes_are_real_preset_names():
+    """Scheme strings are passed straight to the backend, which rejects
+    anything it does not recognize.
+
+    An invented name (FP8_WEIGHT) shipped once and only failed at run time,
+    minutes into a compression job. compressed-tensors is a dependency, so the
+    valid set is checkable here instead.
+    """
+    preset = pytest.importorskip("compressed_tensors.quantization.quant_scheme")
+    valid = set(preset.PRESET_SCHEMES)
+
+    for method in METHODS.values():
+        assert method.scheme in valid, (
+            f"{method.name} declares scheme {method.scheme!r}, "
+            f"which is not a preset. Valid: {', '.join(sorted(valid))}"
+        )
+
+
+def test_cuda_index_is_configured_for_the_isolated_environment():
+    """`uv run` has no --torch-backend flag and ignores UV_TORCH_BACKEND, so
+    without an explicit index the isolated environment silently resolves a
+    CPU-only torch and AWQ cannot run at all."""
+    backend = LLMCompressorBackend()
+    command = backend._command()
+    assert "--index" in command
+    assert any("download.pytorch.org" in part for part in command)
+
+
+def test_an_explicit_interpreter_skips_the_index():
+    command = LLMCompressorBackend(python_executable=sys.executable)._command()
+    assert "--index" not in command
+    assert command[0] == sys.executable

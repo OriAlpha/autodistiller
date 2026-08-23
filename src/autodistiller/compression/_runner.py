@@ -32,6 +32,17 @@ def _emit(payload: dict) -> None:
     sys.stdout.flush()
 
 
+def _dtype_kwarg() -> str:
+    """Transformers renamed `torch_dtype` to `dtype` in v5.
+
+    The isolated environment resolves its own transformers, which may be either
+    major version, so the runner cannot assume the one AutoDistiller uses.
+    """
+    import transformers
+
+    return "dtype" if int(transformers.__version__.split(".")[0]) >= 5 else "torch_dtype"
+
+
 def _versions() -> dict[str, str]:
     from importlib import metadata
 
@@ -113,7 +124,10 @@ def run(job: dict) -> dict:
 
     tokenizer = AutoTokenizer.from_pretrained(model_id, **common)
     model = AutoModelForCausalLM.from_pretrained(
-        model_id, dtype=job.get("dtype", "auto"), device_map=job.get("device_map", "auto"), **common
+        model_id,
+        device_map=job.get("device_map", "auto"),
+        **{_dtype_kwarg(): job.get("dtype", "auto")},
+        **common,
     )
 
     modifier = _build_modifier(job)
