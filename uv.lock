@@ -339,6 +339,7 @@ source = { editable = "." }
 dependencies = [
     { name = "accelerate" },
     { name = "datasets" },
+    { name = "httpx" },
     { name = "huggingface-hub" },
     { name = "nvidia-ml-py", marker = "sys_platform != 'darwin'" },
     { name = "psutil" },
@@ -371,6 +372,7 @@ dev = [
 requires-dist = [
     { name = "accelerate", specifier = ">=0.33" },
     { name = "datasets", specifier = ">=2.20" },
+    { name = "httpx", specifier = ">=0.28.1" },
     { name = "huggingface-hub", specifier = ">=0.24" },
     { name = "nvidia-ml-py", marker = "sys_platform != 'darwin'", specifier = ">=12.535" },
     { name = "psutil", specifier = ">=5.9" },

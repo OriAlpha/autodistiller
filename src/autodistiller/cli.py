@@ -22,6 +22,7 @@ from rich.progress import BarColumn, Progress, SpinnerColumn, TaskID, TextColumn
 
 from .config import (
     BaselineInferenceSpec,
+    DeploymentSpec,
     ModelSpec,
     MultipleChoiceTask,
     PerplexityTask,
@@ -31,17 +32,19 @@ from .config import (
 from .evaluation.registry import PRESETS, resolve_tasks
 from .metadata.environment import collect_environment
 from .metadata.hardware import detect_hardware
+from .metadata.profiles import PROFILES, profile_from_gpu
 from .regression import DEFAULT_MIN_RETENTION, compare_runs
 from .reporting.console import (
     console,
+    render_deployment,
     render_environment,
     render_hardware,
     render_regression,
     render_run,
 )
-from .results import RunRecord
+from .results import ModelInfo, RunRecord
 from .runner import RunObserver, preflight, run_evaluation
-from .store import RunStore
+from .store import RunStore, make_run_id
 
 app = typer.Typer(
     name="autodistiller",
@@ -356,6 +359,152 @@ def show(
         typer.echo(record.to_json())
     else:
         render_run(record, verbose=verbose)
+
+
+@app.command()
+def backends() -> None:
+    """List deployment backends and how to launch them."""
+    from .serving.backends import BACKENDS
+
+    for backend in BACKENDS.values():
+        console.print(f"[bold cyan]{backend.name}[/bold cyan]  {backend.description}")
+        console.print(f"  default port     {backend.default_port}")
+        console.print(f"  ignore_eos       {'yes' if backend.supports_ignore_eos else 'no'}")
+        console.print(f"  launch           {backend.launch_command('<model>')}")
+        if backend.notes:
+            console.print(f"  [dim]{backend.notes}[/dim]")
+        console.print()
+
+
+@app.command()
+def profiles() -> None:
+    """List known NVIDIA hardware profiles and their numeric-format support."""
+    from rich.table import Table
+
+    table = Table(header_style="bold")
+    table.add_column("Profile")
+    table.add_column("VRAM", justify="right")
+    table.add_column("Compute")
+    table.add_column("Architecture")
+    table.add_column("Formats")
+
+    for name in sorted(PROFILES):
+        profile = PROFILES[name]
+        table.add_row(
+            name,
+            f"{profile.vram_gib:g} GiB",
+            profile.compute_capability,
+            profile.architecture,
+            ", ".join(sorted(profile.capabilities)),
+        )
+    console.print(table)
+
+    detected = detect_hardware()
+    if detected.gpus:
+        found = profile_from_gpu(detected.gpus[0])
+        console.print()
+        console.print(
+            f"Detected: [cyan]{found.name}[/cyan] "
+            f"({found.vram_gib:.1f} GiB, {found.architecture}) - "
+            f"supports {', '.join(sorted(found.capabilities))}"
+        )
+
+
+@app.command()
+def benchmark(
+    endpoint: str = typer.Option("http://localhost:8000", "--endpoint", "-e"),
+    backend: str = typer.Option("vllm", "--backend", "-b", help="Runtime being measured"),
+    served_model: str | None = typer.Option(
+        None, "--served-model", help="Defaults to whatever the endpoint reports"
+    ),
+    prompt_tokens: int = typer.Option(256, help="Approximate prompt length"),
+    max_tokens: int = typer.Option(128, help="Output tokens per request"),
+    concurrency: str = typer.Option("1,4,16", help="Comma-separated concurrency levels"),
+    requests: int | None = typer.Option(
+        None, "--requests", "-n", help="Requests per level (default: 4x concurrency, min 8)"
+    ),
+    warmup: int = typer.Option(2, help="Warmup requests before measuring"),
+    use_chat: bool = typer.Option(False, "--chat", help="Use /v1/chat/completions"),
+    save: bool = typer.Option(True, help="Write a run record"),
+    output_dir: Path = typer.Option(Path("runs"), "--output-dir", "-o"),
+    as_json: bool = typer.Option(False, "--json"),
+) -> None:
+    """Benchmark a running serving endpoint. These numbers are deployment claims."""
+    import asyncio
+
+    from .serving.backends import resolve_backend
+    from .serving.benchmark import run_deployment_benchmark
+
+    try:
+        chosen = resolve_backend(backend)
+    except KeyError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+    try:
+        levels = tuple(int(part) for part in concurrency.split(",") if part.strip())
+    except ValueError as exc:
+        raise typer.BadParameter(f"--concurrency must be integers: {exc}") from exc
+    if not levels:
+        raise typer.BadParameter("--concurrency needs at least one level")
+
+    spec = DeploymentSpec(
+        backend=chosen.name,
+        endpoint=endpoint,
+        served_model=served_model,
+        prompt_tokens=prompt_tokens,
+        max_tokens=max_tokens,
+        concurrency_levels=list(levels),
+        requests_per_level=requests,
+        warmup_requests=warmup,
+        use_chat=use_chat,
+    )
+
+    try:
+        result = asyncio.run(
+            run_deployment_benchmark(
+                url=spec.endpoint,
+                backend=spec.backend,
+                model=spec.served_model,
+                prompt_tokens=spec.prompt_tokens,
+                max_tokens=spec.max_tokens,
+                concurrency_levels=tuple(spec.concurrency_levels),
+                requests_per_level=spec.requests_per_level,
+                warmup_requests=spec.warmup_requests,
+                use_chat=spec.use_chat,
+                ignore_eos=chosen.supports_ignore_eos,
+                device_index=spec.device_index,
+                progress=lambda message: console.print(f"[dim]|[/dim] {message}"),
+            )
+        )
+    except (ConnectionError, ValueError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        console.print(
+            f"[dim]Start one with:[/dim] {chosen.launch_command(served_model or '<model>')}"
+        )
+        raise typer.Exit(code=1) from exc
+
+    if as_json:
+        typer.echo(json.dumps(result.model_dump(mode="json"), indent=2))
+        return
+
+    console.print()
+    console.print(render_deployment(result))
+
+    if save:
+        config = RunConfig(
+            model=ModelSpec(id=result.served_model), deployment=spec, output_dir=output_dir
+        )
+        record = RunRecord(
+            run_id=make_run_id(config),
+            config=config,
+            config_fingerprint=config.fingerprint,
+            model=ModelInfo(id=result.served_model),
+            hardware=detect_hardware(),
+            environment=collect_environment(),
+            deployment=result,
+        )
+        directory = RunStore(output_dir).save(record)
+        console.print(f"[dim]|[/dim] Saved run to {directory}")
 
 
 def main() -> None:

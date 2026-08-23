@@ -134,6 +134,41 @@ class BaselineInferenceSpec(StrictModel):
     )
 
 
+class DeploymentSpec(StrictModel):
+    """How to benchmark a running serving endpoint.
+
+    AutoDistiller measures a server it did not start, so the endpoint is part of
+    the configuration rather than something the tool provisions. See
+    :mod:`autodistiller.serving.backends` for why.
+    """
+
+    backend: str = "vllm"
+    endpoint: str = "http://localhost:8000"
+    served_model: str | None = Field(
+        default=None, description="Defaults to whatever the endpoint reports serving"
+    )
+    prompt_tokens: int = Field(default=256, ge=1)
+    max_tokens: int = Field(default=128, ge=1)
+    concurrency_levels: list[int] = Field(default_factory=lambda: [1, 4, 16])
+    requests_per_level: int | None = Field(default=None, ge=1)
+    warmup_requests: int = Field(default=2, ge=0)
+    use_chat: bool = Field(
+        default=False,
+        description="Use /v1/chat/completions. Defaults to /v1/completions, which "
+        "avoids chat-template differences between backends.",
+    )
+    device_index: int = 0
+
+    @field_validator("concurrency_levels")
+    @classmethod
+    def _positive_levels(cls, levels: list[int]) -> list[int]:
+        if not levels:
+            raise ValueError("need at least one concurrency level")
+        if any(level < 1 for level in levels):
+            raise ValueError("concurrency levels must be >= 1")
+        return levels
+
+
 class RunConfig(StrictModel):
     """The full, hashable description of an evaluation run."""
 
@@ -142,6 +177,7 @@ class RunConfig(StrictModel):
     model: ModelSpec
     tasks: list[TaskSpec] = Field(default_factory=list)
     baseline_inference: BaselineInferenceSpec = Field(default_factory=BaselineInferenceSpec)
+    deployment: DeploymentSpec | None = None
     seed: int = 1234
     label: str | None = Field(default=None, description="Human label; excluded from the hash")
     output_dir: Path = Field(default=Path("runs"), description="Excluded from the hash")

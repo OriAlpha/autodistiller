@@ -94,6 +94,72 @@ class InferenceResult(BaseModel):
     peak_vram_bytes: int | None = None
 
 
+class LatencyStats(BaseModel):
+    """Distribution of a latency measurement, in seconds."""
+
+    mean: float
+    p50: float
+    p90: float
+    p99: float
+    min: float
+    max: float
+
+    def format_ms(self) -> str:
+        return f"p50 {self.p50 * 1000:.0f}ms / p90 {self.p90 * 1000:.0f}ms"
+
+
+class ConcurrencyResult(BaseModel):
+    """One rung of the concurrency sweep."""
+
+    concurrency: int
+    n_requests: int
+    n_failed: int = 0
+    duration_s: float
+    ttft: LatencyStats | None = None
+    tpot: LatencyStats | None = Field(
+        default=None, description="Time per output token, excluding prefill"
+    )
+    request_latency: LatencyStats | None = None
+    total_output_tokens: int = 0
+    output_tokens_per_s: float = 0.0
+    requests_per_s: float = 0.0
+    mean_prompt_tokens: float = 0.0
+    peak_vram_bytes: int | None = None
+    errors: list[str] = Field(default_factory=list)
+
+
+class DeploymentBenchmark(BaseModel):
+    """Performance measured inside a real serving runtime.
+
+    Unlike :class:`InferenceResult`, these numbers *are* deployment claims:
+    they came from the runtime the user would actually deploy.
+    """
+
+    backend: str
+    runtime_version: str | None = None
+    endpoint: str
+    served_model: str
+    is_deployment_claim: bool = True
+    prompt_tokens_requested: int = 0
+    max_tokens: int = 0
+    phases: list[ConcurrencyResult] = Field(default_factory=list)
+    device_total_vram_bytes: int | None = None
+
+    @property
+    def peak_vram_bytes(self) -> int | None:
+        peaks = [p.peak_vram_bytes for p in self.phases if p.peak_vram_bytes]
+        return max(peaks) if peaks else None
+
+    @property
+    def best_throughput(self) -> ConcurrencyResult | None:
+        return max(self.phases, key=lambda p: p.output_tokens_per_s, default=None)
+
+    @property
+    def single_stream(self) -> ConcurrencyResult | None:
+        """The concurrency-1 rung: what one user experiences."""
+        return next((p for p in self.phases if p.concurrency == 1), None)
+
+
 class ModelInfo(BaseModel):
     """Resolved identity of the weights that were actually loaded."""
 
@@ -134,6 +200,7 @@ class RunRecord(BaseModel):
 
     tasks: list[TaskResult] = Field(default_factory=list)
     baseline_inference: InferenceResult | None = None
+    deployment: DeploymentBenchmark | None = None
     total_duration_s: float = 0.0
 
     def task(self, name: str) -> TaskResult | None:

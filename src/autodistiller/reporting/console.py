@@ -155,6 +155,44 @@ def _stack(*renderables: RenderableType) -> Table:
     return grid
 
 
+def render_deployment(benchmark) -> Table:
+    """Render a concurrency sweep.
+
+    Unlike the Transformers smoke test, these numbers are deployment claims, so
+    the table names the runtime that produced them.
+    """
+    table = Table(
+        title=(
+            f"Deployment benchmark - {benchmark.backend}"
+            + (f" {benchmark.runtime_version}" if benchmark.runtime_version else "")
+            + f" @ {benchmark.endpoint}"
+        ),
+        title_justify="left",
+        header_style="bold",
+    )
+    table.add_column("Concurrency", justify="right")
+    table.add_column("TTFT p50", justify="right")
+    table.add_column("TTFT p99", justify="right")
+    table.add_column("TPOT p50", justify="right")
+    table.add_column("Throughput", justify="right")
+    table.add_column("Req/s", justify="right")
+    table.add_column("Peak VRAM", justify="right")
+    table.add_column("Failed", justify="right")
+
+    for phase in benchmark.phases:
+        table.add_row(
+            str(phase.concurrency),
+            f"{phase.ttft.p50 * 1000:.0f}ms" if phase.ttft else "-",
+            f"{phase.ttft.p99 * 1000:.0f}ms" if phase.ttft else "-",
+            f"{phase.tpot.p50 * 1000:.1f}ms" if phase.tpot else "-",
+            f"{phase.output_tokens_per_s:.1f} tok/s",
+            f"{phase.requests_per_s:.2f}",
+            _gib(phase.peak_vram_bytes),
+            Text(str(phase.n_failed), style="red") if phase.n_failed else "0",
+        )
+    return table
+
+
 def render_run(record: RunRecord, *, verbose: bool = False) -> None:
     """Print a full run record."""
     status_style = "green" if record.status == "ok" else "red"
@@ -178,6 +216,18 @@ def render_run(record: RunRecord, *, verbose: bool = False) -> None:
     if (panel := render_baseline_inference(record)) is not None:
         console.print()
         console.print(panel)
+
+    if record.deployment is not None:
+        console.print()
+        console.print(render_deployment(record.deployment))
+        total = record.deployment.device_total_vram_bytes
+        console.print(
+            Text(
+                f"Measured in the {record.deployment.backend} runtime."
+                f" Peak VRAM is device-wide" + (f" of {_gib(total)} total" if total else "") + ".",
+                style="dim",
+            )
+        )
 
     if verbose:
         console.print()
@@ -255,6 +305,7 @@ def render_regression(report: RegressionReport) -> None:
 
 __all__ = [
     "console",
+    "render_deployment",
     "render_environment",
     "render_hardware",
     "render_regression",
