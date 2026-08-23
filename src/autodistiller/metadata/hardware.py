@@ -150,3 +150,42 @@ def current_vram_bytes(device_index: int = 0) -> tuple[int, int] | None:
         return int(free), int(total)
     except Exception:
         return None
+
+
+_NVML_READY: bool | None = None
+
+
+def _nvml_handle(device_index: int):
+    """Initialize NVML once and return a device handle, or None."""
+    global _NVML_READY
+    try:
+        import pynvml
+
+        if _NVML_READY is None:
+            pynvml.nvmlInit()
+            _NVML_READY = True
+        return pynvml.nvmlDeviceGetHandleByIndex(device_index)
+    except Exception:
+        _NVML_READY = False
+        return None
+
+
+def device_vram_bytes(device_index: int = 0) -> tuple[int, int] | None:
+    """Return device-wide ``(free, total)`` VRAM, as ``nvidia-smi`` reports it.
+
+    Prefers NVML over :func:`current_vram_bytes`. ``torch.cuda.mem_get_info``
+    only describes the calling process's own CUDA context, so it cannot see
+    memory held by a server in another process -- or, on Windows, by a vLLM
+    instance inside the WSL guest. Benchmarking a serving runtime is exactly
+    that case, and the torch reading silently under-reports it.
+    """
+    handle = _nvml_handle(device_index)
+    if handle is not None:
+        try:
+            import pynvml
+
+            info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            return int(info.free), int(info.total)
+        except Exception:
+            pass
+    return current_vram_bytes(device_index)

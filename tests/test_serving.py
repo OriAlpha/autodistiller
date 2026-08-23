@@ -352,3 +352,38 @@ def test_unknown_backend_lists_the_options():
 def test_all_backends_can_build_a_launch_command():
     for backend in BACKENDS.values():
         assert backend.launch_command("some/model")
+
+
+# --- VRAM sampling ------------------------------------------------------
+
+
+def test_device_vram_is_consistent_or_absent():
+    """Whatever the source, free must never exceed total.
+
+    Returns None on a machine with no NVIDIA device, which is the CI case.
+    """
+    from autodistiller.metadata.hardware import device_vram_bytes
+
+    reading = device_vram_bytes(0)
+    if reading is None:
+        pytest.skip("no NVIDIA device")
+    free, total = reading
+    assert 0 <= free <= total
+    assert total > 0
+
+
+@pytest.mark.gpu
+def test_nvml_sees_memory_torch_cannot():
+    """The reason the sampler uses NVML.
+
+    torch.cuda.mem_get_info describes only the calling process's CUDA context,
+    so it under-reports memory held by a serving runtime in another process
+    (or inside the WSL guest). NVML reports the device, like nvidia-smi.
+    """
+    from autodistiller.metadata.hardware import current_vram_bytes, device_vram_bytes
+
+    nvml = device_vram_bytes(0)
+    torch_reading = current_vram_bytes(0)
+    if nvml is None or torch_reading is None:
+        pytest.skip("no NVIDIA device")
+    assert (nvml[1] - nvml[0]) >= (torch_reading[1] - torch_reading[0])

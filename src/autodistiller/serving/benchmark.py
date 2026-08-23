@@ -20,7 +20,7 @@ from collections.abc import Callable
 
 import httpx
 
-from ..metadata.hardware import current_vram_bytes
+from ..metadata.hardware import device_vram_bytes
 from ..results import ConcurrencyResult, DeploymentBenchmark, LatencyStats
 from .client import RequestMetrics, probe_endpoint, stream_request
 
@@ -80,6 +80,9 @@ class _VramSampler:
     Device-wide, not process-scoped: it includes anything else resident on the
     GPU. That is the right number for "will this deployment fit", and it is the
     only number available when the server runs across a WSL boundary.
+
+    Reads through NVML rather than torch, which reports only the caller's own
+    CUDA context and therefore cannot see a server running in another process.
     """
 
     def __init__(self, device_index: int = 0) -> None:
@@ -90,7 +93,7 @@ class _VramSampler:
         self._stop = asyncio.Event()
 
     def _sample(self) -> None:
-        reading = current_vram_bytes(self.device_index)
+        reading = device_vram_bytes(self.device_index)
         if reading is None:
             return
         free, total = reading

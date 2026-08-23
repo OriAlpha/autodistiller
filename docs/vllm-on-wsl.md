@@ -62,6 +62,40 @@ FileNotFoundError: [Errno 2] No such file or directory: 'ninja'
 uv pip install ninja
 ```
 
+## 4. nvcc and the CUDA runtime headers disagree
+
+```
+error: "CUDA compiler and CUDA toolkit headers are incompatible, please check your include paths"
+```
+
+The vendored wheels can skew: `nvidia-cuda-nvcc` shipped 13.3.73 while
+`nvidia-cuda-runtime` shipped 13.0.96, so `CUDART_VERSION` (13000) did not match
+the compiler (13.3) and flashinfer's bundled cccl refused to build. Align them:
+
+```bash
+uv pip install "nvidia-cuda-runtime>=13.3,<13.4"
+```
+
+Removing flashinfer is not an option; vLLM 0.27 imports it unconditionally.
+
+## 5. The linker cannot find -lcuda / -lcudart
+
+```
+/usr/bin/x86_64-linux-gnu-ld.bfd: cannot find -lcudart: No such file or directory
+```
+
+The libraries exist but only under versioned names (`libcudart.so.13`), and the
+WSL driver directory is not on the default search path. Provide unversioned
+symlinks and point `LIBRARY_PATH` at them:
+
+```bash
+CU=~/vllm-env/lib/python3.12/site-packages/nvidia/cu13
+mkdir -p ~/cudalibs
+ln -sf $CU/lib/libcudart.so.13 ~/cudalibs/libcudart.so
+ln -sf /usr/lib/wsl/lib/libcuda.so.1 ~/cudalibs/libcuda.so
+export LIBRARY_PATH=$HOME/cudalibs:$CU/lib:/usr/lib/wsl/lib
+```
+
 ## Putting it together
 
 ```bash
@@ -98,3 +132,11 @@ utilization if the desktop also needs the GPU; raise it on a headless machine.
 
 `--enforce-eager` skips CUDA graph capture and starts faster, but it measures a
 configuration nobody deploys. Leave it off when benchmarking.
+
+## Measuring VRAM across the WSL boundary
+
+`torch.cuda.mem_get_info` describes only the calling process's CUDA context. Run
+from Windows against a server inside WSL it reported 1.11 GiB while `nvidia-smi`
+on the same device reported 6.8 GiB. AutoDistiller samples through NVML instead,
+which reports the device the way `nvidia-smi` does. See `device_vram_bytes` in
+`metadata/hardware.py`.
