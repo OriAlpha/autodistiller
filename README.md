@@ -1,621 +1,176 @@
 # AutoDistiller
 
-**Automatically find the best LLM deployment configuration for your hardware and quality constraints.**
+**Find the best way to deploy your LLM — automatically.**
 
 [![CI](https://github.com/OriAlpha/Autodistiller/actions/workflows/ci.yml/badge.svg)](https://github.com/OriAlpha/Autodistiller/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/autodistiller)](https://pypi.org/project/autodistiller/)
 [![Python](https://img.shields.io/pypi/pyversions/autodistiller)](https://pypi.org/project/autodistiller/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
-AutoDistiller is the automation layer *above* established compression and serving backends. You
-provide a model, a deployment backend, hardware and constraints; AutoDistiller evaluates realistic
-candidates, benchmarks them in the target runtime, and recommends the best qualifying
-configuration.
+---
 
-It does not implement quantization kernels and does not reimplement AWQ, GPTQ or any other mature
-algorithm. It composes them, measures them under real deployment conditions, and chooses.
+## The problem
+
+You want to run a model on your GPU. Should you quantize it? To INT8, INT4, FP8? Which one keeps
+enough quality? Will it even fit in VRAM? How much faster is it *actually*?
+
+Answering that by hand means compressing several versions, evaluating each, starting a server,
+benchmarking, and tracking what you measured. Hours of work, repeated whenever anything changes.
+
+## What AutoDistiller does
+
+One command:
+
+```bash
+uv run autodistiller optimize --model Qwen/Qwen3-0.6B --max-vram 8GB --min-quality 95
+```
+
+It compresses the realistic options, checks quality against your baseline, benchmarks the survivors
+in a real vLLM or llama.cpp server, and tells you which to deploy — and what you give up by
+choosing it.
+
+```
+ Option                 Candidate   Wins on                      Gives up
+ best quality           baseline    quality retention 100.00%    780 tok/s against a best of 1320
+ fastest (throughput)   int4-awq    peak throughput 1320 tok/s   quality 94.10% against 100.00%
+ smallest               int4-awq    artifact size 0.51 GiB       quality 94.10% against 100.00%
+```
+
+It does not implement quantization itself. It drives the tools that do — LLM Compressor,
+llama.cpp — measures the results honestly, and picks.
 
 ---
 
-## Status: Phases 1–9
-
-Phase 1 is complete and usable on its own. Its milestone is deliberately unglamorous:
-
-> **Establish a trustworthy baseline before any compression is attempted.**
-
-Everything later — candidate generation, constrained optimization, Pareto analysis — is only as
-good as the baseline it is measured against. So Phase 1 ships:
-
-| Capability | Where |
-|---|---|
-| Hugging Face model loading with resolved provenance | [`models/loader.py`](src/autodistiller/models/loader.py) |
-| Reproducible, hashable run configuration | [`config.py`](src/autodistiller/config.py) |
-| Perplexity as a low-cost screening metric | [`evaluation/perplexity.py`](src/autodistiller/evaluation/perplexity.py) |
-| Task + custom evaluation datasets | [`evaluation/datasets.py`](src/autodistiller/evaluation/datasets.py) |
-| Baseline inference smoke test | [`evaluation/baseline_inference.py`](src/autodistiller/evaluation/baseline_inference.py) |
-| Quality regression reporting | [`regression.py`](src/autodistiller/regression.py) |
-| Model / dataset / library / hardware metadata | [`metadata/`](src/autodistiller/metadata) |
-| Deployment benchmarking in the real serving runtime | [`serving/`](src/autodistiller/serving) |
-| NVIDIA hardware profiles and format capabilities | [`metadata/profiles.py`](src/autodistiller/metadata/profiles.py) |
-| Compression through existing backends | [`compression/`](src/autodistiller/compression) |
-| Candidate generation and memory screening | [`candidates/`](src/autodistiller/candidates) |
-| Constrained optimization and ranking | [`optimize/`](src/autodistiller/optimize) |
-| Persistent experiment cache | [`cache.py`](src/autodistiller/cache.py), [`store.py`](src/autodistiller/store.py) |
-| Pareto trade-offs and named recommendations | [`optimize/pareto.py`](src/autodistiller/optimize/pareto.py) |
-| Deployable, reproducible export | [`export.py`](src/autodistiller/export.py) |
-| GGUF and llama.cpp as a second backend | [`compression/gguf.py`](src/autodistiller/compression/gguf.py) |
-
-Phase 10 is post-v1 research, deliberately outside the v1 critical path. See the
-[roadmap](#roadmap) below.
-
-### On isolation
-
-AutoDistiller imports neither vLLM nor llmcompressor. Serving runtimes and compression backends
-have heavy, mutually incompatible pins — llmcompressor caps `transformers<=5.14.1` while
-AutoDistiller runs 5.15.x — and quietly downgrading a library would change the stack every recorded
-baseline was measured against. So both run in their own environments: vLLM over HTTP, compression
-as a subprocess. A useful side effect is that llama.cpp needs no new benchmark client in Phase 9,
-because it speaks the same OpenAI API.
-
----
-
-## Setup
-
-AutoDistiller uses [uv](https://docs.astral.sh/uv/) as its standard project and dependency manager.
+## Install
 
 ```bash
 pip install autodistiller
 ```
 
-Or, for development on the project itself:
-
-```bash
-uv sync
-```
-
-That creates the environment, installs everything from the committed `uv.lock`, and installs
-AutoDistiller in editable mode. Then:
-
-```bash
-uv run autodistiller --help
-```
-
-### GPU builds
-
-`pyproject.toml` points `torch` at the CUDA 12.8 index on Linux and Windows, which covers NVIDIA
-GPUs through Blackwell (`sm_120`). For a CPU-only install:
-
-```bash
-UV_TORCH_BACKEND=cpu uv sync
-```
-
-Check what AutoDistiller detected:
+Check what it found on your machine:
 
 ```bash
 uv run autodistiller env
 ```
 
----
-
-## Quick start
-
-### 1. Establish a baseline
-
-```bash
-uv run autodistiller evaluate --model Qwen/Qwen3-0.6B --task wikitext2 --limit 256
-```
-
-This loads the model, runs a greedy generation smoke test, scores perplexity, and writes a
-complete run record to `runs/<run_id>/`.
-
-### 2. Evaluate on your own data
-
-Public benchmarks tell you about public benchmarks. Your eval set tells you whether a compressed
-model is deployable for *your* use case.
-
-```bash
-uv run autodistiller evaluate \
-  --model Qwen/Qwen3-0.6B \
-  --task wikitext2 \
-  --task mc:examples/datasets/deployment_qa.jsonl \
-  --task ppl:path/to/your/domain_corpus.txt
-```
-
-### 3. Benchmark it in the runtime you will deploy
-
-```bash
-uv run autodistiller benchmark --endpoint http://localhost:8000 --backend vllm --concurrency 1,4,16
-```
-
-Reports TTFT, per-token decode latency, throughput and VRAM at each concurrency level. These are
-deployment claims, measured inside vLLM. Running on Windows? See
-[docs/vllm-on-wsl.md](docs/vllm-on-wsl.md).
-
-### 4. Compress it
-
-```bash
-uv run autodistiller methods
-```
-
-```bash
-uv run autodistiller compress --model Qwen/Qwen3-0.6B --method int4-awq --calibration wikitext2
-```
-
-`methods` lists what this GPU and serving backend can actually use — hardware support (does the
-silicon have the tensor cores?) and backend support (does the runtime have a kernel?) are checked
-separately, because a method can pass one and fail the other.
-
-### 5. See the search space before spending on it
-
-```bash
-uv run autodistiller candidates --model Qwen/Qwen3-0.6B --max-vram 8GiB --concurrency 16
-```
-
-Enumerates compression method × context length × KV cache dtype, then filters by hardware support,
-backend support, and estimated memory. Rejected configurations are listed *with their reasons* —
-a shorter list with no explanation is not an explainable search space.
-
-Memory is estimated from the model's config alone, so a whole search space costs a few kilobytes
-rather than a download per candidate. On Qwen3-0.6B the estimates land within 2% of the artifacts
-that were actually produced, and the KV-cache figure matches what vLLM reports at startup.
-
-### 6. Let it decide for you
-
-```bash
-uv run autodistiller optimize   --model Qwen/Qwen3-0.6B   --backend vllm   --max-vram 8GiB   --min-quality 95   --objective throughput   --calibration wikitext2   --launch-preset wsl-vllm
-```
-
-Generates candidates, screens them on estimated memory, compresses the survivors, scores quality
-against the baseline, benchmarks whatever still qualifies in a real server, and ranks the rest.
-Each stage is more expensive than the last, so a candidate that fails cheaply never costs anything
-more.
-
-The objective sets the search order, which is what makes `--stop-early` (the default) honest: under
-`throughput` the most compressed candidate is tried first, so the first one that holds quality is
-also the fastest one that holds quality. Under `quality` the order reverses.
-
-Without `--launch-preset`, the deployment stage is skipped and ranking falls back to what can be
-measured without a server (quality, size). Latency and throughput constraints require it, and the
-command says so rather than silently ignoring them.
-
-### 7. Check a candidate against the baseline
-
-```bash
-uv run autodistiller compare <baseline_run_id> <candidate_run_id> --min-retention 0.95
-```
-
-Exits non-zero when quality did not hold, so it drops straight into CI.
-
-### 8. Browse what you have measured
-
-```bash
-uv run autodistiller runs
-```
-
-```bash
-uv run autodistiller show <run_id> --verbose
-```
+CPU-only install: `UV_TORCH_BACKEND=cpu uv sync`
 
 ---
 
-## The experiment cache
+## Try it
 
-Nothing is measured twice. `evaluate`, `compress` and `optimize` all check first, and reuse an
-identical earlier result instead of repeating it:
-
-```bash
-uv run autodistiller history
-```
+**See the options before spending anything on them.** Free — it is arithmetic, no GPU needed.
 
 ```bash
-uv run autodistiller history --model Qwen3-0.6B --json
+uv run autodistiller candidates --model Qwen/Qwen3-0.6B --max-vram 8GB
 ```
 
-An experiment is reusable only when everything that could have moved the number is unchanged: the
-config (model, tasks, datasets, seed, compression recipe), the hardware, and the software stack.
-Change the GPU or upgrade torch and the cache misses, as it should. Pass `--refresh` to any of the
-three commands to measure again anyway.
+**Measure your model as it is**, so later numbers mean something.
 
-The stack half of that key is deliberately narrow — `autodistiller`, `torch`, `transformers`,
-`tokenizers`, `datasets`, CUDA and the Python minor version. Keying on every installed package is
-defensible in theory and useless in practice: a `safetensors` patch bump would throw away every
-result without changing any of them.
+```bash
+uv run autodistiller evaluate --model Qwen/Qwen3-0.6B --task wikitext2
+```
 
-Three things are cached, in cost order:
+**Compress one version** and check what it cost.
 
-| What | Keyed on | Where |
+```bash
+uv run autodistiller compress --model Qwen/Qwen3-0.6B --method fp8
+```
+
+**Or let it decide**, and export the winner ready to serve.
+
+```bash
+uv run autodistiller optimize --model Qwen/Qwen3-0.6B --max-vram 8GB \
+  --launch-preset wsl-vllm --export ./my-model
+```
+
+Nothing is measured twice — repeat any of these and it reuses the earlier result.
+
+---
+
+## What it measured
+
+Qwen3-0.6B on an RTX 5070 Laptop (8 GiB), vLLM 0.27, plugged in. Produced by the tool itself.
+
+**Compression** — wikitext-2 perplexity, same baseline for every row:
+
+| Method | Size | Quality kept |
 |---|---|---|
-| Compressed artifacts | model, method, calibration data, `ignore`, dtype | `artifacts/<model>-<method>-<key>/` |
-| Evaluations | config fingerprint + hardware + stack | `runs/<run_id>/record.json` |
-| Deployment benchmarks | served weights, backend, request shape, context length, KV dtype | `runs/<run_id>/record.json` |
+| baseline (bf16) | 1.11 GiB | 100% |
+| `int8-weight-only` | 0.72 GiB | 100.2% |
+| `fp8` | 0.71 GiB | 99.0% |
+| `int4-awq` | 0.51 GiB | 86.4% |
 
-Artifact directories carry the recipe key because the recipe *is* the identity of the weights.
-`Qwen3-0.6B-int4-gptq` alone is not: compress that model and method with two different calibration
-sets and you get two genuinely different artifacts, and one path for both means the second silently
-replaces the first.
+**Speed** — measured inside vLLM, zero failed requests:
 
-`runs/index.jsonl` holds one row per record — the keys and a summary, no metrics — so a lookup does
-not have to parse every run ever done. It is derived state; delete it and it rebuilds, or force it
-with `autodistiller history --rebuild`. It is also the shape a shared benchmark database would want:
-flat rows carrying a complete key rather than a local file layout.
+| Concurrency | bf16 | fp8 | fp8 gain |
+|---|---|---|---|
+| 1 | 195 tok/s | 253 tok/s | **1.30x** |
+| 4 | 649 tok/s | 824 tok/s | 1.27x |
+| 16 | 2144 tok/s | 2626 tok/s | 1.22x |
+| 32 | 3036 tok/s | 3623 tok/s | 1.19x |
 
----
+So on this model FP8 is the pick: ~25% faster for 1% of quality. INT4 saves another 0.2 GiB but
+costs 13.6% — the kind of trade-off you want to see before choosing, not after.
 
-## Trade-offs and recommendations
-
-A single winning score cannot be checked. `optimize` therefore also prints the
-configurations where you cannot improve one thing without losing another, and names
-the options a reader is likely to want:
-
-```
-Pareto frontier - Quality retention vs Peak VRAM vs TTFT p50 vs Peak throughput
- Candidate      Quality retention   Peak VRAM   TTFT p50   Peak throughput   Verdict
- baseline                 100.00%    7.00 GiB      110ms         780 tok/s   Pareto-optimal
- fp8                       98.45%    5.00 GiB       60ms        1010 tok/s   Pareto-optimal
- int4-awq                  94.10%    4.00 GiB       40ms        1320 tok/s   Pareto-optimal
- int8                      97.02%    5.00 GiB       70ms         990 tok/s   dominated
-```
-
-`int8` is dominated because `fp8` beats it on every axis at once — there is no
-reading of the numbers under which you would pick it. The other three are real
-trade-offs, and each named recommendation says what choosing it costs:
-
-```
- Option                 Candidate   Wins on                      Frontier   Gives up
- best quality           baseline    quality retention 100.00%    yes        peak vram 7.00 GiB against a best of 4.00 GiB; ...
- fastest (throughput)   int4-awq    peak throughput 1320 tok/s   yes        quality retention 94.10% against a best of 100.00%
-```
-
-Two rules keep this honest:
-
-- **A candidate is never ranked on a number nobody measured.** Treating an
-  unmeasured throughput as either the best or the worst value would put a
-  candidate on the frontier for a reason that is not a measurement. Those are
-  listed as "not measured on every axis" instead.
-- **An axis never mixes measured and estimated values.** Peak VRAM from a real
-  serving run and VRAM predicted by arithmetic are different quantities. When
-  nothing was benchmarked the whole axis falls back to estimates and is labelled
-  `VRAM (estimated)`; it never compares one against the other.
-
-Early stopping and trade-off analysis pull against each other — the first
-qualifying candidate is the only one measured, so there is nothing to compare it
-to. Use `--no-stop-early` when you want the frontier, and `--no-pareto` when you
-only want the winner.
+> **Your numbers will differ.** The same model on the same GPU measured **3x apart** during
+> development: once because the laptop was on battery (GPU capped to 34 W), once because another
+> process held 5.9 GiB of the card. That is why every run records the hardware and software it ran
+> on, and why a cached result is never reused across a change in either.
 
 ---
 
-## Export and deploy
+## Commands
 
-A measured recommendation is only worth something if someone else can deploy it
-and rebuild it:
-
-```bash
-uv run autodistiller export <run_id>
-```
-
-That writes three files beside the weights, so the directory you would serve is
-the one that explains itself:
-
-| File | What it carries |
+| | |
 |---|---|
-| `autodistiller-manifest.json` | Recipe, calibration fingerprint, metrics, benchmark, hardware, stack |
-| `DEPLOY.md` | How to serve it, what it scored, how to rebuild it |
-| `autodistiller-config.yaml` | The exact config, which re-hashes to the same experiment |
+| `env` | what hardware and software will be recorded |
+| `candidates` | the options worth measuring, and why the rest were dropped |
+| `evaluate` | measure a model's quality |
+| `compare` | did quality hold? |
+| `compress` | build one compressed version |
+| `benchmark` | measure a running server |
+| `optimize` | do all of it, and recommend |
+| `export` | make a result deployable and reproducible |
+| `runs` · `show` · `history` | what you have measured before |
 
-Export **checks** deployability rather than asserting it, and exits non-zero if
-the artifact would not load:
-
-```
-config      PASS  config.json present
-weights     PASS  1 file(s), 0.70 GiB
-tokenizer   PASS  tokenizer.json, tokenizer_config.json
-format      PASS  compressed-tensors, which vllm has kernels for
-
-Serve it    vllm serve artifacts/Qwen3-0.6B-fp8-7deef795 --port 8000 --max-model-len 2048
-```
-
-Nothing is converted — llmcompressor already writes a Hugging Face directory, so
-the artifact *is* the export. What was missing was the provenance tying it to the
-measurements that justify it, and a verified claim that a server can load it.
-An artifact that benchmarks beautifully and then cannot be served is the failure
-these checks exist to catch.
-
-`optimize --export DIR` does the same for the winning configuration, so you never
-have to work out which run id it was. Add `--copy-weights` to assemble a bundle
-you can move; without it the bundle refers to the weights where they already are.
-
-### GGUF
-
-GGUF artifacts export the same way. They carry their own config and tokenizer, so
-the Hugging Face checks do not apply and are not run — asking for a `tokenizer.json`
-inside a GGUF directory would report a working artifact as broken.
-
-There is still no conversion *from* a compressed-tensors artifact: GGUF carries
-its own quantization schemes and llama.cpp converts from unquantized weights. The
-manifest says so and points at the command that builds one from the source model
-instead.
+`--help` on any of them. `autodistiller methods` shows what your GPU and backend support.
 
 ---
 
-## Two backends
+## Status
 
-`--backend vllm` and `--backend llama.cpp` search different spaces, because they
-serve different formats:
+Phases 1–9 are done, which is the whole v1.0 scope.
 
-| | vLLM | llama.cpp |
-|---|---|---|
-| Format | compressed-tensors | GGUF |
-| Methods | `int8`, `int4-gptq`, `int4-awq`, `fp8`, … | `gguf-q8-0`, `gguf-q6-k`, `gguf-q5-k-m`, `gguf-q4-k-m`, `gguf-q3-k-m` |
-| Built by | llmcompressor | `convert_hf_to_gguf.py` + `llama-quantize` |
-| Artifact | a directory | a single `.gguf` |
-| KV cache types | `auto`, `fp8` | `auto` |
-| Default port | 8000 | 8080 |
+| Phase | | Phase | |
+|---|---|---|---|
+| 1 Evaluation engine | done | 6 Experiment cache | done |
+| 2 Deployment profiling | done | 7 Pareto analysis | done |
+| 3 Compression backends | done | 8 Export | done |
+| 4 Candidate generation | done | 9 llama.cpp | done |
+| 5 Constrained optimization | done | 10 Post-v1 research | later |
 
-Picking a method picks the toolchain, so `--method gguf-q4-k-m` routes to
-llama.cpp on its own. The search filters itself: a GGUF method is never offered
-to vLLM, and llama.cpp is never offered an fp8 KV cache it has no concept of.
+**Known gap:** the llama.cpp path is implemented and unit-tested but has not been run against real
+llama.cpp binaries. Treat GGUF support as experimental until it has.
 
-```bash
-uv run autodistiller optimize --model Qwen/Qwen3-0.6B --backend llama.cpp   --launch-preset native-llamacpp --objective throughput
-```
-
-llama.cpp is not pip installable, so point AutoDistiller at a built checkout with
-`--llama-cpp` or `LLAMA_CPP_DIR`. When it is missing, the error names which half —
-the converter script or the binary — rather than failing inside a subprocess.
-
-### Sizing GGUF honestly
-
-A K-quant is a mix of widths, not its headline number: `gguf-q4-k-m` averages about
-4.85 bits per weight. GGUF also quantizes the embeddings, which compressed-tensors
-leaves at 16-bit — so at the same nominal width a GGUF artifact is smaller.
-
-Both matter for screening. Published bits-per-weight figures are measured on
-7B-class models where embeddings are a rounding error; Qwen3-0.6B carries 26% of
-its parameters in a 151936-entry embedding, and llama.cpp keeps those tensors
-above the headline type. Estimating from the headline number alone under-reports
-by around 15%, and a memory screen that under-estimates produces candidates that
-OOM at serve time. Estimates land within 10% of published sizes for this model.
-
-### Quality screening
-
-Quality is screened by loading the GGUF through Transformers, which dequantizes
-it: the weights come back carrying the quantization error, which is what a quality
-comparison needs. It is not a claim about llama.cpp's inference kernels — those
-are measured where they run, in `llama-server`, and reported as the deployment
-numbers.
+v1.0 targets Hugging Face models on NVIDIA GPUs, vLLM first and llama.cpp next, with
+INT4/INT8/AWQ/GPTQ and FP8 through existing backends. Phase 10 is deliberately post-v1: knowledge
+distillation, pruning, student-model search, and Bayesian optimization — the last only if the
+discrete search space proves limiting.
 
 ---
 
-## Reference benchmarks
+## More
 
-Numbers AutoDistiller measured on its development machine, so you have something
-to compare your own first run against. Every figure below came out of the tool
-itself and is reproducible from the run records in `runs/`.
+- **[Design notes](docs/design.md)** — why it works this way, and the failures that shaped it
+- **[vLLM on WSL](docs/vllm-on-wsl.md)** — four undocumented blockers, and their fixes
+- **[Contributing](CONTRIBUTING.md)** · **[Changelog](CHANGELOG.md)**
 
-**Conditions.** Qwen3-0.6B on an RTX 5070 Laptop (8 GiB, sm_120), vLLM 0.27.1 under
-WSL2, torch 2.11 / CUDA 12.8, `--gpu-memory-utilization 0.85`, **on wall power**.
-Read the conditions before the numbers — see [why they matter](#your-numbers-will-differ).
-
-### Compression
-
-wikitext-2 perplexity, 57 documents, same baseline for every row. Retention is
-direction-aware, so higher is better.
-
-| Method | Artifact | vs bf16 | Perplexity | Quality retention |
-|---|---|---|---|---|
-| baseline (bf16) | 1.11 GiB | — | 20.83 | 100% |
-| `int8-weight-only` | 0.72 GiB | 0.65x | 20.80 | **100.2%** |
-| `fp8` | 0.71 GiB | 0.64x | 21.04 | 99.0% |
-| `int4-awq` | 0.51 GiB | 0.46x | 24.10 | 86.4% |
-
-INT4 loses real quality on a 0.6B model. That is expected rather than a defect:
-the smaller the model, the less redundancy there is to quantize away, and it is
-exactly the kind of trade-off the Pareto view exists to make visible.
-
-### Deployment
-
-Measured inside vLLM, 256-token prompts, 128 output tokens, zero failed requests.
-These are deployment claims; the Transformers smoke test in Phase 1 is not.
-
-| Concurrency | bf16 throughput | bf16 TTFT p50 | fp8 throughput | fp8 TTFT p50 | fp8 speedup |
-|---|---|---|---|---|---|
-| 1 | 195 tok/s | 56 ms | 253 tok/s | 56 ms | **1.30x** |
-| 4 | 649 tok/s | 66 ms | 824 tok/s | 64 ms | 1.27x |
-| 16 | 2144 tok/s | 74 ms | 2626 tok/s | 79 ms | 1.22x |
-| 32 | 3036 tok/s | 285 ms | 3623 tok/s | 294 ms | 1.19x |
-
-Peak VRAM 7.78 GiB (bf16) against 7.04 GiB (fp8), sampled device-wide through
-NVML. Device-wide is deliberate: it is the number that answers "will this fit",
-and the only one visible when the server runs across a WSL boundary.
-
-So on this model FP8 is the clear pick — ~1.2-1.3x throughput for 1% of quality —
-and INT4's extra 0.2 GiB costs 13.6% of quality to get it.
-
-### Your numbers will differ
-
-Not by a little. The same model, on the same GPU, measured **3x apart** during
-development for a reason that had nothing to do with the model:
-
-| | Peak throughput @ c=8 | Cause |
-|---|---|---|
-| Wall power | 1179 tok/s | 80–115 W GPU power budget |
-| On battery | 395 tok/s | GPU capped to **34 W**, `SW Power Cap: Active` |
-
-A second run was corrupted a different way, by an idle Ollama server holding
-5.9 GiB of the 8 GiB card. Neither is visible in a throughput number on its own,
-which is why every run records the hardware and the software stack, and why the
-experiment cache refuses to reuse a result across either.
-
-Check `nvidia-smi --query-gpu=enforced.power.limit,memory.used --format=csv`
-before you trust a benchmark from a laptop.
+AutoTrainer is a separate project: it trains and fine-tunes, AutoDistiller takes a trained model
+and makes it deployable. They stay interoperable rather than merged.
 
 ---
-
-## Tasks
-
-Run `uv run autodistiller tasks` for the live list.
-
-**Presets** — `wikitext2`, `wikitext103`, `arc_easy`, `arc_challenge`, `hellaswag`, `piqa`
-
-**Your own data**
-
-| Syntax | Meaning |
-|---|---|
-| `ppl:corpus.txt` | perplexity over a local text file |
-| `ppl:corpus.jsonl` | perplexity over a local JSONL corpus (`text` field) |
-| `mc:evals.jsonl` | multiple choice over a local JSONL file |
-
-The multiple-choice schema is one JSON object per line:
-
-```json
-{"id": "q1", "context": "Question: What is 2+2?\nAnswer:", "choices": [" 3", " 4"], "answer_index": 1}
-```
-
-Choices keep their own leading space: they are appended to the context verbatim so tokenization
-matches what a real prompt would produce.
-
-For full control, use a config file — see
-[`examples/configs/baseline.yaml`](examples/configs/baseline.yaml):
-
-```bash
-uv run autodistiller evaluate --config examples/configs/baseline.yaml
-```
-
----
-
-## Metrics
-
-**Perplexity** (`perplexity`, `nll_per_token`, `bits_per_byte`) — strided windows, so every token is
-scored exactly once and with as much left context as the window allows. Naive chunking scores the
-first token of every chunk with no context at all, which inflates the number. `bits_per_byte` is
-tokenizer-independent and stays meaningful when a candidate ships a different tokenizer.
-
-**Multiple choice** (`acc`, `acc_norm`) — each candidate answer is scored by log-probability and the
-highest-scoring one wins. No sampling, so results are exactly reproducible. `acc_norm` normalizes by
-answer length so longer answers are not penalized for having more tokens.
-
-Both report a standard error, which `compare` uses to distinguish a real regression from noise.
-
----
-
-## Why every run records so much
-
-A run record carries the config, the resolved model commit, an architecture fingerprint, dataset
-content fingerprints, library versions, and the hardware it ran on. That is not bookkeeping for its
-own sake:
-
-- **Comparability is checkable.** `compare` refuses to score a comparison where the two runs used
-  different data, and warns when the hardware or software stack moved.
-- **The experiment cache needs it.** Reusing a measurement is only safe if you can prove the inputs
-  were identical. The config hash and the hardware and software fingerprints are that proof.
-- **It is the long-term differentiator.** The defensible asset is measured knowledge: which
-  configurations work on which models, GPUs, backends and software stacks.
-
-### On performance numbers
-
-The baseline inference step reports tokens/sec. It is tagged `runtime: "transformers"` and
-`is_deployment_claim: false`, and the CLI says so every time it prints them. Transformers timings
-are a smoke test, not serving performance. Deployment numbers get measured inside the deployment
-backend — that is Phase 2.
-
----
-
-## Reproducibility
-
-Runs are seeded (Python, NumPy, torch, CUDA), cuDNN autotuning is pinned off, and the resolved
-config is written next to every result:
-
-```bash
-uv run autodistiller evaluate --model Qwen/Qwen3-0.6B --save-config my-baseline.yaml
-uv run autodistiller evaluate --config my-baseline.yaml   # same numbers
-```
-
-The config hash covers everything that can move a metric and excludes what cannot (`label`,
-`output_dir`).
-
----
-
-## Development
-
-```bash
-uv sync
-```
-
-```bash
-uv run pytest
-```
-
-```bash
-uv run ruff check . && uv run ruff format --check .
-```
-
-The suite runs on CPU in a few seconds against a tiny model built in-process, so the full
-load → evaluate → record → compare path is covered without downloading anything.
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the full workflow, and
-[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) for community expectations. Security issues go through
-[SECURITY.md](SECURITY.md) rather than the public tracker.
-
----
-
-## Releasing
-
-Releases publish to PyPI automatically via
-[Trusted Publishing](https://docs.pypi.org/trusted-publishers/) — there is no API token to store
-or rotate.
-
-1. Bump `version` in `pyproject.toml` (`__version__` reads it from package metadata, so there is
-   nothing else to keep in sync).
-2. Commit, then tag and push: `git tag v0.2.0 && git push --tags`
-3. Publish a GitHub release for that tag.
-
-[`release.yml`](.github/workflows/release.yml) then re-runs the full test suite, checks the tag
-matches the packaged version, builds an sdist and wheel with `uv build`, and uploads. PyPI version
-numbers can never be reused, so both gates run before anything is uploaded.
-
-## Roadmap
-
-| Phase | Scope | Status |
-|---|---|---|
-| 1 | Evaluation engine | **done** |
-| 2 | Hardware & deployment profiling (vLLM) | **done** |
-| 3 | Compression backend integration (LLM Compressor adapters) | **done** |
-| 4 | Candidate generator | **done** |
-| 5 | Constrained optimization | **done** |
-| 6 | Persistent experiment cache | **done** |
-| 7 | Pareto analysis | **done** |
-| 8 | Export & reproducibility | **done** |
-| 9 | Multi-backend expansion (llama.cpp) | **done** |
-| 10 | Post-v1 research (distillation, pruning, Bayesian search) | post-v1 |
-
-### v1.0 target
-
-Hugging Face models, NVIDIA GPUs, evaluation-first workflow, vLLM as the first deployment backend,
-INT4/INT8/AWQ/GPTQ and selected FP8 paths through existing backends, constrained enumeration rather
-than advanced AutoML, a persistent experiment cache, Pareto analysis, and reproducible export.
-
-The `optimize` command from the roadmap arrives once Phases 2–5 land:
-
-```bash
-uv run autodistiller optimize \
-  --model Qwen/Qwen3-4B \
-  --backend vllm \
-  --max-vram 8GB \
-  --min-quality 95 \
-  --objective throughput
-```
-
-It will call this same evaluation engine underneath.
-
----
-
-## Relationship to AutoTrainer
-
-AutoTrainer and AutoDistiller are separate projects. AutoTrainer covers training and fine-tuning;
-AutoDistiller covers deployment optimization. They share interfaces where useful (model metadata,
-evaluation, experiment tracking, hardware detection) and stay interoperable, but the repositories
-are not merged.
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+Apache 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
