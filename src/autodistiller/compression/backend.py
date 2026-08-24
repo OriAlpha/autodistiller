@@ -201,6 +201,8 @@ class LLMCompressorBackend(CompressionBackend):
                 input=json.dumps(job.to_payload()),
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=self.timeout_s,
                 env=env,
             )

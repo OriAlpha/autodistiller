@@ -60,6 +60,25 @@ NATIVE_VLLM_TEMPLATE = "vllm serve {model} --port {port} --max-model-len {max_mo
 NATIVE_LLAMACPP_TEMPLATE = (
     "llama-server -m {model} --port {port} -c {max_model_len} -ngl 999 {kv_flag}"
 )
+
+WSL_LLAMACPP_TEMPLATE = (
+    'wsl -d Ubuntu -e bash -lc "'
+    "$HOME/llama.cpp/build/bin/llama-server -m {model} --port {port} "
+    '-c {max_model_len} -ngl 999 --host 0.0.0.0 {kv_flag}"'
+)
+"""llama.cpp built inside WSL, which is where it has to run on Windows.
+
+A backgrounded process does not survive the shell that started it here, so the
+launcher keeps wsl.exe in the foreground and stops it explicitly -- the same
+arrangement vLLM needs, for the same reason.
+"""
+
+WSL_LLAMACPP_STOP = 'wsl -d Ubuntu -e bash -lc "pkill -f llama.cpp/build/bin/llama-server; true"'
+"""Killing wsl.exe does not reach the server inside the VM.
+
+Matched on the build path so it cannot take down an unrelated llama-server --
+Ollama ships one under the same name.
+"""
 """llama.cpp builds natively on Windows, so unlike vLLM it needs no WSL wrapper.
 
 ``-ngl 999`` offloads every layer it can to the GPU. llama.cpp defaults to CPU,
@@ -240,6 +259,8 @@ def optimize(
 __all__ = [
     "NATIVE_LLAMACPP_TEMPLATE",
     "NATIVE_VLLM_TEMPLATE",
+    "WSL_LLAMACPP_STOP",
+    "WSL_LLAMACPP_TEMPLATE",
     "WSL_VLLM_STOP",
     "WSL_VLLM_TEMPLATE",
     "build_benchmarker",

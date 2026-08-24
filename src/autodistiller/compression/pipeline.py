@@ -27,6 +27,7 @@ from ..config import CompressionSpec, ModelSpec
 from ..evaluation.datasets import load_text_corpus
 from ..metadata.profiles import GPUProfile
 from ..results import CompressionArtifact
+from ..serving.launcher import wsl_path
 from .backend import CompressionJob, ProgressFn, resolve_compression_backend
 from .methods import check_method, resolve_method
 
@@ -192,6 +193,8 @@ def run_compression(
         backend_name,
         python_executable=spec.python_executable,
         llama_cpp_dir=spec.llama_cpp_dir,
+        wrapper=spec.llama_cpp_wrapper,
+        path_translator=wsl_path if spec.llama_cpp_wrapper else None,
     )
 
     usable, detail = backend.available()

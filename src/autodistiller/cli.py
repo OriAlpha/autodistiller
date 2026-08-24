@@ -589,6 +589,12 @@ def compress(
         envvar="LLAMA_CPP_DIR",
         help="llama.cpp checkout, for GGUF methods. Also read from LLAMA_CPP_DIR.",
     ),
+    llama_cpp_wsl: bool = typer.Option(
+        False,
+        "--llama-cpp-wsl",
+        help="Run the llama.cpp toolchain inside WSL. Required on Windows, where "
+        "its binaries are Linux executables.",
+    ),
     trust_remote_code: bool = typer.Option(False),
     refresh: bool = typer.Option(
         False, "--refresh", help="Compress again even if this exact artifact already exists"
@@ -599,6 +605,7 @@ def compress(
     _configure_logging(verbose)
 
     from .compression.backend import CompressionError
+    from .compression.gguf import WSL_COMMAND
     from .compression.pipeline import run_compression
 
     calibration_spec: DatasetSpec | None = None
@@ -618,6 +625,7 @@ def compress(
         output_dir=output_dir,
         python_executable=compress_python,
         llama_cpp_dir=llama_cpp_dir,
+        llama_cpp_wrapper=WSL_COMMAND if llama_cpp_wsl else None,
     )
 
     hardware = detect_hardware()
@@ -640,9 +648,15 @@ def compress(
     console.print()
     console.print(render_compression(artifact))
     console.print()
+    # The runtime that serves this format, not whichever one happens to be
+    # first: a GGUF handed to `vllm serve` is a command that cannot work.
+    from .compression.methods import resolve_method
+    from .serving.backends import resolve_backend
+
+    runtime = resolve_backend(resolve_method(method).backends[0])
     console.print(
-        f"[dim]Serve it with:[/dim] vllm serve {artifact.output_dir} "
-        f"--port 8000 --max-model-len 4096"
+        f"[dim]Serve it with:[/dim] "
+        f"{runtime.launch_command(runtime.model_path(artifact.output_dir), max_model_len=4096)}"
     )
 
 
@@ -796,6 +810,12 @@ def optimize(
         envvar="LLAMA_CPP_DIR",
         help="llama.cpp checkout, for GGUF methods. Also read from LLAMA_CPP_DIR.",
     ),
+    llama_cpp_wsl: bool = typer.Option(
+        False,
+        "--llama-cpp-wsl",
+        help="Run the llama.cpp toolchain inside WSL. Required on Windows, where "
+        "its binaries are Linux executables.",
+    ),
     concurrency: int = typer.Option(8, "--concurrency", help="Sequences the KV cache must hold"),
     launch_template: str | None = typer.Option(
         None, "--launch", help="Command template to start a server. See --launch-preset."
@@ -803,7 +823,7 @@ def optimize(
     launch_preset: str = typer.Option(
         "none",
         "--launch-preset",
-        help="none | wsl-vllm | native-vllm | native-llamacpp",
+        help="none | wsl-vllm | native-vllm | wsl-llamacpp | native-llamacpp",
     ),
     stop_early: bool = typer.Option(True, "--stop-early/--no-stop-early"),
     artifacts_root: Path = typer.Option(Path("artifacts"), "--artifacts-root"),
@@ -828,6 +848,8 @@ def optimize(
     from .optimize.command import (
         NATIVE_LLAMACPP_TEMPLATE,
         NATIVE_VLLM_TEMPLATE,
+        WSL_LLAMACPP_STOP,
+        WSL_LLAMACPP_TEMPLATE,
         WSL_VLLM_STOP,
         WSL_VLLM_TEMPLATE,
     )
@@ -880,14 +902,16 @@ def optimize(
             "wsl-vllm": WSL_VLLM_TEMPLATE,
             "native-vllm": NATIVE_VLLM_TEMPLATE,
             "native-llamacpp": NATIVE_LLAMACPP_TEMPLATE,
+            "wsl-llamacpp": WSL_LLAMACPP_TEMPLATE,
         }.get(launch_preset)
         if template is None:
             raise typer.BadParameter(f"unknown --launch-preset {launch_preset!r}")
 
     # A WSL launch crosses a process boundary, so terminating the launcher does
     # not stop the server; it needs an explicit stop command.
-    is_wsl = template == WSL_VLLM_TEMPLATE
-    stop = WSL_VLLM_STOP if is_wsl else None
+    stops = {WSL_VLLM_TEMPLATE: WSL_VLLM_STOP, WSL_LLAMACPP_TEMPLATE: WSL_LLAMACPP_STOP}
+    is_wsl = template in stops
+    stop = stops.get(template) if template else None
     launch = (
         LaunchSpec(
             template=template,

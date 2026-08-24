@@ -27,10 +27,12 @@ from __future__ import annotations
 
 import logging
 import os
+import shlex
 import shutil
 import subprocess
 import time
-from pathlib import Path
+from collections.abc import Callable
+from pathlib import Path, PurePosixPath
 
 from ..results import CompressionArtifact
 from .backend import CompressionBackend, CompressionError, CompressionJob, ProgressFn
@@ -43,6 +45,18 @@ CONVERT_SCRIPT = "convert_hf_to_gguf.py"
 QUANTIZE_BINARY = "llama-quantize"
 ARTIFACT_NAME = "model.gguf"
 INTERMEDIATE_NAME = "model-f16.gguf"
+
+NO_PROJECT = "--no-project"
+"""Never adopt the surrounding project.
+
+``uv run`` looks upward for a ``pyproject.toml`` and syncs that project's
+environment before running anything. The converter is not part of this project
+and has different dependencies, so adopting it is wrong in every case -- and
+across a WSL boundary it is destructive: uv finds AutoDistiller's own Windows
+``.venv`` through ``/mnt/d``, decides it does not match, and starts deleting it.
+It got as far as removing packages before the 9P filesystem refused, which is
+the only reason there was anything left to repair.
+"""
 
 CONVERTER_REQUIREMENTS = (
     "--with",
@@ -71,12 +85,41 @@ The converter is a script inside the repository, not something that gets
 installed, so a path is the only way to find it.
 """
 
+WSL_COMMAND = 'wsl -d Ubuntu -e bash -lc "{command}"'
+"""Run the toolchain inside WSL.
+
+llama.cpp builds native Linux binaries, and on Windows that is where they have
+to run: handing one to CreateProcess gets "not a valid Win32 application". The
+same boundary vLLM crosses, and crossed the same way.
+"""
+
 SEARCH_DIRS = (
     "~/llama.cpp",
     "~/src/llama.cpp",
     "/opt/llama.cpp",
     "/usr/local/share/llama.cpp",
 )
+
+
+def resolve_local_model(model_id: str) -> str:
+    """A local directory for the converter to read.
+
+    ``convert_hf_to_gguf.py`` reads a directory from disk; unlike llmcompressor,
+    which goes through transformers, it cannot resolve a Hugging Face repo id.
+    Downloading is what the hub cache is for, so a model already fetched costs
+    nothing here.
+    """
+    if Path(model_id).is_dir():
+        return model_id
+
+    from huggingface_hub import snapshot_download
+
+    return snapshot_download(model_id)
+
+
+def _as_posix(path: Path) -> str:
+    """A path as the far side spells it. On the near side this changes nothing."""
+    return str(path).replace("\\", "/")
 
 
 def _candidate_roots(explicit: str | None = None) -> list[Path]:
@@ -122,15 +165,39 @@ class LlamaCppBackend(CompressionBackend):
         *,
         llama_cpp_dir: str | None = None,
         python_executable: str | None = None,
+        wrapper: str | None = None,
+        path_translator: Callable[[str], str] | None = None,
         timeout_s: int = DEFAULT_TIMEOUT_S,
     ) -> None:
         self.llama_cpp_dir = llama_cpp_dir
         self.python_executable = python_executable
+        self.wrapper = wrapper
+        self.path_translator = path_translator
         self.timeout_s = timeout_s
 
+    def _translate(self, path: str) -> str:
+        return self.path_translator(path) if self.path_translator else path
+
+    def _tools(self) -> tuple[Path | None, Path | None]:
+        """Where the converter and the quantizer are.
+
+        With a wrapper the checkout is on the far side of the boundary and this
+        filesystem cannot see it -- and on Windows, probing a ``\\wsl$`` share
+        for it is slow enough to look like a hang. The path given is taken on
+        trust there; the command that uses it reports clearly if it is wrong.
+        """
+        if self.wrapper:
+            if not self.llama_cpp_dir:
+                return None, None
+            root = PurePosixPath(self.llama_cpp_dir)
+            return (
+                Path(str(root / CONVERT_SCRIPT)),
+                Path(str(root / "build" / "bin" / QUANTIZE_BINARY)),
+            )
+        return find_convert_script(self.llama_cpp_dir), find_quantize_binary(self.llama_cpp_dir)
+
     def available(self) -> tuple[bool, str]:
-        script = find_convert_script(self.llama_cpp_dir)
-        binary = find_quantize_binary(self.llama_cpp_dir)
+        script, binary = self._tools()
 
         missing = []
         if script is None:
@@ -154,6 +221,12 @@ class LlamaCppBackend(CompressionBackend):
         if self.python_executable:
             return [self.python_executable]
 
+        if self.wrapper:
+            # Resolving uv here would find this machine's copy, which is the
+            # wrong one and possibly the wrong operating system. The far side
+            # runs under a login shell, so let its own PATH answer.
+            return ["uv", "run", "--quiet", NO_PROJECT, *CONVERTER_REQUIREMENTS, "python"]
+
         uv = shutil.which("uv")
         if uv is None:
             raise CompressionError(
@@ -161,15 +234,25 @@ class LlamaCppBackend(CompressionBackend):
                 "dependencies. Install uv, or pass --converter-python pointing at an "
                 "interpreter that already has gguf and sentencepiece."
             )
-        return [uv, "run", "--quiet", *CONVERTER_REQUIREMENTS, "python"]
+        return [uv, "run", "--quiet", NO_PROJECT, *CONVERTER_REQUIREMENTS, "python"]
 
     def _run(self, command: list[str], *, step: str, job: CompressionJob) -> None:
-        logger.debug("%s: %s", step, " ".join(command))
+        runnable: str | list[str] = command
+        if self.wrapper:
+            # The toolchain lives on the far side of a boundary, so the command
+            # has to be handed across as text rather than executed here. Same
+            # shape as the serving launcher's template, and for the same reason.
+            runnable = self.wrapper.format(command=shlex.join(command))
+
+        logger.debug("%s: %s", step, runnable)
         try:
             completed = subprocess.run(
-                command,
+                runnable,
+                shell=bool(self.wrapper),
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=self.timeout_s,
             )
         except subprocess.TimeoutExpired as exc:
@@ -186,11 +269,20 @@ class LlamaCppBackend(CompressionBackend):
                 f"{job.method.name}: {step} failed (exit {completed.returncode})\n{tail}"
             )
 
+    def _versions(self, binary: Path) -> dict[str, str]:
+        """Whatever llama.cpp will tell us about itself. Best effort.
+
+        Skipped behind a wrapper: the binary is on the far side, and spending a
+        round trip to label a version is not worth failing a build over.
+        """
+        if self.wrapper:
+            return {}
+        return _versions(binary)
+
     def compress(
         self, job: CompressionJob, *, progress: ProgressFn | None = None
     ) -> CompressionArtifact:
-        script = find_convert_script(self.llama_cpp_dir)
-        binary = find_quantize_binary(self.llama_cpp_dir)
+        script, binary = self._tools()
         if script is None or binary is None:
             raise CompressionError(f"llama.cpp tooling unavailable: {self.available()[1]}")
 
@@ -198,18 +290,34 @@ class LlamaCppBackend(CompressionBackend):
         intermediate = job.output_dir / INTERMEDIATE_NAME
         artifact_path = job.output_dir / ARTIFACT_NAME
 
+        # Translate the directory and join the filenames on the far side. A path
+        # translator only recognises what already exists -- that is how it tells
+        # a local path from a hub id -- and these two files are what this run is
+        # about to create. Translating them directly leaves them untouched, and
+        # a Windows path handed to Linux is silently written nowhere.
+        if self.path_translator is None:
+            far_intermediate, far_artifact = str(intermediate), str(artifact_path)
+        else:
+            far_dir = self._translate(str(job.output_dir))
+            far_intermediate = f"{far_dir}/{INTERMEDIATE_NAME}"
+            far_artifact = f"{far_dir}/{ARTIFACT_NAME}"
+
         started = time.perf_counter()
 
         if progress is not None:
             progress(f"{self.name}: converting {job.model_id} to GGUF")
 
+        source = resolve_local_model(job.model_id)
+        if progress is not None and source != job.model_id:
+            progress(f"{self.name}: reading weights from {source}")
+
         self._run(
             [
                 *self._converter_command(),
-                str(script),
-                job.model_id,
+                _as_posix(script),
+                self._translate(source),
                 "--outfile",
-                str(intermediate),
+                far_intermediate,
                 "--outtype",
                 "f16",
             ],
@@ -222,7 +330,12 @@ class LlamaCppBackend(CompressionBackend):
 
         try:
             self._run(
-                [str(binary), str(intermediate), str(artifact_path), job.method.scheme],
+                [
+                    _as_posix(binary),
+                    far_intermediate,
+                    far_artifact,
+                    job.method.scheme,
+                ],
                 step="llama-quantize",
                 job=job,
             )
@@ -245,7 +358,7 @@ class LlamaCppBackend(CompressionBackend):
             output_dir=str(job.output_dir),
             artifact_bytes=artifact_path.stat().st_size,
             duration_s=time.perf_counter() - started,
-            versions=_versions(binary),
+            versions=self._versions(binary),
         )
 
 
@@ -253,7 +366,12 @@ def _versions(binary: Path) -> dict[str, str]:
     """Whatever llama.cpp will tell us about itself. Best effort."""
     try:
         completed = subprocess.run(
-            [str(binary), "--help"], capture_output=True, text=True, timeout=30
+            [str(binary), "--help"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
         )
         for line in (completed.stdout + completed.stderr).splitlines():
             if "version" in line.lower():
@@ -268,8 +386,11 @@ __all__ = [
     "CONVERTER_REQUIREMENTS",
     "CONVERT_SCRIPT",
     "LLAMA_CPP_DIR_ENV",
+    "NO_PROJECT",
     "QUANTIZE_BINARY",
+    "WSL_COMMAND",
     "LlamaCppBackend",
     "find_convert_script",
     "find_quantize_binary",
+    "resolve_local_model",
 ]

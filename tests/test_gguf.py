@@ -46,8 +46,11 @@ def _checkout(tmp_path, *, script: bool = True, binary: bool = True):
 
 
 def _job(tmp_path, method: str = "gguf-q4-k-m") -> CompressionJob:
+    # A local directory, so resolve_local_model has nothing to download.
+    source = tmp_path / "source-model"
+    source.mkdir(parents=True, exist_ok=True)
     return CompressionJob(
-        model_id="Qwen/Qwen3-0.6B",
+        model_id=str(source),
         method=resolve_method(method),
         output_dir=tmp_path / "out",
         calibration_texts=[],
@@ -319,8 +322,10 @@ def test_an_unspecified_serving_backend_does_not_block_the_method(tmp_path, monk
 
     # Reaches the backend and fails there for a real reason, not at the gate.
     with pytest.raises(CompressionError, match="wrote no"):
+        source = tmp_path / "source-model"
+        source.mkdir()
         run_compression(
-            ModelSpec(id="Qwen/Qwen3-0.6B"),
+            ModelSpec(id=str(source)),
             CompressionSpec(
                 method="gguf-q4-k-m", llama_cpp_dir=str(root), python_executable="python"
             ),
@@ -339,3 +344,21 @@ def test_an_explicit_mismatch_is_still_refused(tmp_path):
             output_root=tmp_path,
             serving_backend="vllm",
         )
+
+
+def test_the_converter_never_adopts_the_surrounding_project():
+    """uv run syncs whatever project it finds above the working directory. The
+    converter is not part of this one, and across a WSL boundary uv reaches
+    AutoDistiller's own Windows .venv through /mnt and starts deleting it."""
+    from autodistiller.compression.gguf import NO_PROJECT
+
+    for backend in (LlamaCppBackend(), LlamaCppBackend(wrapper='wsl -e bash -lc "{command}"')):
+        command = backend._converter_command()
+        assert NO_PROJECT in command, command
+
+
+def test_a_wrapped_converter_resolves_uv_on_the_far_side():
+    """Resolving uv here would find this machine's copy, which may be the wrong
+    operating system entirely."""
+    command = LlamaCppBackend(wrapper='wsl -e bash -lc "{command}"')._converter_command()
+    assert command[0] == "uv"  # a bare name, for the far side's PATH to answer

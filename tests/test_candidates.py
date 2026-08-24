@@ -128,19 +128,28 @@ def test_gguf_is_smaller_than_the_same_width_elsewhere():
     assert weight_bytes(shape, METHODS["gguf-q4-k-m"]) < weight_bytes(shape, METHODS["int4-gptq"])
 
 
-def test_gguf_sizes_follow_their_published_bits_per_weight():
-    """A K-quant is a mix of widths, so its size does not follow the headline
-    number. These estimates are checked against what llama.cpp actually
-    produces for this model."""
+def test_gguf_size_matches_a_measured_artifact():
+    """Against a GGUF this project actually produced, not a published figure.
+
+    llama.cpp writes the embedding twice -- token_embd at the headline type and
+    output.weight at Q6_K -- which a whole-file bits-per-weight average does not
+    capture. Counting it once under-reported this artifact by 18.5%.
+    """
+    measured_mib = 461.8  # artifacts/Qwen3-0.6B-gguf-q4-k-m, llama.cpp b7584430
+    estimate = weight_bytes(qwen3_06b(), METHODS["gguf-q4-k-m"]) / 1024**2
+
+    assert estimate == pytest.approx(measured_mib, rel=0.05)
+    assert estimate >= measured_mib, "a screen must not under-estimate what has to fit"
+
+
+def test_gguf_estimates_rise_with_the_quantization_type():
     shape = qwen3_06b()
-    mib = 1024**2
-    for name, published in (
-        ("gguf-q8-0", 610),
-        ("gguf-q5-k-m", 420),
-        ("gguf-q4-k-m", 380),
-    ):
-        estimate = weight_bytes(shape, METHODS[name]) / mib
-        assert abs(estimate - published) / published < 0.10, f"{name}: {estimate:.0f} MiB"
+    sizes = [
+        weight_bytes(shape, METHODS[n])
+        for n in ("gguf-q3-k-m", "gguf-q4-k-m", "gguf-q5-k-m", "gguf-q6-k", "gguf-q8-0")
+    ]
+    assert sizes == sorted(sizes)
+    assert sizes[-1] < weight_bytes(shape, None), "every quant beats bf16"
 
 
 # --- KV cache, against what vLLM reported -------------------------------

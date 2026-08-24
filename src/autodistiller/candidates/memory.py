@@ -36,12 +36,12 @@ BYTES_PER_GIB = 1024**3
 QUANT_GROUP_SIZE = 128
 """Weights per shared scale for grouped integer quantization."""
 
-GGUF_EMBEDDING_FLOOR_BPW = 6.56
-"""Bits per weight llama.cpp keeps embedding and output tensors at, at minimum.
+GGUF_EMBEDDING_FLOOR_BPW = 6.5625
+"""Bits per weight llama.cpp keeps the output head at, at minimum.
 
-Q6_K. The K-quant mixes hold those tensors above the headline type because they
-are the most quantization-sensitive in the file, so a Q3_K_M model is not 3.74
-bits everywhere.
+Q6_K, confirmed by reading a produced artifact: `output.weight` came back Q6_K
+in a Q4_K_M file. The K-quant mixes hold that tensor above the headline type
+because it is the most quantization-sensitive in the file.
 """
 
 RUNTIME_OVERHEAD_FRACTION = 0.10
@@ -122,20 +122,26 @@ def weight_bytes(shape: ModelShape, method: CompressionMethod | None) -> int:
         if not method.quantizes_embeddings:
             return total + shape.embedding_params * 2
 
-        # Those averages are measured on 7B-class models, where embeddings are a
-        # rounding error. On a small model with a large vocabulary they are not:
-        # Qwen3-0.6B carries 26% of its parameters in a 151936-entry embedding,
-        # and llama.cpp deliberately keeps those tensors above the headline type
-        # because they are the most quantization-sensitive in the file. Applying
-        # the headline average to them under-estimates the artifact by roughly
-        # 15%, and a memory screen that under-estimates produces candidates that
-        # OOM at serve time.
+        # GGUF writes the embedding twice, even when the model ties them:
+        # `token_embd.weight` at the headline type, and `output.weight` at a
+        # higher one because the output head is the most quantization-sensitive
+        # tensor in the file. Counting it once under-reported a measured
+        # Qwen3-0.6B Q4_K_M artifact by 18.5% -- and a screen that
+        # under-estimates produces candidates that OOM at serve time, which is
+        # the one thing it exists to prevent.
         #
-        # ponytail: one floor rather than llama.cpp's per-tensor type table,
-        # which is version-dependent and would need tracking upstream. Replace
-        # with the real table if measured GGUF sizes drift from these estimates.
-        embedding_bpw = max(method.bits_per_weight, GGUF_EMBEDDING_FLOOR_BPW)
-        return total + int(shape.embedding_params * embedding_bpw / 8)
+        # A tied model reports one embedding, an untied one reports both
+        # tensors already, so halving recovers the single size in either case.
+        #
+        # ponytail: two rates rather than llama.cpp's per-tensor type table,
+        # which is version-dependent and would need tracking upstream.
+        # Calibrated against one measured artifact; revisit if others drift.
+        single = (
+            shape.embedding_params if shape.tie_word_embeddings else shape.embedding_params // 2
+        )
+        token_embd = single * method.bits_per_weight / 8
+        output_head = single * max(method.bits_per_weight, GGUF_EMBEDDING_FLOOR_BPW) / 8
+        return total + int(token_embd + output_head)
 
     bits = method.weight_bits
     quantized = shape.transformer_params * bits // 8

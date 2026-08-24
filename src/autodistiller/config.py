@@ -204,6 +204,14 @@ class CompressionSpec(StrictModel):
         default=None,
         description="llama.cpp checkout, for GGUF methods. Also read from LLAMA_CPP_DIR.",
     )
+    llama_cpp_wrapper: str | None = Field(
+        default=None,
+        description=(
+            "Command template to run the llama.cpp toolchain somewhere else, e.g. "
+            "inside WSL. Formatted with {command}. Needed on Windows, where the "
+            "binaries are Linux executables."
+        ),
+    )
 
 
 class RunConfig(StrictModel):

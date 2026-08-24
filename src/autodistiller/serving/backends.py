@@ -10,8 +10,9 @@ So a backend here is mostly *knowledge*: how you would launch it, and which
 protocol extensions it honours. The benchmark client itself is backend-agnostic
 because vLLM and llama.cpp both speak the OpenAI API.
 
-ponytail: no process management; add a launcher only if printing the command
-proves annoying in practice.
+Process management lives in :mod:`.launcher` rather than here. Phase 2 deferred
+it on the grounds that printing the command was enough; benchmarking a dozen
+candidates in sequence is the condition under which it stopped being enough.
 """
 
 from __future__ import annotations
