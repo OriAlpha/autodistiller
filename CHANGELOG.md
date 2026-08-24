@@ -12,6 +12,11 @@ the v1.0 scope.
 
 ### Added
 
+- **Reference benchmarks in the README**: measured compression and deployment
+  matrices for Qwen3-0.6B on an RTX 5070, so a first run has something to be
+  compared against, plus the conditions they were taken under and a worked
+  example of how much those conditions matter.
+
 - **`--backend llama.cpp`**, end to end: GGUF candidates, GGUF artifacts,
   benchmarks in `llama-server`, and recommendations. The benchmark client needed
   no changes -- both runtimes speak the OpenAI API -- so what this phase actually
@@ -44,6 +49,17 @@ the v1.0 scope.
 
 ### Fixed
 
+- **A cold-start stall could be reported as throughput.** A server answers
+  `/v1/models` before it is warm -- vLLM captures CUDA graphs lazily, on real
+  requests -- and two fixed warmup requests did not reliably cover it. In a real
+  end-to-end run one request took 9.33s against a median of 0.67s, inflating the
+  phase from ~5s to 21.1s: throughput reported 48 tok/s for a server whose own
+  per-token timings said 209. Whichever candidate was benchmarked first paid it,
+  which corrupts the ranking the optimizer depends on. Warmup now continues until
+  three consecutive requests land within 25% of the fastest seen (capped at 10),
+  and every phase records a `throughput_efficiency` -- measured throughput over
+  what the per-token timings imply -- with a warning below 0.5, so a stall can
+  never again be silently reported as a measurement.
 - **The memory estimator sized GGUF from its nominal bit width.** A K-quant is a
   mix, not four bits everywhere: `gguf-q4-k-m` averages 4.85 bits per weight. GGUF
   also quantizes embeddings, which compressed-tensors leaves at 16-bit. Published

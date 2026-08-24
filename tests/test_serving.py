@@ -24,8 +24,13 @@ from autodistiller.metadata.profiles import (
     resolve_profile,
 )
 from autodistiller.serving.backends import BACKENDS, resolve_backend
-from autodistiller.serving.benchmark import _percentile, build_prompt, run_deployment_benchmark
-from autodistiller.serving.client import probe_endpoint, stream_request
+from autodistiller.serving.benchmark import (
+    _aggregate,
+    _percentile,
+    build_prompt,
+    run_deployment_benchmark,
+)
+from autodistiller.serving.client import RequestMetrics, probe_endpoint, stream_request
 
 MODEL = "fake/model"
 
@@ -190,12 +195,14 @@ def test_build_prompt_scales_with_target():
 
 
 def _run_sweep(transport, **kwargs):
+    # Warmup off unless a test is about warmup: it costs requests the other
+    # tests would then have to account for.
+    kwargs.setdefault("warmup_requests", 0)
     return asyncio.run(
         run_deployment_benchmark(
             url="http://fake",
             backend="vllm",
             transport=transport,
-            warmup_requests=0,
             **kwargs,
         )
     )
@@ -529,3 +536,119 @@ def test_launch_spec_applies_the_translator():
 
     spec = LaunchSpec(template="serve {model}", path_translator=lambda p: f"/mnt/{p}")
     assert spec.command_for("x") == "serve /mnt/x"
+
+
+# --- cold-start stalls --------------------------------------------------
+
+
+def _request(total_s: float, *, ttft_s: float = 0.058, tokens: int = 128) -> RequestMetrics:
+    return RequestMetrics(
+        ok=True, total_s=total_s, ttft_s=ttft_s, n_prompt_tokens=256, n_output_tokens=tokens
+    )
+
+
+def test_a_stall_is_reported_rather_than_measured():
+    """The numbers here are the ones a real run produced: seven requests at
+    0.67s, one at 9.33s, and a phase duration of 21.1s. Wall-clock throughput
+    absorbed the stall and reported 48 tok/s for a server doing 209."""
+    results = [_request(0.67) for _ in range(7)] + [_request(9.33)]
+    phase = _aggregate(results, duration_s=21.14, concurrency=1)
+
+    assert phase.output_tokens_per_s == pytest.approx(1024 / 21.14, rel=0.01)
+    assert phase.throughput_efficiency < 0.5
+    assert phase.warnings
+    assert "stall" in phase.warnings[0]
+    assert "unreliable" in phase.warnings[0]
+
+
+def test_a_clean_phase_carries_no_warning():
+    """The second server in the same run: eight requests within 0.03s of each
+    other. Nothing to flag, and flagging it would make the warning worthless."""
+    results = [_request(0.85, ttft_s=0.060) for _ in range(8)]
+    phase = _aggregate(results, duration_s=6.79, concurrency=1)
+
+    assert phase.throughput_efficiency > 0.8
+    assert not phase.warnings
+
+
+def test_queueing_at_higher_concurrency_is_not_a_stall():
+    """Latency legitimately spreads under load, so the check has to compare
+    against the per-token ceiling rather than against latency spread."""
+    results = [_request(0.78) for _ in range(28)] + [_request(1.08) for _ in range(4)]
+    phase = _aggregate(results, duration_s=3.47, concurrency=8)
+
+    assert not phase.warnings
+
+
+def test_efficiency_is_absent_when_there_is_nothing_to_compare():
+    phase = _aggregate([RequestMetrics(ok=False, total_s=0.0, error="boom")], 1.0, 1)
+    assert phase.throughput_efficiency is None
+    assert not phase.warnings
+
+
+# --- warmup -------------------------------------------------------------
+
+
+def _stalling_server(*, slow_requests: int, slow_delay: float = 0.30):
+    """A server that answers /v1/models before it is warm.
+
+    Which is what vLLM does: it reports healthy, then pays for CUDA graph
+    capture on the first real requests.
+    """
+    state = {"seen": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/models":
+            return httpx.Response(200, json={"data": [{"id": MODEL}]})
+        state["seen"] += 1
+        cold = state["seen"] <= slow_requests
+        return httpx.Response(
+            200,
+            content=_sse_body(
+                n_tokens=4,
+                ttft_delay=slow_delay if cold else 0.005,
+                token_delay=0.001,
+                include_usage=True,
+                prompt_tokens=16,
+                chat=False,
+            ),
+        )
+
+    return httpx.MockTransport(handler), state
+
+
+def test_warmup_absorbs_the_cold_start_so_the_phase_does_not():
+    """The whole point: a stall that used to land in the first measured phase
+    should be paid for during warmup instead."""
+    transport, state = _stalling_server(slow_requests=3)
+    result = _run_sweep(transport, concurrency_levels=(1,), warmup_requests=2)
+
+    assert state["seen"] > 3, "warmup stopped before the server was warm"
+    phase = result.phases[0]
+    assert not phase.warnings
+    assert phase.request_latency.max < 0.2  # no cold request reached the measurement
+
+
+def test_a_warm_server_is_not_warmed_ten_times():
+    """Warming until stable must not mean always paying the cap."""
+    transport, state = _stalling_server(slow_requests=0)
+    _run_sweep(transport, concurrency_levels=(1,), warmup_requests=2)
+
+    assert state["seen"] <= 3 + 8  # settled after the minimum, then the phase ran
+
+
+def test_warmup_is_bounded_when_a_server_never_settles():
+    """A server that stays erratic is telling us something a longer wait will
+    not fix, so the cap has to hold."""
+    transport, state = _stalling_server(slow_requests=1000)
+    _run_sweep(transport, concurrency_levels=(1,), warmup_requests=2, warmup_max_requests=4)
+
+    assert state["seen"] <= 4 + 8
+
+
+def test_warmup_stops_when_the_server_is_failing():
+    """Ten failing warmup requests tell us nothing the phase will not report
+    properly."""
+    transport = fake_server(status=500)
+    result = _run_sweep(transport, concurrency_levels=(1,), warmup_requests=2)
+    assert result.phases[0].n_failed == 8

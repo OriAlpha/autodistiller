@@ -190,6 +190,17 @@ def render_deployment(benchmark) -> Table:
             _gib(phase.peak_vram_bytes),
             Text(str(phase.n_failed), style="red") if phase.n_failed else "0",
         )
+
+    # A stall that inflated a phase must stay visible in a record read back
+    # later, not only in the progress output of the run that produced it.
+    for phase in benchmark.phases:
+        for warning in phase.warnings:
+            note = f"concurrency {phase.concurrency}: {warning}"
+            table.caption = f"{table.caption}\n{note}" if table.caption else note
+    if table.caption:
+        table.caption_style = "yellow"
+        table.caption_justify = "left"
+
     return table
 
 

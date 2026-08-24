@@ -26,6 +26,33 @@ from .client import RequestMetrics, probe_endpoint, stream_request
 
 VRAM_POLL_INTERVAL_S = 0.25
 
+WARMUP_MAX_REQUESTS = 10
+WARMUP_STABLE_RUN = 3
+WARMUP_TOLERANCE = 0.25
+"""How warm is warm enough.
+
+A server answers ``/v1/models`` before it is ready to be measured: vLLM captures
+CUDA graphs and compiles kernels lazily, on real requests, after it starts
+reporting healthy. A fixed warmup count is a guess at how long that takes, and
+guessing low is not visible in the result -- it just moves the cost into the
+first measured phase.
+
+So warm up until the server proves it is warm: stop once ``WARMUP_STABLE_RUN``
+consecutive requests land within ``WARMUP_TOLERANCE`` of the fastest seen.
+Bounded by ``WARMUP_MAX_REQUESTS``, because a server that never stabilizes is
+telling us something a longer wait will not fix.
+"""
+
+MIN_THROUGHPUT_EFFICIENCY = 0.5
+"""Below this, a phase's throughput is not describing steady-state serving.
+
+Wall-clock throughput is total tokens over wall-clock time, so it absorbs any
+stall. Per-token latency does not: a median is unmoved by one outlier. When the
+two disagree badly the wall-clock number is measuring a hiccup rather than the
+server, and reporting it as throughput would corrupt the ranking that depends
+on it.
+"""
+
 # Deterministic filler so every run sends the same prompt. Real prompts vary,
 # but a benchmark that varies its input cannot be compared against itself.
 _FILLER = (
@@ -154,6 +181,67 @@ async def _run_phase(
     return list(results), time.perf_counter() - started
 
 
+async def _warm_until_stable(
+    client: httpx.AsyncClient,
+    *,
+    url: str,
+    model: str,
+    prompt: str,
+    max_tokens: int,
+    use_chat: bool,
+    ignore_eos: bool,
+    minimum: int,
+    maximum: int,
+) -> tuple[bool, list[float]]:
+    """Send single requests until the server settles. Returns (settled, latencies).
+
+    Settled means ``WARMUP_STABLE_RUN`` consecutive requests all landed within
+    ``WARMUP_TOLERANCE`` of the fastest seen so far. The fastest is the right
+    reference: a cold-start stall is slow against a floor the server reaches and
+    then holds, so comparing against the floor detects it where comparing
+    consecutive pairs would accept a uniformly slow run.
+    """
+    latencies: list[float] = []
+
+    for _ in range(max(maximum, minimum)):
+        result = await stream_request(
+            client,
+            url=url,
+            model=model,
+            prompt=prompt,
+            max_tokens=max_tokens,
+            use_chat=use_chat,
+            ignore_eos=ignore_eos,
+        )
+        if not result.ok:
+            # A failing warmup is the server's problem to report; the phases
+            # below will record the failures properly.
+            break
+        latencies.append(result.total_s)
+
+        if len(latencies) < max(minimum, WARMUP_STABLE_RUN):
+            continue
+        recent = latencies[-WARMUP_STABLE_RUN:]
+        if max(recent) <= min(latencies) * (1 + WARMUP_TOLERANCE):
+            return True, latencies
+
+    return False, latencies
+
+
+def _throughput_efficiency(phase: ConcurrencyResult) -> float | None:
+    """Measured throughput against what the per-token timings imply.
+
+    At concurrency C each in-flight stream emits a token every TPOT seconds, so
+    C/TPOT is the decode ceiling. A healthy phase lands a little under it -- the
+    gap is prefill, which produces no output tokens. A phase that lands far under
+    it spent its wall-clock time on something other than serving.
+    """
+    if phase.tpot is None or phase.tpot.p50 <= 0 or phase.output_tokens_per_s <= 0:
+        return None
+    implied = phase.concurrency / phase.tpot.p50
+    return phase.output_tokens_per_s / implied if implied > 0 else None
+
+
 def _aggregate(
     results: list[RequestMetrics], duration_s: float, concurrency: int
 ) -> ConcurrencyResult:
@@ -165,7 +253,7 @@ def _aggregate(
     latencies = [r.total_s for r in ok]
     total_output_tokens = sum(r.n_output_tokens for r in ok)
 
-    return ConcurrencyResult(
+    phase = ConcurrencyResult(
         concurrency=concurrency,
         n_requests=len(results),
         n_failed=len(failed),
@@ -180,6 +268,22 @@ def _aggregate(
         errors=sorted({r.error for r in failed if r.error})[:5],
     )
 
+    efficiency = _throughput_efficiency(phase)
+    phase.throughput_efficiency = efficiency
+
+    if efficiency is not None and efficiency < MIN_THROUGHPUT_EFFICIENCY and phase.tpot is not None:
+        slowest = phase.request_latency.max if phase.request_latency else 0.0
+        median = phase.request_latency.p50 if phase.request_latency else 0.0
+        phase.warnings.append(
+            f"throughput is {efficiency * 100:.0f}% of what the per-token timings imply "
+            f"({phase.output_tokens_per_s:.0f} vs "
+            f"{phase.concurrency / phase.tpot.p50:.0f} tok/s); "
+            f"slowest request {slowest:.2f}s against a median of {median:.2f}s. "
+            f"A stall inflated this measurement -- treat it as unreliable."
+        )
+
+    return phase
+
 
 async def run_deployment_benchmark(
     *,
@@ -191,6 +295,7 @@ async def run_deployment_benchmark(
     concurrency_levels: tuple[int, ...] = (1, 4, 16),
     requests_per_level: int | None = None,
     warmup_requests: int = 2,
+    warmup_max_requests: int = WARMUP_MAX_REQUESTS,
     use_chat: bool = False,
     ignore_eos: bool = True,
     device_index: int = 0,
@@ -216,21 +321,27 @@ async def run_deployment_benchmark(
     phases: list[ConcurrencyResult] = []
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(300.0), transport=transport) as client:
-        # The first requests pay for CUDA graph capture and cache warmup, which
-        # no steady-state workload repeats.
+        # The first requests pay for CUDA graph capture and kernel compilation,
+        # which no steady-state workload repeats. Warm until the server proves
+        # it is warm rather than for a fixed count; see WARMUP_TOLERANCE.
         if warmup_requests:
-            say(f"warmup ({warmup_requests} requests)")
-            await _run_phase(
+            say(f"warmup (until stable, max {warmup_max_requests})")
+            warmed, latencies = await _warm_until_stable(
                 client,
                 url=url,
                 model=served_model,
                 prompt=prompt,
                 max_tokens=max_tokens,
-                concurrency=1,
-                n_requests=warmup_requests,
                 use_chat=use_chat,
                 ignore_eos=ignore_eos,
+                minimum=warmup_requests,
+                maximum=warmup_max_requests,
             )
+            if latencies:
+                detail = f"  warm after {len(latencies)} requests, {latencies[-1]:.2f}s"
+                if not warmed:
+                    detail += " (never stabilized; measurements may be noisy)"
+                say(detail)
 
         async with _VramSampler(device_index) as vram:
             for concurrency in concurrency_levels:
@@ -256,6 +367,8 @@ async def run_deployment_benchmark(
                 if phase.n_failed:
                     summary += f" | {phase.n_failed} failed"
                 say(summary)
+                for warning in phase.warnings:
+                    say(f"  warning: {warning}")
 
     return DeploymentBenchmark(
         backend=backend,

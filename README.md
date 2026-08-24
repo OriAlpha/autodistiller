@@ -386,6 +386,71 @@ numbers.
 
 ---
 
+## Reference benchmarks
+
+Numbers AutoDistiller measured on its development machine, so you have something
+to compare your own first run against. Every figure below came out of the tool
+itself and is reproducible from the run records in `runs/`.
+
+**Conditions.** Qwen3-0.6B on an RTX 5070 Laptop (8 GiB, sm_120), vLLM 0.27.1 under
+WSL2, torch 2.11 / CUDA 12.8, `--gpu-memory-utilization 0.85`, **on wall power**.
+Read the conditions before the numbers — see [why they matter](#your-numbers-will-differ).
+
+### Compression
+
+wikitext-2 perplexity, 57 documents, same baseline for every row. Retention is
+direction-aware, so higher is better.
+
+| Method | Artifact | vs bf16 | Perplexity | Quality retention |
+|---|---|---|---|---|
+| baseline (bf16) | 1.11 GiB | — | 20.83 | 100% |
+| `int8-weight-only` | 0.72 GiB | 0.65x | 20.80 | **100.2%** |
+| `fp8` | 0.71 GiB | 0.64x | 21.04 | 99.0% |
+| `int4-awq` | 0.51 GiB | 0.46x | 24.10 | 86.4% |
+
+INT4 loses real quality on a 0.6B model. That is expected rather than a defect:
+the smaller the model, the less redundancy there is to quantize away, and it is
+exactly the kind of trade-off the Pareto view exists to make visible.
+
+### Deployment
+
+Measured inside vLLM, 256-token prompts, 128 output tokens, zero failed requests.
+These are deployment claims; the Transformers smoke test in Phase 1 is not.
+
+| Concurrency | bf16 throughput | bf16 TTFT p50 | fp8 throughput | fp8 TTFT p50 | fp8 speedup |
+|---|---|---|---|---|---|
+| 1 | 195 tok/s | 56 ms | 253 tok/s | 56 ms | **1.30x** |
+| 4 | 649 tok/s | 66 ms | 824 tok/s | 64 ms | 1.27x |
+| 16 | 2144 tok/s | 74 ms | 2626 tok/s | 79 ms | 1.22x |
+| 32 | 3036 tok/s | 285 ms | 3623 tok/s | 294 ms | 1.19x |
+
+Peak VRAM 7.78 GiB (bf16) against 7.04 GiB (fp8), sampled device-wide through
+NVML. Device-wide is deliberate: it is the number that answers "will this fit",
+and the only one visible when the server runs across a WSL boundary.
+
+So on this model FP8 is the clear pick — ~1.2-1.3x throughput for 1% of quality —
+and INT4's extra 0.2 GiB costs 13.6% of quality to get it.
+
+### Your numbers will differ
+
+Not by a little. The same model, on the same GPU, measured **3x apart** during
+development for a reason that had nothing to do with the model:
+
+| | Peak throughput @ c=8 | Cause |
+|---|---|---|
+| Wall power | 1179 tok/s | 80–115 W GPU power budget |
+| On battery | 395 tok/s | GPU capped to **34 W**, `SW Power Cap: Active` |
+
+A second run was corrupted a different way, by an idle Ollama server holding
+5.9 GiB of the 8 GiB card. Neither is visible in a throughput number on its own,
+which is why every run records the hardware and the software stack, and why the
+experiment cache refuses to reuse a result across either.
+
+Check `nvidia-smi --query-gpu=enforced.power.limit,memory.used --format=csv`
+before you trust a benchmark from a laptop.
+
+---
+
 ## Tasks
 
 Run `uv run autodistiller tasks` for the live list.

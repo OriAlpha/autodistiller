@@ -179,6 +179,14 @@ class ConcurrencyResult(BaseModel):
     requests_per_s: float = 0.0
     mean_prompt_tokens: float = 0.0
     peak_vram_bytes: int | None = None
+    throughput_efficiency: float | None = Field(
+        default=None,
+        description=(
+            "Measured throughput over what the per-token timings imply. Near 1 is "
+            "healthy; far below means wall-clock time went somewhere other than serving."
+        ),
+    )
+    warnings: list[str] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
 
 
