@@ -93,6 +93,40 @@ class Constraints:
             f"{self.min_quality_retention * 100:.1f}% floor"
         ]
 
+    def quality_warning(self, comparison) -> str | None:
+        """Whether the quality measurement is precise enough to mean what it says.
+
+        :meth:`check_quality` compares point estimates, which is the right
+        decision rule but reads as more certain than the data. Perplexity on a
+        handful of documents carries a standard error that can rival the value,
+        and two such numbers make a ratio that cannot settle a 95% floor. The
+        verdict still stands -- refusing to decide would be worse -- but a reader
+        should know when it rests on a difference the measurement cannot see.
+
+        The giveaway in practice is retention above 100%: compression does not
+        improve a model, so anything over 1.0 is noise being read as a result.
+        """
+        retention, stderr = comparison.retention, comparison.stderr
+        if retention is None or stderr is None or stderr <= 0:
+            return None
+
+        if self.min_quality_retention is not None and comparison.indistinguishable_from(
+            self.min_quality_retention
+        ):
+            return (
+                f"quality retention {comparison.describe()} cannot be told apart from the "
+                f"{self.min_quality_retention * 100:.1f}% floor at this sample size; "
+                f"raise --limit before trusting the verdict"
+            )
+
+        if comparison.indistinguishable_from(1.0):
+            return (
+                f"quality retention {comparison.describe()} is within noise of the baseline; "
+                f"the difference is not measurable at this sample size"
+            )
+
+        return None
+
     def check_benchmark(self, benchmark) -> list[str]:
         """Check the constraints only a real deployment run can settle."""
         if benchmark is None:

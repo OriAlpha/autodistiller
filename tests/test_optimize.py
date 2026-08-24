@@ -8,6 +8,7 @@ which are dropped and why, and whether the winner is defensible.
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import pytest
@@ -236,7 +237,8 @@ def test_retention_uses_the_worst_metric():
     baseline = _record("base", perplexity=10.0, accuracy=0.80)
     candidate = _record("cand", perplexity=10.1, accuracy=0.40)
 
-    worst, per_metric = quality_retention(baseline, candidate)
+    comparison = quality_retention(baseline, candidate)
+    worst, per_metric = comparison.retention, comparison.per_metric
     assert worst == pytest.approx(0.5, rel=0.01)
     assert per_metric["wikitext2/perplexity"] > 0.98
 
@@ -245,7 +247,7 @@ def test_retention_is_direction_aware():
     """Lower perplexity is better, so an improvement must exceed 1.0."""
     baseline = _record("base", perplexity=10.0)
     better = _record("cand", perplexity=8.0)
-    _, per_metric = quality_retention(baseline, better)
+    per_metric = quality_retention(baseline, better).per_metric
     assert per_metric["wikitext2/perplexity"] == pytest.approx(1.25)
 
 
@@ -596,3 +598,150 @@ def test_candidates_differing_only_in_context_keep_separate_benchmarks(tmp_path)
     # And a second search reuses every one of them rather than a single survivor.
     result = _cached_optimizer(tmp_path, benchmark_fn=benchmark).run(candidates)
     assert result.reused_stages.get("benchmark") == len(measured)
+
+
+# --- quality measured with its uncertainty ------------------------------
+
+
+def _noisy_record(run_id: str, *, perplexity: float, stderr: float | None) -> RunRecord:
+    from autodistiller.config import DatasetSpec, PerplexityTask, RunConfig
+
+    config = RunConfig(
+        model=ModelSpec(id="m"),
+        tasks=[PerplexityTask(name="wikitext2", dataset=DatasetSpec(source="text", path="c.txt"))],
+    )
+    return RunRecord(
+        run_id=run_id,
+        config=config,
+        config_fingerprint=config.fingerprint,
+        model=ModelInfo(id="m"),
+        hardware=__import__(
+            "autodistiller.metadata.hardware", fromlist=["detect_hardware"]
+        ).detect_hardware(),
+        environment=__import__(
+            "autodistiller.metadata.environment", fromlist=["collect_environment"]
+        ).collect_environment(),
+        tasks=[
+            TaskResult(
+                name="wikitext2",
+                kind="perplexity",
+                metrics=[
+                    MetricValue(
+                        name="perplexity",
+                        value=perplexity,
+                        higher_is_better=False,
+                        stderr=stderr,
+                    )
+                ],
+            )
+        ],
+    )
+
+
+def test_retention_carries_the_uncertainty_of_both_measurements():
+    """A ratio is only as precise as the two numbers it came from."""
+    baseline = _noisy_record("base", perplexity=20.83, stderr=0.5)
+    candidate = _noisy_record("cand", perplexity=21.04, stderr=0.6)
+
+    comparison = quality_retention(baseline, candidate)
+
+    assert comparison.retention == pytest.approx(20.83 / 21.04, rel=1e-6)
+    # Relative errors add in quadrature: sqrt((.5/20.83)^2 + (.6/21.04)^2).
+    expected = comparison.retention * math.hypot(0.5 / 20.83, 0.6 / 21.04)
+    assert comparison.stderr == pytest.approx(expected, rel=1e-6)
+    assert "±" in comparison.describe()
+
+
+def test_retention_without_stderr_still_works():
+    """Older records carry no standard error; they must still be comparable,
+    just without a claim about precision."""
+    comparison = quality_retention(
+        _noisy_record("base", perplexity=20.0, stderr=None),
+        _noisy_record("cand", perplexity=22.0, stderr=None),
+    )
+    assert comparison.retention == pytest.approx(20.0 / 22.0)
+    assert comparison.stderr is None
+    assert comparison.lower_bound is None
+
+
+def test_a_measurement_this_noisy_is_flagged_as_meaningless():
+    """These are real numbers from a one-document screening run: the standard
+    error is larger than the value it qualifies."""
+    comparison = quality_retention(
+        _noisy_record("base", perplexity=2981.28, stderr=3318.36),
+        _noisy_record("cand", perplexity=2720.97, stderr=2850.81),
+    )
+
+    assert comparison.retention > 1.0  # the candidate "beat" its own baseline
+    assert Constraints().quality_warning(comparison) is not None
+    assert "within noise" in Constraints().quality_warning(comparison)
+
+
+def test_retention_above_one_hundred_percent_is_noise_not_a_result():
+    """Compression does not improve a model. A run reported 101.16% retention,
+    and that 1% was the scale wobbling."""
+    comparison = quality_retention(
+        _noisy_record("base", perplexity=34.83, stderr=9.01),
+        _noisy_record("cand", perplexity=34.43, stderr=8.90),
+    )
+    assert comparison.retention > 1.0
+    assert Constraints().quality_warning(comparison) is not None
+
+
+def test_a_floor_the_measurement_cannot_settle_is_called_out():
+    """94% against a 95% floor, plus or minus 8%, is a coin toss with a decimal
+    point on it."""
+    comparison = quality_retention(
+        _noisy_record("base", perplexity=20.0, stderr=1.2),
+        _noisy_record("cand", perplexity=21.3, stderr=1.2),
+    )
+    warning = Constraints(min_quality_retention=0.95).quality_warning(comparison)
+
+    assert warning is not None
+    assert "cannot be told apart" in warning
+    assert "--limit" in warning
+
+
+def test_a_precise_measurement_is_not_second_guessed():
+    """The warning is worth nothing if it fires on good data too."""
+    comparison = quality_retention(
+        _noisy_record("base", perplexity=20.83, stderr=0.05),
+        _noisy_record("cand", perplexity=24.10, stderr=0.06),
+    )
+    assert Constraints(min_quality_retention=0.95).quality_warning(comparison) is None
+
+
+def test_the_verdict_still_rests_on_the_measurement():
+    """Uncertainty is disclosed, not used to overturn a result: a candidate
+    measured below the floor is still rejected."""
+    constraints = Constraints(min_quality_retention=0.95)
+    comparison = quality_retention(
+        _noisy_record("base", perplexity=20.0, stderr=1.2),
+        _noisy_record("cand", perplexity=21.3, stderr=1.2),
+    )
+
+    assert constraints.check_quality(comparison.retention)
+    assert constraints.quality_warning(comparison) is not None
+
+
+def test_the_search_surfaces_the_warning_on_the_candidate():
+    baseline = _noisy_record("base", perplexity=34.83, stderr=9.01)
+    candidate = _noisy_record("cand", perplexity=34.43, stderr=8.90)
+
+    optimizer = _optimizer(
+        constraints=Constraints(min_quality_retention=0.90),
+        evaluate_fn=lambda t, c: baseline if c.is_baseline else candidate,
+        stop_early=False,
+    )
+    result = optimizer.run(_small_set(n=2))
+
+    flagged = [o for o in result.outcomes if o.warnings]
+    assert flagged, "a candidate judged on noise should say so"
+
+    outcome = flagged[0]
+    assert outcome.quality_stderr is not None
+    # The real figure from a real run, now carrying what it is worth: the
+    # uncertainty is a third of the value it is qualifying.
+    assert outcome.quality_retention == pytest.approx(1.0116, abs=1e-3)
+    assert outcome.quality_stderr > 0.3
+    assert "cannot be told apart from the 90.0% floor" in outcome.summary()

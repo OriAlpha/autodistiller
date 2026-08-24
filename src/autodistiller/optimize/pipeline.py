@@ -19,6 +19,7 @@ the first one tried.
 from __future__ import annotations
 
 import logging
+import math
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -32,7 +33,14 @@ from ..compression.pipeline import run_compression
 from ..config import CompressionSpec, DeploymentSpec, ModelSpec, RunConfig
 from ..metadata.environment import EnvironmentInfo, collect_environment
 from ..metadata.hardware import HardwareInfo, detect_hardware
-from ..results import CompressionArtifact, DeploymentBenchmark, ModelInfo, RunRecord
+from ..regression import SIGNIFICANCE_SIGMA
+from ..results import (
+    CompressionArtifact,
+    DeploymentBenchmark,
+    MetricValue,
+    ModelInfo,
+    RunRecord,
+)
 from ..store import RunStore
 from .constraints import Constraints, Objective, Score, score_candidate, search_order
 from .pareto import ParetoReport
@@ -54,6 +62,11 @@ class CandidateOutcome:
     benchmark: DeploymentBenchmark | None = None
     quality_metrics: dict[str, float] = field(default_factory=dict)
     quality_retention: float | None = None
+    quality_stderr: float | None = None
+    warnings: list[str] = field(default_factory=list)
+    """Things that do not disqualify a candidate but change how much its numbers
+    are worth. A measurement too noisy to settle the constraint it was checked
+    against is the main one."""
     weights_bytes: int | None = None
     violations: list[str] = field(default_factory=list)
     error: str | None = None
@@ -80,6 +93,8 @@ class CandidateOutcome:
         note = f" (reused {', '.join(self.reused)})" if self.reused else ""
         if self.violations:
             return f"{self.candidate.id}: rejected ({self.violations[0]}){note}"
+        if self.warnings:
+            note += f" -- {self.warnings[0]}"
         return f"{self.candidate.id}: qualified at {self.stage}{note}"
 
 
@@ -154,13 +169,77 @@ def _retention(baseline: float, candidate: float, higher_is_better: bool) -> flo
     return candidate / baseline if higher_is_better else baseline / candidate
 
 
-def quality_retention(baseline: RunRecord, candidate: RunRecord) -> tuple[float | None, dict]:
-    """Worst per-metric retention across the shared tasks.
+def _retention_stderr(
+    retention: float, baseline: MetricValue, candidate: MetricValue
+) -> float | None:
+    """Uncertainty on a retention ratio, propagated from both measurements.
+
+    Retention is a ratio of two measured numbers, and a ratio's relative
+    uncertainty is the two relative uncertainties added in quadrature. Without
+    this the ratio is reported to four decimal places whatever the sample size,
+    which reads as precision the measurement does not have.
+    """
+    if baseline.stderr is None or candidate.stderr is None:
+        return None
+    if baseline.value == 0 or candidate.value == 0:
+        return None
+    relative = math.hypot(baseline.stderr / baseline.value, candidate.stderr / candidate.value)
+    return abs(retention) * relative
+
+
+@dataclass(frozen=True)
+class QualityComparison:
+    """How much quality a candidate held, and how well that is known.
+
+    The second half matters as much as the first. Perplexity on a handful of
+    documents carries a standard error that can rival the value, and a retention
+    figure derived from two such numbers cannot settle a 95% floor no matter how
+    many decimal places it is printed to.
+    """
+
+    retention: float | None = None
+    per_metric: dict[str, float] = field(default_factory=dict)
+    stderr: float | None = None
+    worst_metric: str | None = None
+
+    @property
+    def lower_bound(self) -> float | None:
+        """Retention at the pessimistic end of its uncertainty."""
+        if self.retention is None or self.stderr is None:
+            return None
+        return self.retention - SIGNIFICANCE_SIGMA * self.stderr
+
+    @property
+    def upper_bound(self) -> float | None:
+        if self.retention is None or self.stderr is None:
+            return None
+        return self.retention + SIGNIFICANCE_SIGMA * self.stderr
+
+    def indistinguishable_from(self, level: float) -> bool:
+        """Whether the measurement can tell retention apart from ``level``."""
+        if self.retention is None or self.stderr is None:
+            return False
+        return abs(self.retention - level) <= SIGNIFICANCE_SIGMA * self.stderr
+
+    def describe(self) -> str:
+        if self.retention is None:
+            return "not measured"
+        text = f"{self.retention * 100:.2f}%"
+        if self.stderr is not None:
+            text += f" ± {self.stderr * 100:.2f}%"
+        return text
+
+
+def quality_retention(baseline: RunRecord, candidate: RunRecord) -> QualityComparison:
+    """Worst per-metric retention across the shared tasks, with its uncertainty.
 
     The worst metric, not the average: a candidate that holds perplexity but
     collapses on the task the user actually cares about has not held quality.
+    The uncertainty comes from the same metric, since that is the one the
+    decision is made on.
     """
     per_metric: dict[str, float] = {}
+    stderrs: dict[str, float | None] = {}
 
     for baseline_task in baseline.tasks:
         candidate_task = candidate.task(baseline_task.name)
@@ -171,10 +250,22 @@ def quality_retention(baseline: RunRecord, candidate: RunRecord) -> tuple[float 
             if other is None:
                 continue
             value = _retention(metric.value, other.value, metric.higher_is_better)
-            if value is not None:
-                per_metric[f"{baseline_task.name}/{metric.name}"] = value
+            if value is None:
+                continue
+            key = f"{baseline_task.name}/{metric.name}"
+            per_metric[key] = value
+            stderrs[key] = _retention_stderr(value, metric, other)
 
-    return (min(per_metric.values()) if per_metric else None), per_metric
+    if not per_metric:
+        return QualityComparison()
+
+    worst = min(per_metric, key=lambda k: per_metric[k])
+    return QualityComparison(
+        retention=per_metric[worst],
+        per_metric=per_metric,
+        stderr=stderrs.get(worst),
+        worst_metric=worst,
+    )
 
 
 class Optimizer:
@@ -340,9 +431,16 @@ class Optimizer:
                 if candidate.is_baseline:
                     outcome.quality_retention = 1.0
                 elif baseline_record is not None:
-                    retention, per_metric = quality_retention(baseline_record, record)
-                    outcome.quality_retention = retention
-                    outcome.quality_metrics = per_metric
+                    comparison = quality_retention(baseline_record, record)
+                    outcome.quality_retention = comparison.retention
+                    outcome.quality_metrics = comparison.per_metric
+                    outcome.quality_stderr = comparison.stderr
+
+                    # A floor the measurement cannot settle is worth saying out
+                    # loud: the verdict below is then a coin toss wearing a
+                    # decimal point.
+                    if (note := self.constraints.quality_warning(comparison)) is not None:
+                        outcome.warnings.append(note)
 
                 outcome.violations = self.constraints.check_quality(outcome.quality_retention)
                 if outcome.violations:
@@ -462,5 +560,6 @@ __all__ = [
     "CandidateOutcome",
     "OptimizationResult",
     "Optimizer",
+    "QualityComparison",
     "quality_retention",
 ]
