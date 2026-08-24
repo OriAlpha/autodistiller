@@ -401,3 +401,131 @@ def test_nvml_tracks_real_allocations():
     finally:
         del block
         torch.cuda.empty_cache()
+
+
+# --- server lifecycle ---------------------------------------------------
+
+FAKE_SERVER = """
+import json, sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+port = int(sys.argv[1])
+
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/v1/models":
+            body = json.dumps({"data": [{"id": "fake"}]}).encode()
+            self.send_response(200)
+        else:
+            body = b"{}"
+            self.send_response(404)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *a):
+        pass
+
+HTTPServer(("127.0.0.1", port), H).serve_forever()
+"""
+
+
+def _free_port() -> int:
+    import socket
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def test_launcher_starts_waits_and_stops(tmp_path):
+    """The whole lifecycle against a real process."""
+    import sys
+
+    from autodistiller.serving.launcher import LaunchSpec, serving
+
+    script = tmp_path / "fake_server.py"
+    script.write_text(FAKE_SERVER, encoding="utf-8")
+    port = _free_port()
+
+    spec = LaunchSpec(
+        template=f'"{sys.executable}" "{script}" {port}',
+        url=f"http://127.0.0.1:{port}",
+        port=port,
+        ready_timeout_s=30,
+    )
+
+    with serving(spec, "fake/model") as url:
+        response = httpx.get(f"{url}/v1/models", timeout=5)
+        assert response.status_code == 200
+        assert response.json()["data"][0]["id"] == "fake"
+
+    # The server runs under a shell, so it is a grandchild: terminating the
+    # process we hold is not enough, and the tree has to be killed.
+    with pytest.raises(httpx.HTTPError):
+        httpx.get(f"http://127.0.0.1:{port}/v1/models", timeout=2)
+
+
+def test_launcher_gives_up_when_the_process_dies(tmp_path):
+    """A server that already exited will never become ready, and waiting the
+    full timeout for that is wasted minutes."""
+    import sys
+
+    from autodistiller.serving.launcher import LaunchSpec, ServerError, serving
+
+    spec = LaunchSpec(
+        template=f'"{sys.executable}" -c "raise SystemExit(3)"',
+        url=f"http://127.0.0.1:{_free_port()}",
+        ready_timeout_s=60,
+    )
+    with pytest.raises(ServerError, match="exited with code"), serving(spec, "m"):
+        pass
+
+
+def test_stopped_means_not_serving_models():
+    """The port outlives the engine: after vLLM exits something still answers
+    with a 404, so waiting for silence would wait forever."""
+    from autodistiller.serving.launcher import wait_until_stopped
+
+    assert wait_until_stopped(f"http://127.0.0.1:{_free_port()}", timeout_s=5)
+
+
+def test_launch_template_formats_the_candidate():
+    from autodistiller.serving.launcher import LaunchSpec
+
+    spec = LaunchSpec(template="serve {model} -p {port} -c {max_model_len} {kv_flag}", port=9001)
+    assert spec.command_for("m", max_model_len=4096, kv_dtype="fp8") == (
+        "serve m -p 9001 -c 4096 --kv-cache-dtype fp8"
+    )
+    assert spec.command_for("m", max_model_len=2048).strip() == "serve m -p 9001 -c 2048"
+
+
+def test_wsl_path_translates_local_artifacts(tmp_path):
+    """A launch that crosses into WSL carries the model path with it, and a
+    Windows path means nothing on the other side."""
+    import sys
+
+    from autodistiller.serving.launcher import wsl_path
+
+    artifact = tmp_path / "model-fp8"
+    artifact.mkdir()
+    translated = wsl_path(str(artifact))
+
+    if sys.platform == "win32":
+        assert translated.startswith("/mnt/")
+        assert "\\" not in translated
+    assert translated.endswith("model-fp8")
+
+
+def test_wsl_path_leaves_hub_ids_alone():
+    """Repo ids are not paths and must survive untouched."""
+    from autodistiller.serving.launcher import wsl_path
+
+    assert wsl_path("Qwen/Qwen3-0.6B") == "Qwen/Qwen3-0.6B"
+
+
+def test_launch_spec_applies_the_translator():
+    from autodistiller.serving.launcher import LaunchSpec
+
+    spec = LaunchSpec(template="serve {model}", path_translator=lambda p: f"/mnt/{p}")
+    assert spec.command_for("x") == "serve /mnt/x"

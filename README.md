@@ -17,7 +17,7 @@ algorithm. It composes them, measures them under real deployment conditions, and
 
 ---
 
-## Status: Phases 1–4
+## Status: Phases 1–5
 
 Phase 1 is complete and usable on its own. Its milestone is deliberately unglamorous:
 
@@ -39,8 +39,9 @@ good as the baseline it is measured against. So Phase 1 ships:
 | NVIDIA hardware profiles and format capabilities | [`metadata/profiles.py`](src/autodistiller/metadata/profiles.py) |
 | Compression through existing backends | [`compression/`](src/autodistiller/compression) |
 | Candidate generation and memory screening | [`candidates/`](src/autodistiller/candidates) |
+| Constrained optimization and ranking | [`optimize/`](src/autodistiller/optimize) |
 
-Phases 5–10 (constrained optimization, experiment cache, Pareto analysis, export) are on the
+Phases 6–10 (experiment cache, Pareto analysis, export, llama.cpp) are on the
 [roadmap](#roadmap) below.
 
 ### On isolation
@@ -154,7 +155,26 @@ Memory is estimated from the model's config alone, so a whole search space costs
 rather than a download per candidate. On Qwen3-0.6B the estimates land within 2% of the artifacts
 that were actually produced, and the KV-cache figure matches what vLLM reports at startup.
 
-### 6. Check a candidate against the baseline
+### 6. Let it decide for you
+
+```bash
+uv run autodistiller optimize   --model Qwen/Qwen3-0.6B   --backend vllm   --max-vram 8GiB   --min-quality 95   --objective throughput   --calibration wikitext2   --launch-preset wsl-vllm
+```
+
+Generates candidates, screens them on estimated memory, compresses the survivors, scores quality
+against the baseline, benchmarks whatever still qualifies in a real server, and ranks the rest.
+Each stage is more expensive than the last, so a candidate that fails cheaply never costs anything
+more.
+
+The objective sets the search order, which is what makes `--stop-early` (the default) honest: under
+`throughput` the most compressed candidate is tried first, so the first one that holds quality is
+also the fastest one that holds quality. Under `quality` the order reverses.
+
+Without `--launch-preset`, the deployment stage is skipped and ranking falls back to what can be
+measured without a server (quality, size). Latency and throughput constraints require it, and the
+command says so rather than silently ignoring them.
+
+### 7. Check a candidate against the baseline
 
 ```bash
 uv run autodistiller compare <baseline_run_id> <candidate_run_id> --min-retention 0.95
@@ -162,7 +182,7 @@ uv run autodistiller compare <baseline_run_id> <candidate_run_id> --min-retentio
 
 Exits non-zero when quality did not hold, so it drops straight into CI.
 
-### 7. Browse what you have measured
+### 8. Browse what you have measured
 
 ```bash
 uv run autodistiller runs
@@ -304,8 +324,8 @@ numbers can never be reused, so both gates run before anything is uploaded.
 | 2 | Hardware & deployment profiling (vLLM) | **done** |
 | 3 | Compression backend integration (LLM Compressor adapters) | **done** |
 | 4 | Candidate generator | **done** |
-| 5 | Constrained optimization | next |
-| 6 | Persistent experiment cache | planned |
+| 5 | Constrained optimization | **done** |
+| 6 | Persistent experiment cache | next |
 | 7 | Pareto analysis | planned |
 | 8 | Export & reproducibility | planned |
 | 9 | Multi-backend expansion (llama.cpp) | planned |

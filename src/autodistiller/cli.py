@@ -43,6 +43,7 @@ from .reporting.console import (
     render_deployment,
     render_environment,
     render_hardware,
+    render_optimization,
     render_regression,
     render_run,
 )
@@ -595,6 +596,146 @@ def candidates(
         "[dim]Memory figures are estimates from the model config, "
         "used to screen before expensive runs.[/dim]"
     )
+
+
+@app.command()
+def optimize(
+    model: str = typer.Option(..., "--model", "-m", help="Hugging Face id or local path"),
+    backend: str = typer.Option("vllm", "--backend", "-b"),
+    objective: str = typer.Option(
+        "balanced", "--objective", help="throughput | latency | size | quality | balanced"
+    ),
+    max_vram: str | None = typer.Option(None, "--max-vram", help="e.g. 8GiB"),
+    min_quality: float | None = typer.Option(
+        None, "--min-quality", help="Percent of baseline quality to retain, e.g. 95"
+    ),
+    max_ttft_ms: float | None = typer.Option(None, "--max-ttft-ms"),
+    min_throughput: float | None = typer.Option(
+        None, "--min-throughput", help="Tokens per second at peak concurrency"
+    ),
+    task: list[str] | None = typer.Option(
+        None, "--task", "-t", help="Quality screening tasks (default wikitext2)"
+    ),
+    limit: int = typer.Option(128, help="Documents per screening task"),
+    calibration: str | None = typer.Option(
+        None, "--calibration", help="Calibration corpus for methods that need it"
+    ),
+    method: list[str] | None = typer.Option(None, "--method", help="Restrict the search space"),
+    max_candidates: int = typer.Option(12, "--max-candidates"),
+    concurrency: int = typer.Option(8, "--concurrency", help="Sequences the KV cache must hold"),
+    launch_template: str | None = typer.Option(
+        None, "--launch", help="Command template to start a server. See --launch-preset."
+    ),
+    launch_preset: str = typer.Option(
+        "none", "--launch-preset", help="none | wsl-vllm | native-vllm"
+    ),
+    stop_early: bool = typer.Option(True, "--stop-early/--no-stop-early"),
+    artifacts_root: Path = typer.Option(Path("artifacts"), "--artifacts-root"),
+    output_dir: Path = typer.Option(Path("runs"), "--output-dir", "-o"),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Find the best deployment configuration under explicit constraints."""
+    _configure_logging(verbose)
+
+    from .candidates.memory import parse_size
+    from .optimize.command import NATIVE_VLLM_TEMPLATE, WSL_VLLM_STOP, WSL_VLLM_TEMPLATE
+    from .optimize.command import optimize as run_optimize
+    from .optimize.constraints import Constraints, Objective
+    from .serving.launcher import LaunchSpec, wsl_path
+
+    try:
+        chosen_objective = Objective(objective.lower())
+    except ValueError as exc:
+        raise typer.BadParameter(
+            f"unknown objective {objective!r}; choose from {', '.join(o.value for o in Objective)}"
+        ) from exc
+
+    budget = None
+    if max_vram:
+        try:
+            budget = parse_size(max_vram)
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+
+    if min_quality is not None and not 0 < min_quality <= 100:
+        raise typer.BadParameter("--min-quality is a percent, e.g. 95")
+
+    constraints = Constraints(
+        min_quality_retention=min_quality / 100 if min_quality is not None else None,
+        max_vram_bytes=budget,
+        max_ttft_s=max_ttft_ms / 1000 if max_ttft_ms is not None else None,
+        min_throughput_tokens_per_s=min_throughput,
+    )
+
+    try:
+        tasks = resolve_tasks(task, limit=limit)
+        calibration_spec = (
+            resolve_tasks([calibration], limit=512)[0].dataset if calibration else None
+        )
+    except (ValueError, FileNotFoundError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+    template = launch_template
+    if template is None and launch_preset != "none":
+        template = {"wsl-vllm": WSL_VLLM_TEMPLATE, "native-vllm": NATIVE_VLLM_TEMPLATE}.get(
+            launch_preset
+        )
+        if template is None:
+            raise typer.BadParameter(f"unknown --launch-preset {launch_preset!r}")
+
+    # A WSL launch crosses a process boundary, so terminating the launcher does
+    # not stop the server; it needs an explicit stop command.
+    is_wsl = template == WSL_VLLM_TEMPLATE
+    stop = WSL_VLLM_STOP if is_wsl else None
+    launch = (
+        LaunchSpec(
+            template=template,
+            stop_template=stop,
+            # Artifact paths are local; the server is not.
+            path_translator=wsl_path if is_wsl else None,
+        )
+        if template
+        else None
+    )
+    if launch is None and constraints.needs_benchmark:
+        raise typer.BadParameter(
+            "latency and throughput constraints need a deployment benchmark. "
+            "Pass --launch-preset wsl-vllm (or --launch with your own command)."
+        )
+
+    hardware = detect_hardware()
+    profile = profile_from_gpu(hardware.gpus[0]) if hardware.gpus else None
+
+    try:
+        result = run_optimize(
+            model=ModelSpec(id=model),
+            tasks=tasks,
+            constraints=constraints,
+            objective=chosen_objective,
+            backend=backend,
+            profile=profile,
+            calibration=calibration_spec,
+            launch=launch,
+            artifacts_root=artifacts_root,
+            runs_dir=output_dir,
+            methods=tuple(method) if method else None,
+            concurrency=concurrency,
+            max_candidates=max_candidates,
+            stop_early=stop_early,
+            skip_benchmark=launch is None,
+            progress=lambda message: console.print(f"[dim]|[/dim] {message}"),
+        )
+    except (KeyError, ValueError, RuntimeError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+
+    console.print()
+    console.print(render_optimization(result))
+    console.print()
+    console.print(result.explain())
+
+    if result.recommended is None:
+        raise typer.Exit(code=1)
 
 
 @app.command()

@@ -274,6 +274,52 @@ def render_candidates(candidate_set, *, show_rejected: bool = True) -> Table:
     return table
 
 
+def render_optimization(result) -> Table:
+    """Render every configuration that was tried, and how far each one got."""
+    table = Table(
+        title=(
+            f"Optimization: {result.model_id} on {result.backend}, "
+            f"objective {result.objective.value}"
+        ),
+        title_justify="left",
+        header_style="bold",
+    )
+    table.add_column("Candidate")
+    table.add_column("Stage")
+    table.add_column("Quality", justify="right")
+    table.add_column("Size", justify="right")
+    table.add_column("Throughput", justify="right")
+    table.add_column("TTFT", justify="right")
+    table.add_column("Verdict")
+
+    best = result.recommended
+    for outcome in result.outcomes:
+        benchmark = outcome.benchmark
+        single = benchmark.single_stream if benchmark else None
+        peak = benchmark.best_throughput if benchmark else None
+
+        if outcome.error:
+            verdict = Text("failed", style="red")
+        elif outcome.violations:
+            verdict = Text(outcome.violations[0], style="yellow")
+        elif best is not None and outcome is best:
+            verdict = Text("RECOMMENDED", style="bold green")
+        else:
+            verdict = Text("qualified", style="green")
+
+        table.add_row(
+            outcome.candidate.id,
+            outcome.stage,
+            f"{outcome.quality_retention * 100:.2f}%" if outcome.quality_retention else "-",
+            _gib(outcome.weights_bytes),
+            f"{peak.output_tokens_per_s:.0f} tok/s" if peak else "-",
+            f"{single.ttft.p50 * 1000:.0f}ms" if single and single.ttft else "-",
+            verdict,
+        )
+
+    return table
+
+
 def render_run(record: RunRecord, *, verbose: bool = False) -> None:
     """Print a full run record."""
     status_style = "green" if record.status == "ok" else "red"
@@ -395,6 +441,7 @@ __all__ = [
     "render_deployment",
     "render_environment",
     "render_hardware",
+    "render_optimization",
     "render_regression",
     "render_run",
 ]
