@@ -83,10 +83,31 @@ class Constraints:
             f"{self.max_vram_bytes / 1024**3:.2f} GiB budget"
         ]
 
-    def check_quality(self, retention: float | None) -> list[str]:
-        if self.min_quality_retention is None or retention is None:
+    def check_quality(self, retention: float | None, *, measurable: bool = True) -> list[str]:
+        """Whether a candidate clears the quality floor.
+
+        ``measurable`` is False when nothing could be compared against -- no
+        baseline was evaluated, so there is no retention figure and never will
+        be for this candidate. That is a violation rather than a pass: the user
+        asked for a floor, and a floor that cannot be checked has not been met.
+        Reporting it as satisfied is the worst of the three options, because
+        nothing in the output looks wrong.
+
+        ``retention is None`` while still measurable is different -- it means
+        the comparison has not happened *yet*, as during memory screening -- and
+        stays silent so a candidate is not rejected before it is measured.
+        """
+        if self.min_quality_retention is None:
             return []
-        if retention >= self.min_quality_retention:
+
+        if not measurable:
+            return [
+                f"quality could not be measured, so the "
+                f"{self.min_quality_retention * 100:.1f}% floor cannot be verified "
+                f"(no baseline was evaluated to compare against)"
+            ]
+
+        if retention is None or retention >= self.min_quality_retention:
             return []
         return [
             f"quality retention {retention * 100:.2f}% is below the "

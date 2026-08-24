@@ -357,6 +357,16 @@ class Optimizer:
             f"constraints: {self.constraints.describe()}"
         )
 
+        # A quality floor needs something to measure against. Saying so now
+        # beats saying it after several compressions, and beats not saying it.
+        wants_quality = self.constraints.min_quality_retention is not None
+        if wants_quality and not baselines:
+            self._say(
+                "  warning: no baseline survived screening, so quality retention "
+                "cannot be measured and the quality floor cannot be verified. "
+                "Raise --max-vram, or drop --min-quality to search without it."
+            )
+
         baseline_record: RunRecord | None = None
 
         for candidate in ordered:
@@ -442,7 +452,12 @@ class Optimizer:
                     if (note := self.constraints.quality_warning(comparison)) is not None:
                         outcome.warnings.append(note)
 
-                outcome.violations = self.constraints.check_quality(outcome.quality_retention)
+                # Distinguish "not compared yet" from "nothing to compare
+                # against": only the second means the floor can never be met.
+                outcome.violations = self.constraints.check_quality(
+                    outcome.quality_retention,
+                    measurable=candidate.is_baseline or baseline_record is not None,
+                )
                 if outcome.violations:
                     outcome.duration_s = time.perf_counter() - started
                     return outcome

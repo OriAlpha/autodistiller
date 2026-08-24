@@ -745,3 +745,61 @@ def test_the_search_surfaces_the_warning_on_the_candidate():
     assert outcome.quality_retention == pytest.approx(1.0116, abs=1e-3)
     assert outcome.quality_stderr > 0.3
     assert "cannot be told apart from the 90.0% floor" in outcome.summary()
+
+
+# --- a floor that cannot be checked ---------------------------------------
+
+
+def test_an_unverifiable_quality_floor_is_not_a_pass():
+    """Asking for 97% and getting no baseline is not 97%. Reporting it as
+    satisfied is the worst option available, because nothing looks wrong."""
+    constraints = Constraints(min_quality_retention=0.97)
+    violations = constraints.check_quality(None, measurable=False)
+
+    assert violations
+    assert "cannot be verified" in violations[0]
+    assert "no baseline" in violations[0]
+
+
+def test_not_yet_measured_is_still_silent():
+    """During memory screening nothing has been compared yet. Rejecting there
+    would drop every candidate before it was measured."""
+    assert Constraints(min_quality_retention=0.97).check_quality(None) == []
+
+
+def test_no_floor_means_no_complaint_either_way():
+    assert Constraints().check_quality(None, measurable=False) == []
+
+
+def test_a_screened_out_baseline_does_not_silently_satisfy_the_floor():
+    """The real case: bf16 does not fit the VRAM budget, so no baseline
+    survives screening, so nothing can be compared -- and a --min-quality the
+    user asked for was never checked against anything."""
+    candidates = _small_set(n=3)
+    candidates.accepted = [c for c in candidates.accepted if not c.is_baseline]
+    assert candidates.accepted and not any(c.is_baseline for c in candidates.accepted)
+
+    said: list[str] = []
+    optimizer = _optimizer(
+        constraints=Constraints(min_quality_retention=0.97),
+        evaluate_fn=lambda t, c: _record("c", perplexity=10.0),
+        stop_early=False,
+        progress=said.append,
+    )
+    result = optimizer.run(candidates)
+
+    assert not result.qualified, "a floor that could not be checked must not pass"
+    assert any("cannot be verified" in v for o in result.outcomes for v in o.violations)
+    assert any("no baseline survived screening" in m for m in said), said
+
+
+def test_a_measured_baseline_still_enforces_the_floor_normally():
+    """The fix must not reject candidates that do have a reference."""
+    baseline = _record("base", perplexity=10.0)
+    optimizer = _optimizer(
+        constraints=Constraints(min_quality_retention=0.90),
+        evaluate_fn=lambda t, c: baseline if c.is_baseline else _record("c", perplexity=10.2),
+        stop_early=False,
+    )
+    result = optimizer.run(_small_set(n=3))
+    assert result.qualified
