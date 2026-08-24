@@ -113,6 +113,15 @@ Qwen3-0.6B on an RTX 5070 Laptop (8 GiB), vLLM 0.27, plugged in. Produced by the
 So on this model FP8 is the pick: ~25% faster for 1% of quality. INT4 saves another 0.2 GiB but
 costs 13.6% — the kind of trade-off you want to see before choosing, not after.
 
+**GGUF**, for llama.cpp, measured the same way:
+
+| Method | Size | Served by |
+|---|---|---|
+| `gguf-q4-k-m` | 0.45 GiB | llama-server, 55 tok/s at concurrency 1 (CPU-only build) |
+
+Those tok/s are not comparable to the vLLM rows above — that llama.cpp build has no CUDA. The size
+is real, and within 1% of what the candidate screen predicted before anything was built.
+
 > **Your numbers will differ.** The same model on the same GPU measured **3x apart** during
 > development: once because the laptop was on battery (GPU capped to 34 W), once because another
 > process held 5.9 GiB of the card. That is why every run records the hardware and software it ran
@@ -150,8 +159,16 @@ Phases 1–9 are done, which is the whole v1.0 scope.
 | 4 Candidate generation | done | 9 llama.cpp | done |
 | 5 Constrained optimization | done | 10 Post-v1 research | later |
 
-**Known gap:** the llama.cpp path is implemented and unit-tested but has not been run against real
-llama.cpp binaries. Treat GGUF support as experimental until it has.
+Both backends are verified end to end against real binaries: vLLM on GPU, and llama.cpp built and
+run for real (CPU-only so far, so its numbers below are not GPU numbers).
+
+**On Windows**, llama.cpp's binaries are Linux executables, so build it in WSL and add
+`--llama-cpp-wsl`:
+
+```bash
+uv run autodistiller compress --model Qwen/Qwen3-0.6B --method gguf-q4-k-m \
+  --llama-cpp ~/llama.cpp --llama-cpp-wsl
+```
 
 v1.0 targets Hugging Face models on NVIDIA GPUs, vLLM first and llama.cpp next, with
 INT4/INT8/AWQ/GPTQ and FP8 through existing backends. Phase 10 is deliberately post-v1: knowledge

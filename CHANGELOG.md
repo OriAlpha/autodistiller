@@ -7,8 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Phase 9 of the roadmap: llama.cpp as a second deployment backend. This completes
-the v1.0 scope.
+## [1.0.0] - 2026-08-24
+
+The v1.0 scope, complete: Hugging Face models on NVIDIA GPUs, vLLM as the first
+deployment backend and llama.cpp as the second, INT4/INT8/AWQ/GPTQ and FP8
+through existing backends, constrained enumeration, a persistent experiment
+cache, Pareto analysis, and reproducible export.
+
+Phase 9 of the roadmap lands here: llama.cpp as a second deployment backend.
+
+### The 1.0 promise
+
+Everything re-exported from the top-level `autodistiller` package is the
+supported API and will not change incompatibly before 2.0. Anything reached by
+importing a submodule directly is internal. Phases 2-9 added the optimizer,
+Pareto analysis, the cache, export and the compression backends without ever
+saying which of them counted as public; they now do.
+
+The classifier moves to Beta rather than Production/Stable. 1.0 is a promise
+about the API, not a claim to have been battle-tested by anyone but its author,
+and one subsystem is still unverified -- see below.
+
+### Both backends verified end to end
+
+vLLM on GPU, and llama.cpp built from source and actually run: a Q4_K_M GGUF
+produced, served by `llama-server`, and benchmarked through the same client. The
+v1.0 scope made llama.cpp conditional -- "the next backend if the integration is
+stable" -- and that condition is now met by measurement rather than by hope.
+
+llama.cpp has so far been exercised against a CPU-only build, so its throughput
+figures are not GPU figures. Producing and serving GGUF is what was verified.
+
+Running it for real found seven bugs that unit tests could not, none of which
+would have survived a first user:
+
+- `uv run` adopted the surrounding project and began deleting AutoDistiller's own
+  virtualenv through `/mnt`. Fixed with `--no-project`.
+- Windows cannot execute llama.cpp's Linux binaries. They now run through a WSL
+  wrapper, the same boundary vLLM crosses, with a `wsl-llamacpp` launch preset
+  that was missing entirely.
+- Output paths were not translated across that boundary: a path translator only
+  recognises what already exists, and these files are what the run creates.
+- Subprocess output was decoded as cp1252 and crashed on llama.cpp's UTF-8.
+- The converter needs a local directory, not a Hugging Face repo id.
+- `compress` suggested serving a GGUF with `vllm serve`.
+- The size estimate was 18.5% low, in the direction that causes OOM at serve
+  time. Reading the produced artifact showed why: GGUF writes a tied embedding
+  twice, `token_embd` at the headline type and `output.weight` at Q6_K. Now
+  within 1% of the measured file.
 
 ### Added
 
@@ -72,17 +118,44 @@ the v1.0 scope.
   for a GGUF method, which previously failed with "backend 'vllm' cannot serve
   Q4_K_M" against a default the user never chose.
 
+### Also in this release
+
+- **A quality floor that cannot be checked is no longer reported as met.**
+  `--min-quality` compares a candidate against a baseline, and when no baseline
+  survives memory screening -- which is what happens the moment the unquantized
+  model does not fit, the case the tool most exists for -- there was nothing to
+  compare against and the constraint silently evaporated. A search would run to
+  completion and recommend a configuration whose quality floor had never been
+  checked against anything. It now warns before spending a minute on
+  compression, and rejects rather than passing: being unable to verify a
+  constraint is not the same as satisfying it. Found by pointing the tool at
+  Qwen3-4B on an 8 GiB card; Qwen3-0.6B could never have surfaced it, because
+  bf16 fits there and a baseline always exists.
+- **Quality retention now carries its uncertainty.** `--min-quality` compared
+  point estimates, and perplexity on a handful of documents carries a standard
+  error that can rival the value. One run reported 101.16% retention -- a
+  compressed model apparently beating its own baseline -- which was noise being
+  read as a result. The verdict still rests on the measurement, but a floor the
+  data cannot settle now says so and points at `--limit`.
+- **A cold-start stall can no longer be reported as throughput.** Found by the
+  first full end-to-end run: one request took 9.33s against a median of 0.67s,
+  and throughput reported 48 tok/s for a server whose own per-token timings said
+  209. Warmup now continues until the server settles, and every phase records a
+  `throughput_efficiency` that makes the disagreement impossible to miss.
+- **The README is 176 lines instead of 621.** It leads with the problem and the
+  measured results; the reasoning moved to `docs/design.md`.
+- CI actions updated off the deprecated Node 20 runtime.
+
 ### Verified
 
-Candidate generation, method filtering, routing and the failure path are verified
-against Qwen3-0.6B: `--backend llama.cpp` generates only GGUF candidates, drops
-the fp8 KV variants, and a search without the tooling installed fails each GGUF
-candidate with an actionable message while completing normally.
+Qwen3-0.6B on an RTX 5070. The full workflow -- baseline, candidates, screening,
+compression, deployment benchmark, Pareto, recommendation, export -- runs in one
+command against a live vLLM server. Separately, a Q4_K_M GGUF was built (461.8
+MiB, within 1% of the estimate), served, and benchmarked with zero failures.
 
-**Not verified end to end.** llama.cpp is not installed on the development
-machine, so no GGUF has actually been built or served. The subprocess calls are
-covered by tests with the tooling faked; the conversion, quantization and
-`llama-server` benchmark remain unexercised against the real binaries.
+The warmup fix is confirmed on a clean run: concurrency-1 throughput went from
+48.4 tok/s, corrupted by a cold-start stall, to 196.4 -- matching the 194.5 this
+model measured in Phase 2.
 
 Phase 8 of the roadmap: export and reproducibility.
 
@@ -318,7 +391,8 @@ First release. Phase 1 of the roadmap: the evaluation engine.
 - Metadata capture for hardware, CUDA, and library versions.
 - CLI: `env`, `tasks`, `evaluate`, `compare`, `runs`, `show`.
 
-[Unreleased]: https://github.com/OriAlpha/Autodistiller/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/OriAlpha/Autodistiller/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/OriAlpha/Autodistiller/releases/tag/v1.0.0
 [0.3.0]: https://github.com/OriAlpha/Autodistiller/releases/tag/v0.3.0
 [0.2.0]: https://github.com/OriAlpha/Autodistiller/releases/tag/v0.2.0
 [0.1.1]: https://github.com/OriAlpha/Autodistiller/releases/tag/v0.1.1

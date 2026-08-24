@@ -1,6 +1,6 @@
 [project]
 name = "autodistiller"
-version = "0.3.0"
+version = "1.0.0"
 description = "Automatically find the best LLM deployment configuration for your hardware and quality constraints."
 readme = "README.md"
 requires-python = ">=3.10,<3.14"
@@ -10,7 +10,7 @@ authors = [{ name = "Suhas Goravale Siddaramu", email = "41699212+OriAlpha@users
 maintainers = [{ name = "Suhas", email = "41699212+OriAlpha@users.noreply.github.com" }]
 keywords = ["llm", "quantization", "evaluation", "vllm", "deployment", "optimization"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Environment :: GPU :: NVIDIA CUDA",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
