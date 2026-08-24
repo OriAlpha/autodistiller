@@ -172,9 +172,9 @@ def test_run_is_persisted_and_reloadable(run_config: RunConfig):
     assert RunConfig.from_yaml(directory / "config.yaml").fingerprint == record.config_fingerprint
 
 
-def test_store_finds_runs_by_config_fingerprint(run_config: RunConfig):
+def test_store_finds_runs_by_experiment_key(run_config: RunConfig):
     record = run_evaluation(run_config)
-    found = RunStore(run_config.output_dir).find_by_fingerprint(run_config.fingerprint)
+    found = RunStore(run_config.output_dir).find_experiment(record.experiment_key)
     assert found is not None and found.run_id == record.run_id
 
 

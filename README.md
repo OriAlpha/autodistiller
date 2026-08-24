@@ -17,7 +17,7 @@ algorithm. It composes them, measures them under real deployment conditions, and
 
 ---
 
-## Status: Phases 1–5
+## Status: Phases 1–7
 
 Phase 1 is complete and usable on its own. Its milestone is deliberately unglamorous:
 
@@ -40,8 +40,10 @@ good as the baseline it is measured against. So Phase 1 ships:
 | Compression through existing backends | [`compression/`](src/autodistiller/compression) |
 | Candidate generation and memory screening | [`candidates/`](src/autodistiller/candidates) |
 | Constrained optimization and ranking | [`optimize/`](src/autodistiller/optimize) |
+| Persistent experiment cache | [`cache.py`](src/autodistiller/cache.py), [`store.py`](src/autodistiller/store.py) |
+| Pareto trade-offs and named recommendations | [`optimize/pareto.py`](src/autodistiller/optimize/pareto.py) |
 
-Phases 6–10 (experiment cache, Pareto analysis, export, llama.cpp) are on the
+Phases 8–10 (export, llama.cpp, post-v1 research) are on the
 [roadmap](#roadmap) below.
 
 ### On isolation
@@ -194,6 +196,92 @@ uv run autodistiller show <run_id> --verbose
 
 ---
 
+## The experiment cache
+
+Nothing is measured twice. `evaluate`, `compress` and `optimize` all check first, and reuse an
+identical earlier result instead of repeating it:
+
+```bash
+uv run autodistiller history
+```
+
+```bash
+uv run autodistiller history --model Qwen3-0.6B --json
+```
+
+An experiment is reusable only when everything that could have moved the number is unchanged: the
+config (model, tasks, datasets, seed, compression recipe), the hardware, and the software stack.
+Change the GPU or upgrade torch and the cache misses, as it should. Pass `--refresh` to any of the
+three commands to measure again anyway.
+
+The stack half of that key is deliberately narrow — `autodistiller`, `torch`, `transformers`,
+`tokenizers`, `datasets`, CUDA and the Python minor version. Keying on every installed package is
+defensible in theory and useless in practice: a `safetensors` patch bump would throw away every
+result without changing any of them.
+
+Three things are cached, in cost order:
+
+| What | Keyed on | Where |
+|---|---|---|
+| Compressed artifacts | model, method, calibration data, `ignore`, dtype | `artifacts/<model>-<method>-<key>/` |
+| Evaluations | config fingerprint + hardware + stack | `runs/<run_id>/record.json` |
+| Deployment benchmarks | served weights, backend, request shape, context length, KV dtype | `runs/<run_id>/record.json` |
+
+Artifact directories carry the recipe key because the recipe *is* the identity of the weights.
+`Qwen3-0.6B-int4-gptq` alone is not: compress that model and method with two different calibration
+sets and you get two genuinely different artifacts, and one path for both means the second silently
+replaces the first.
+
+`runs/index.jsonl` holds one row per record — the keys and a summary, no metrics — so a lookup does
+not have to parse every run ever done. It is derived state; delete it and it rebuilds, or force it
+with `autodistiller history --rebuild`. It is also the shape a shared benchmark database would want:
+flat rows carrying a complete key rather than a local file layout.
+
+---
+
+## Trade-offs and recommendations
+
+A single winning score cannot be checked. `optimize` therefore also prints the
+configurations where you cannot improve one thing without losing another, and names
+the options a reader is likely to want:
+
+```
+Pareto frontier - Quality retention vs Peak VRAM vs TTFT p50 vs Peak throughput
+ Candidate      Quality retention   Peak VRAM   TTFT p50   Peak throughput   Verdict
+ baseline                 100.00%    7.00 GiB      110ms         780 tok/s   Pareto-optimal
+ fp8                       98.45%    5.00 GiB       60ms        1010 tok/s   Pareto-optimal
+ int4-awq                  94.10%    4.00 GiB       40ms        1320 tok/s   Pareto-optimal
+ int8                      97.02%    5.00 GiB       70ms         990 tok/s   dominated
+```
+
+`int8` is dominated because `fp8` beats it on every axis at once — there is no
+reading of the numbers under which you would pick it. The other three are real
+trade-offs, and each named recommendation says what choosing it costs:
+
+```
+ Option                 Candidate   Wins on                      Frontier   Gives up
+ best quality           baseline    quality retention 100.00%    yes        peak vram 7.00 GiB against a best of 4.00 GiB; ...
+ fastest (throughput)   int4-awq    peak throughput 1320 tok/s   yes        quality retention 94.10% against a best of 100.00%
+```
+
+Two rules keep this honest:
+
+- **A candidate is never ranked on a number nobody measured.** Treating an
+  unmeasured throughput as either the best or the worst value would put a
+  candidate on the frontier for a reason that is not a measurement. Those are
+  listed as "not measured on every axis" instead.
+- **An axis never mixes measured and estimated values.** Peak VRAM from a real
+  serving run and VRAM predicted by arithmetic are different quantities. When
+  nothing was benchmarked the whole axis falls back to estimates and is labelled
+  `VRAM (estimated)`; it never compares one against the other.
+
+Early stopping and trade-off analysis pull against each other — the first
+qualifying candidate is the only one measured, so there is nothing to compare it
+to. Use `--no-stop-early` when you want the frontier, and `--no-pareto` when you
+only want the winner.
+
+---
+
 ## Tasks
 
 Run `uv run autodistiller tasks` for the live list.
@@ -249,8 +337,8 @@ own sake:
 
 - **Comparability is checkable.** `compare` refuses to score a comparison where the two runs used
   different data, and warns when the hardware or software stack moved.
-- **Phase 6's experiment cache needs it.** Reusing a measurement is only safe if you can prove the
-  inputs were identical. The config hash and fingerprints are that proof.
+- **The experiment cache needs it.** Reusing a measurement is only safe if you can prove the inputs
+  were identical. The config hash and the hardware and software fingerprints are that proof.
 - **It is the long-term differentiator.** The defensible asset is measured knowledge: which
   configurations work on which models, GPUs, backends and software stacks.
 
@@ -325,9 +413,9 @@ numbers can never be reused, so both gates run before anything is uploaded.
 | 3 | Compression backend integration (LLM Compressor adapters) | **done** |
 | 4 | Candidate generator | **done** |
 | 5 | Constrained optimization | **done** |
-| 6 | Persistent experiment cache | next |
-| 7 | Pareto analysis | planned |
-| 8 | Export & reproducibility | planned |
+| 6 | Persistent experiment cache | **done** |
+| 7 | Pareto analysis | **done** |
+| 8 | Export & reproducibility | next |
 | 9 | Multi-backend expansion (llama.cpp) | planned |
 | 10 | Post-v1 research (distillation, pruning, Bayesian search) | post-v1 |
 

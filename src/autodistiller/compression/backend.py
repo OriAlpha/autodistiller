@@ -22,7 +22,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..metadata.hashing import hash_text_stream
+from ..metadata.hashing import hash_obj, hash_text_stream
 from ..results import CompressionArtifact, CompressionRecipe
 from .methods import CompressionMethod
 
@@ -75,6 +75,25 @@ class CompressionJob:
             calibration_fingerprint=(
                 hash_text_stream(self.calibration_texts) if self.calibration_texts else None
             ),
+        )
+
+    @property
+    def artifact_key(self) -> str:
+        """Identity of the weights this job would produce.
+
+        The recipe plus the things a recipe does not carry: which model, and at
+        what precision it was loaded. Two jobs with the same key produce the
+        same artifact, which is what makes an existing one safe to reuse -- and
+        what stops two jobs with *different* calibration data from being written
+        to the same directory.
+        """
+        return hash_obj(
+            {
+                "recipe": self.recipe().model_dump(mode="json"),
+                "model_id": self.model_id,
+                "dtype": self.dtype,
+                "trust_remote_code": self.trust_remote_code,
+            }
         )
 
     def to_payload(self) -> dict:

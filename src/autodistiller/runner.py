@@ -16,6 +16,7 @@ import time
 import traceback
 from collections.abc import Callable
 
+from .cache import experiment_key
 from .config import MultipleChoiceTask, PerplexityTask, RunConfig, TaskSpec
 from .determinism import seed_everything
 from .evaluation.baseline_inference import run_baseline_inference
@@ -27,7 +28,7 @@ from .metadata.environment import collect_environment
 from .metadata.hardware import detect_hardware
 from .models.loader import loaded_model
 from .results import RunRecord, TaskResult
-from .store import RunStore, make_run_id
+from .store import RunStore
 
 logger = logging.getLogger(__name__)
 
@@ -107,11 +108,29 @@ def run_evaluation(
     observer: RunObserver | None = None,
     store: RunStore | None = None,
     save: bool = True,
+    reuse: bool = True,
 ) -> RunRecord:
-    """Execute a full evaluation and return (and optionally persist) the record."""
+    """Execute a full evaluation and return (and optionally persist) the record.
+
+    With ``reuse``, an experiment already measured on this hardware and this
+    software stack is returned instead of being run again. The check lives here
+    rather than in the callers so that everything routed through this function
+    gets it: the ``evaluate`` command, and the optimizer's per-candidate quality
+    screening.
+    """
     observer = observer or RunObserver()
     store = store or RunStore(config.output_dir)
     started = time.perf_counter()
+
+    # Before the seed and before preflight: both are cheap, but neither is free,
+    # and a cache hit should not need a dataset to be reachable at all.
+    hardware = detect_hardware()
+    environment = collect_environment()
+    key = experiment_key(config.fingerprint, hardware, environment)
+
+    if reuse and (cached := store.find_experiment(key)) is not None:
+        observer.stage(f"Reusing {cached.run_id}: identical config, hardware and stack")
+        return cached
 
     if problems := preflight(config):
         listed = "\n  - ".join(problems)
@@ -119,12 +138,9 @@ def run_evaluation(
 
     seed_everything(config.seed)
     observer.stage(f"Seeded run with {config.seed}")
-
-    hardware = detect_hardware()
-    environment = collect_environment()
     observer.stage(f"Hardware: {hardware.describe()}")
 
-    run_id = make_run_id(config)
+    run_id = store.new_run_id(config)
     tasks: list[TaskResult] = []
     baseline = None
     status: str = "ok"
@@ -166,6 +182,8 @@ def run_evaluation(
         error=error,
         config=config,
         config_fingerprint=config.fingerprint,
+        experiment_key=key,
+        candidate_id=config.label,
         model=model_info,
         hardware=hardware,
         environment=environment,

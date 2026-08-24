@@ -1,20 +1,29 @@
 """AutoDistiller command line interface.
 
-Phase 1 exposes the evaluation engine:
+    env        what hardware and software stack will be recorded
+    tasks      evaluation presets
+    evaluate   measure a model and save a run record
+    compare    check a candidate against a baseline
+    runs/show  browse past runs
+    history    the experiment cache: what has been measured, what can be reused
+    methods    compression methods, and whether they are usable here
+    compress   produce a compressed artifact
+    candidates the search space for a model
+    profiles   GPU capability profiles
+    backends   deployment backends
+    benchmark  measure a running serving endpoint
+    optimize   the whole search, under constraints
 
-    env       what hardware and software stack will be recorded
-    evaluate  measure a model and save a run record
-    compare   check a candidate against a baseline
-    runs/show browse past runs
-
-The ``optimize`` command from the roadmap arrives once Phases 2-5 land; it will
-call the same evaluation engine underneath.
+Anything measured is cached. ``evaluate``, ``compress`` and ``optimize`` reuse
+an identical earlier experiment rather than repeating it, and each takes
+``--refresh`` to measure again anyway.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 
 import typer
@@ -44,6 +53,8 @@ from .reporting.console import (
     render_environment,
     render_hardware,
     render_optimization,
+    render_pareto,
+    render_recommendations,
     render_regression,
     render_run,
 )
@@ -196,10 +207,17 @@ def evaluate(
     save_config: Path | None = typer.Option(
         None, help="Write the resolved config to YAML for reproduction"
     ),
+    refresh: bool = typer.Option(
+        False, "--refresh", help="Measure again even if this exact experiment is cached"
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
     """Establish a baseline: load a model, evaluate it, and record everything."""
     _configure_logging(verbose)
+
+    # A record older than this call is one the cache handed back rather than one
+    # this call measured.
+    started_at = datetime.now(timezone.utc)
 
     if config_path is not None:
         run_config = RunConfig.from_yaml(config_path)
@@ -239,12 +257,6 @@ def evaluate(
         console.print(f"[dim]|[/dim] Wrote config to {save_config}")
 
     store = RunStore(run_config.output_dir)
-    if (cached := store.find_by_fingerprint(run_config.fingerprint)) is not None:
-        # Phase 6 will skip the work entirely; for now, just say so.
-        console.print(
-            f"[yellow]note:[/yellow] an identical config was already run "
-            f"({cached.run_id}). Re-running; Phase 6 will reuse it instead."
-        )
 
     if problems := preflight(run_config):
         raise typer.BadParameter("\n".join(problems))
@@ -258,9 +270,19 @@ def evaluate(
         console=console,
         transient=True,
     ) as progress:
-        record = run_evaluation(run_config, observer=ConsoleObserver(progress), store=store)
+        record = run_evaluation(
+            run_config,
+            observer=ConsoleObserver(progress),
+            store=store,
+            reuse=not refresh,
+        )
 
     console.print()
+    if record.created_at < started_at:
+        console.print(
+            f"[green]cached[/green] {record.run_id} — identical config, hardware and stack. "
+            f"[dim]Pass --refresh to measure again.[/dim]"
+        )
     render_run(record, verbose=verbose)
 
     if record.status != "ok":
@@ -313,11 +335,14 @@ def compare(
 def list_runs(
     runs_dir: Path = typer.Option(Path("runs"), "--runs-dir"),
     limit: int = typer.Option(20, "--limit", "-n"),
+    model: str | None = typer.Option(None, "--model", "-m", help="Only runs of this model"),
 ) -> None:
     """List saved runs, newest first."""
     from rich.table import Table
 
-    records = RunStore(runs_dir).list_records(limit=limit)
+    records = RunStore(runs_dir).list_records(limit=None if model else limit)
+    if model:
+        records = [r for r in records if model in r.model.id][:limit]
     if not records:
         console.print(f"[dim]No runs found under {runs_dir}[/dim]")
         return
@@ -364,6 +389,76 @@ def show(
         typer.echo(record.to_json())
     else:
         render_run(record, verbose=verbose)
+
+
+@app.command()
+def history(
+    runs_dir: Path = typer.Option(Path("runs"), "--runs-dir"),
+    limit: int = typer.Option(30, "--limit", "-n"),
+    model: str | None = typer.Option(None, "--model", "-m", help="Only runs of this model"),
+    rebuild: bool = typer.Option(
+        False, "--rebuild", help="Re-derive the index from the run records on disk"
+    ),
+    as_json: bool = typer.Option(False, "--json", help="Emit index rows, one JSON object per line"),
+) -> None:
+    """Show the experiment cache: what has been measured, and what it can reuse.
+
+    Reads the index rather than the records, so it stays fast however many runs
+    have accumulated. A row with an experiment key can serve a repeated
+    evaluation; one with a benchmark key can serve a repeated deployment
+    benchmark. Rows with neither predate the cache and are history only.
+    """
+    from rich.table import Table
+
+    store = RunStore(runs_dir)
+    if rebuild:
+        rows = store.rebuild_index()
+        console.print(f"[dim]Rebuilt {runs_dir / 'index.jsonl'} from {len(rows)} records[/dim]")
+
+    rows = store.summaries(limit=None if model else limit)
+    if model:
+        rows = [row for row in rows if model in (row.get("model") or "")][:limit]
+
+    if not rows:
+        console.print(f"[dim]No experiments recorded under {runs_dir}[/dim]")
+        return
+
+    if as_json:
+        for row in rows:
+            typer.echo(json.dumps(row, ensure_ascii=False))
+        return
+
+    table = Table(header_style="bold")
+    table.add_column("Run id")
+    table.add_column("Model")
+    table.add_column("Candidate")
+    table.add_column("Holds")
+    table.add_column("Experiment key", style="dim")
+    table.add_column("Benchmark key", style="dim")
+
+    for row in rows:
+        holds = [
+            name
+            for name, present in (
+                ("eval", row.get("has_tasks")),
+                ("benchmark", row.get("has_deployment")),
+                ("compression", row.get("has_compression")),
+            )
+            if present
+        ]
+        status = row.get("status")
+        table.add_row(
+            row.get("run_id", "?"),
+            row.get("model") or "-",
+            row.get("candidate_id") or "-",
+            ", ".join(holds) if status == "ok" else f"[red]{status}[/red]",
+            row.get("experiment_key") or "-",
+            row.get("benchmark_key") or "-",
+        )
+
+    console.print(table)
+    reusable = sum(1 for row in rows if row.get("experiment_key") or row.get("benchmark_key"))
+    console.print(f"[dim]{reusable} of {len(rows)} shown are reusable by the cache[/dim]")
 
 
 @app.command()
@@ -430,6 +525,9 @@ def compress(
         None, "--compress-python", help="Reuse an interpreter that already has the backend"
     ),
     trust_remote_code: bool = typer.Option(False),
+    refresh: bool = typer.Option(
+        False, "--refresh", help="Compress again even if this exact artifact already exists"
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
     """Produce a compressed artifact through an existing compression backend."""
@@ -466,6 +564,7 @@ def compress(
             output_root=artifacts_root,
             profile=profile,
             serving_backend=serving_backend,
+            reuse=not refresh,
             progress=lambda message: console.print(f"[dim]|[/dim] {message}"),
         )
     except (KeyError, ValueError, RuntimeError, CompressionError) as exc:
@@ -632,6 +731,12 @@ def optimize(
     stop_early: bool = typer.Option(True, "--stop-early/--no-stop-early"),
     artifacts_root: Path = typer.Option(Path("artifacts"), "--artifacts-root"),
     output_dir: Path = typer.Option(Path("runs"), "--output-dir", "-o"),
+    refresh: bool = typer.Option(
+        False, "--refresh", help="Ignore cached experiments and measure everything again"
+    ),
+    no_pareto: bool = typer.Option(
+        False, "--no-pareto", help="Skip the trade-off analysis and print only the winner"
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
     """Find the best deployment configuration under explicit constraints."""
@@ -723,6 +828,7 @@ def optimize(
             max_candidates=max_candidates,
             stop_early=stop_early,
             skip_benchmark=launch is None,
+            reuse=not refresh,
             progress=lambda message: console.print(f"[dim]|[/dim] {message}"),
         )
     except (KeyError, ValueError, RuntimeError) as exc:
@@ -733,6 +839,18 @@ def optimize(
     console.print(render_optimization(result))
     console.print()
     console.print(result.explain())
+
+    if result.qualified and not no_pareto:
+        report = result.pareto()
+        console.print()
+        console.print(render_pareto(report))
+        console.print()
+        console.print(render_recommendations(report))
+        if len(result.qualified) == 1:
+            console.print(
+                "\n[dim]Only one configuration qualified, so there is nothing to trade off "
+                "against. Re-run with --no-stop-early to measure the alternatives.[/dim]"
+            )
 
     if result.recommended is None:
         raise typer.Exit(code=1)

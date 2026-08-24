@@ -28,6 +28,22 @@ TRACKED_PACKAGES = (
     "numpy",
 )
 
+CACHE_RELEVANT_PACKAGES = (
+    "autodistiller",
+    "torch",
+    "transformers",
+    "tokenizers",
+    "datasets",
+)
+"""Packages whose version can move a measured number.
+
+The cache key covers these rather than the whole environment. Keying on
+everything is defensible in theory and useless in practice: a `safetensors`
+patch bump would discard every cached result without changing any of them.
+These five can. `autodistiller` is on the list because it *is* the measurement
+code, and `datasets` because it decides which text gets scored.
+"""
+
 
 class EnvironmentInfo(BaseModel):
     """Versions of everything that can move a metric."""
@@ -42,6 +58,27 @@ class EnvironmentInfo(BaseModel):
     @property
     def fingerprint(self) -> str:
         return hash_obj(self.model_dump())
+
+    @property
+    def cache_fingerprint(self) -> str:
+        """Identity of the stack, for deciding whether a cached result still holds.
+
+        Narrower than :attr:`fingerprint`: the OS build string and packages that
+        cannot move a metric are left out, so an unrelated dependency bump does
+        not throw the cache away. CUDA is in, because kernel changes do move
+        numbers.
+        """
+        return hash_obj(
+            {
+                "python": ".".join(self.python_version.split(".")[:2]),
+                "packages": {
+                    name: version
+                    for name, version in self.packages.items()
+                    if name in CACHE_RELEVANT_PACKAGES
+                },
+                "cuda": self.cuda_version,
+            }
+        )
 
 
 def _package_version(name: str) -> str | None:

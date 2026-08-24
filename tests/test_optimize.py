@@ -456,3 +456,143 @@ def test_no_qualifying_candidate_is_stated_plainly():
 
     assert result.recommended is None
     assert "No candidate satisfied" in result.explain()
+
+
+# --- the experiment cache in the search ---------------------------------
+
+
+def _cached_optimizer(tmp_path, **kwargs):
+    from autodistiller.store import RunStore
+
+    baseline = _record("base", perplexity=10.0)
+    defaults = dict(
+        constraints=Constraints(min_quality_retention=0.90),
+        objective=Objective.THROUGHPUT,
+        evaluate_fn=lambda t, c: baseline if c.is_baseline else _record("c", perplexity=10.1),
+        store=RunStore(tmp_path),
+        stop_early=False,
+        benchmark_settings={"prompt_tokens": 256, "max_tokens": 128},
+    )
+    return _optimizer(**{**defaults, **kwargs})
+
+
+def test_a_benchmark_is_saved_so_the_next_search_can_reuse_it(tmp_path):
+    optimizer = _cached_optimizer(tmp_path, benchmark_fn=lambda o: _benchmark(throughput=900))
+    optimizer.run(_small_set(n=3))
+
+    from autodistiller.store import RunStore
+
+    saved = [r for r in RunStore(tmp_path).list_records() if r.deployment is not None]
+    assert saved, "the optimizer measured a benchmark and then dropped it"
+    assert all(r.benchmark_key for r in saved)
+    assert all(r.candidate_id for r in saved)
+
+
+def test_a_second_search_reuses_the_benchmark(tmp_path):
+    """The roadmap's milestone for this phase: repeating an optimization must be
+    substantially cheaper than running it the first time."""
+    runs: list[str] = []
+
+    def benchmark(outcome):
+        runs.append(outcome.candidate.id)
+        return _benchmark(throughput=900)
+
+    candidates = _small_set(n=3)
+    _cached_optimizer(tmp_path, benchmark_fn=benchmark).run(candidates)
+    first_pass = len(runs)
+    assert first_pass > 0
+
+    result = _cached_optimizer(tmp_path, benchmark_fn=benchmark).run(candidates)
+
+    assert len(runs) == first_pass, "re-benchmarked a candidate the cache already held"
+    assert result.reused_stages.get("benchmark") == first_pass
+    assert result.recommended is not None
+    assert result.recommended.score.value == 900
+
+
+def test_refresh_re_measures_the_benchmark(tmp_path):
+    runs: list[str] = []
+
+    def benchmark(outcome):
+        runs.append(outcome.candidate.id)
+        return _benchmark(throughput=900)
+
+    candidates = _small_set(n=3)
+    _cached_optimizer(tmp_path, benchmark_fn=benchmark).run(candidates)
+    first_pass = len(runs)
+
+    _cached_optimizer(tmp_path, benchmark_fn=benchmark, reuse=False).run(candidates)
+    assert len(runs) == first_pass * 2
+
+
+def test_a_different_request_shape_is_not_reused(tmp_path):
+    """Changing what the benchmark asks the server to do changes the number, so
+    the earlier measurement no longer answers the question."""
+    runs: list[str] = []
+
+    def benchmark(outcome):
+        runs.append(outcome.candidate.id)
+        return _benchmark(throughput=900)
+
+    candidates = _small_set(n=3)
+    _cached_optimizer(tmp_path, benchmark_fn=benchmark).run(candidates)
+    first_pass = len(runs)
+
+    _cached_optimizer(
+        tmp_path,
+        benchmark_fn=benchmark,
+        benchmark_settings={"prompt_tokens": 256, "max_tokens": 512},
+    ).run(candidates)
+    assert len(runs) == first_pass * 2
+
+
+def test_without_a_store_nothing_is_cached_and_nothing_breaks(tmp_path):
+    """The optimizer is usable without a store; it just pays every time."""
+    optimizer = _optimizer(
+        constraints=Constraints(min_quality_retention=0.90),
+        objective=Objective.THROUGHPUT,
+        evaluate_fn=lambda t, c: _record("c", perplexity=10.0),
+        benchmark_fn=lambda o: _benchmark(throughput=900),
+        stop_early=False,
+    )
+    result = optimizer.run(_small_set(n=2))
+    assert result.recommended is not None
+    assert not list(tmp_path.iterdir())
+
+
+def test_candidates_differing_only_in_context_keep_separate_benchmarks(tmp_path):
+    """Context length is not a compression parameter, so these two share an
+    artifact and an evaluation but not a benchmark. One record per evaluation
+    could only hold one of them."""
+    measured: dict[str, float] = {}
+
+    def benchmark(outcome):
+        result = _benchmark(throughput=100.0 * outcome.candidate.max_model_len)
+        measured[outcome.candidate.id] = result.best_throughput.output_tokens_per_s
+        return result
+
+    candidates = generate_candidates(
+        qwen3_06b(),
+        profile=BLACKWELL,
+        methods=("int8",),
+        context_lengths=(2048, 4096),
+        kv_dtypes=("auto",),
+        max_candidates=8,
+    )
+    assert len({c.max_model_len for c in candidates.accepted}) > 1
+
+    from autodistiller.store import RunStore
+
+    _cached_optimizer(tmp_path, benchmark_fn=benchmark).run(candidates)
+    assert len(measured) > 1
+
+    saved = {
+        r.candidate_id: r.deployment.best_throughput.output_tokens_per_s
+        for r in RunStore(tmp_path).list_records()
+        if r.deployment is not None
+    }
+    assert saved == measured, "a benchmark was overwritten by another candidate's"
+
+    # And a second search reuses every one of them rather than a single survivor.
+    result = _cached_optimizer(tmp_path, benchmark_fn=benchmark).run(candidates)
+    assert result.reused_stages.get("benchmark") == len(measured)

@@ -290,6 +290,7 @@ def render_optimization(result) -> Table:
     table.add_column("Size", justify="right")
     table.add_column("Throughput", justify="right")
     table.add_column("TTFT", justify="right")
+    table.add_column("Cached", justify="center")
     table.add_column("Verdict")
 
     best = result.recommended
@@ -314,6 +315,8 @@ def render_optimization(result) -> Table:
             _gib(outcome.weights_bytes),
             f"{peak.output_tokens_per_s:.0f} tok/s" if peak else "-",
             f"{single.ttft.p50 * 1000:.0f}ms" if single and single.ttft else "-",
+            # Which stages this candidate did not have to pay for again.
+            Text(",".join(s[:4] for s in outcome.reused), style="cyan") if outcome.reused else "-",
             verdict,
         )
 
@@ -434,6 +437,68 @@ def render_regression(report: RegressionReport) -> None:
         console.print(Text(f"FAIL - {'; '.join(reasons)}.", style="bold red"))
 
 
+def render_pareto(report) -> Table:
+    """Render the trade-off surface: who is optimal, who is beaten, and by what.
+
+    The point is transparency. A candidate that lost should show the numbers it
+    lost on, sitting next to the candidate that beat it.
+    """
+    table = Table(
+        title=f"Pareto frontier - {report.frontier.labels}",
+        title_justify="left",
+        header_style="bold",
+    )
+    table.add_column("Candidate")
+    for axis in report.axes:
+        table.add_column(axis.label, justify="right")
+    table.add_column("Verdict")
+
+    frontier = report.frontier
+    groups = (
+        (frontier.optimal, Text("Pareto-optimal", style="bold green")),
+        (frontier.dominated, Text("dominated", style="dim")),
+        (frontier.incomparable, Text("not measured on every axis", style="yellow")),
+    )
+
+    for outcomes, verdict in groups:
+        for outcome in outcomes:
+            table.add_row(
+                outcome.candidate.id,
+                *[axis.format(outcome) for axis in report.axes],
+                verdict,
+            )
+
+    return table
+
+
+def render_recommendations(report) -> Table:
+    """Render the named options, each with what it costs to choose it."""
+    table = Table(
+        title="Recommendations",
+        title_justify="left",
+        header_style="bold",
+    )
+    table.add_column("Option", style="bold")
+    table.add_column("Candidate")
+    table.add_column("Wins on")
+    table.add_column("Frontier", justify="center")
+    table.add_column("Gives up", overflow="fold")
+
+    for recommendation in report.recommendations:
+        table.add_row(
+            recommendation.label,
+            recommendation.outcome.candidate.id,
+            f"{recommendation.score.basis} {recommendation.score.detail}".strip(),
+            Text("yes", style="green")
+            if recommendation.on_frontier
+            else Text("no", style="yellow"),
+            # An empty note means it was best (or tied best) on every axis.
+            recommendation.trade_off or Text("nothing", style="dim"),
+        )
+
+    return table
+
+
 __all__ = [
     "console",
     "render_candidates",
@@ -442,6 +507,8 @@ __all__ = [
     "render_environment",
     "render_hardware",
     "render_optimization",
+    "render_pareto",
+    "render_recommendations",
     "render_regression",
     "render_run",
 ]

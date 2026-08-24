@@ -22,14 +22,20 @@ import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 
+from ..cache import benchmark_key
 from ..candidates.generator import Candidate, CandidateSet
 from ..compression.backend import CompressionError
 from ..compression.pipeline import run_compression
-from ..config import CompressionSpec, ModelSpec
-from ..results import CompressionArtifact, DeploymentBenchmark, RunRecord
+from ..config import CompressionSpec, DeploymentSpec, ModelSpec, RunConfig
+from ..metadata.environment import EnvironmentInfo, collect_environment
+from ..metadata.hardware import HardwareInfo, detect_hardware
+from ..results import CompressionArtifact, DeploymentBenchmark, ModelInfo, RunRecord
+from ..store import RunStore
 from .constraints import Constraints, Objective, Score, score_candidate, search_order
+from .pareto import ParetoReport
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +59,10 @@ class CandidateOutcome:
     error: str | None = None
     score: Score | None = None
     duration_s: float = 0.0
+    record: RunRecord | None = None
+    reused: list[str] = field(default_factory=list)
+    """Stages answered from cache rather than measured. Reported, not inferred:
+    a result the user did not just pay for should say so."""
 
     @property
     def qualified(self) -> bool:
@@ -67,9 +77,10 @@ class CandidateOutcome:
     def summary(self) -> str:
         if self.error:
             return f"{self.candidate.id}: failed ({self.error})"
+        note = f" (reused {', '.join(self.reused)})" if self.reused else ""
         if self.violations:
-            return f"{self.candidate.id}: rejected ({self.violations[0]})"
-        return f"{self.candidate.id}: qualified at {self.stage}"
+            return f"{self.candidate.id}: rejected ({self.violations[0]}){note}"
+        return f"{self.candidate.id}: qualified at {self.stage}{note}"
 
 
 @dataclass
@@ -90,10 +101,28 @@ class OptimizationResult:
         return [o for o in self.outcomes if o.qualified]
 
     @property
+    def reused_stages(self) -> dict[str, int]:
+        """How many candidates skipped each stage because the cache had it."""
+        counts: dict[str, int] = {}
+        for outcome in self.outcomes:
+            for stage in outcome.reused:
+                counts[stage] = counts.get(stage, 0) + 1
+        return counts
+
+    @property
     def recommended(self) -> CandidateOutcome | None:
-        """Highest-scoring qualifying candidate."""
+        """Highest-scoring qualifying candidate under the chosen objective."""
         scored = [o for o in self.qualified if o.score is not None]
         return max(scored, key=lambda o: o.score.value if o.score else 0.0) if scored else None
+
+    def pareto(self) -> ParetoReport:
+        """The trade-off view over everything that qualified.
+
+        Qualifying candidates only: one that violated a constraint is not a
+        trade-off, it is disqualified. The baseline is kept, because "do not
+        compress" is a real option and usually the best-quality one.
+        """
+        return ParetoReport(self.qualified)
 
     def explain(self) -> str:
         """Why the recommendation qualifies, in the roadmap's words."""
@@ -110,6 +139,11 @@ class OptimizationResult:
         if best.benchmark is not None and best.benchmark.peak_vram_bytes:
             parts.append(f"peak VRAM {best.benchmark.peak_vram_bytes / 1024**3:.2f} GiB")
         parts.append(f"chosen from {len(self.qualified)} qualifying of {len(self.outcomes)} tried")
+        if reused := self.reused_stages:
+            parts.append(
+                "reused from cache: "
+                + ", ".join(f"{count}x {stage}" for stage, count in sorted(reused.items()))
+            )
         return "; ".join(parts) + "."
 
 
@@ -164,6 +198,9 @@ class Optimizer:
         compress_fn: Callable[[Candidate], CompressionArtifact] | None = None,
         calibration=None,
         stop_early: bool = True,
+        store: RunStore | None = None,
+        reuse: bool = True,
+        benchmark_settings: dict | None = None,
         progress: ProgressFn | None = None,
     ) -> None:
         self.model = model
@@ -176,7 +213,16 @@ class Optimizer:
         self.compress_fn = compress_fn or self._default_compress
         self.calibration = calibration
         self.stop_early = stop_early
+        self.store = store
+        self.reuse = reuse
+        self.benchmark_settings = benchmark_settings or {}
         self.progress = progress
+
+        # Once per search, not once per candidate: neither can change while the
+        # search is running, and both are part of every cache key it computes.
+        self.hardware: HardwareInfo = detect_hardware()
+        self.environment: EnvironmentInfo = collect_environment()
+        self._started_at = datetime.now(timezone.utc)
 
     def _say(self, message: str) -> None:
         if self.progress is not None:
@@ -190,7 +236,7 @@ class Optimizer:
             calibration=self.calibration,
             output_dir=None,
         )
-        return run_compression(self.model, spec, output_root=self.artifacts_root)
+        return run_compression(self.model, spec, output_root=self.artifacts_root, reuse=self.reuse)
 
     def run(self, candidate_set: CandidateSet) -> OptimizationResult:
         started = time.perf_counter()
@@ -224,7 +270,7 @@ class Optimizer:
             result.outcomes.append(outcome)
 
             if candidate.is_baseline and outcome.error is None and baseline_record is None:
-                baseline_record = getattr(outcome, "_record", None)
+                baseline_record = outcome.record
                 result.baseline_record = baseline_record
 
             self._say(f"  {outcome.summary()}")
@@ -257,21 +303,27 @@ class Optimizer:
 
         try:
             # Stage 2: compression. Skipped for the baseline, which is the
-            # model as it already exists.
+            # model as it already exists. An identical artifact already on disk
+            # is reused inside run_compression, which is why this can be the
+            # most expensive stage and still cost nothing the second time.
             if not candidate.is_baseline:
                 self._say(f"  compressing {candidate.id}")
                 outcome.artifact = self.compress_fn(candidate)
                 outcome.stage = "compressed"
                 if outcome.artifact.artifact_bytes:
                     outcome.weights_bytes = outcome.artifact.artifact_bytes
+                if outcome.artifact.created_at < self._started_at:
+                    outcome.reused.append("compression")
 
             # Stage 3: cheap quality screening.
             if self.evaluate_fn is not None:
                 self._say(f"  evaluating {candidate.id}")
                 target = outcome.served_model or self.model.id
                 record = self.evaluate_fn(target, candidate)
-                outcome._record = record  # type: ignore[attr-defined]
+                outcome.record = record
                 outcome.stage = "evaluated"
+                if record.created_at < self._started_at:
+                    outcome.reused.append("evaluation")
 
                 if candidate.is_baseline:
                     outcome.quality_retention = 1.0
@@ -287,8 +339,18 @@ class Optimizer:
 
             # Stage 4: the deployment benchmark, only for survivors.
             if self.benchmark_fn is not None and self._needs_benchmark():
-                self._say(f"  benchmarking {candidate.id}")
-                outcome.benchmark = self.benchmark_fn(outcome)
+                key = self._benchmark_key(outcome)
+                cached = self.store.find_benchmark(key) if self.reuse and self.store else None
+
+                if cached is not None and cached.deployment is not None:
+                    self._say(f"  reusing benchmark for {candidate.id} from {cached.run_id}")
+                    outcome.benchmark = cached.deployment
+                    outcome.reused.append("benchmark")
+                else:
+                    self._say(f"  benchmarking {candidate.id}")
+                    outcome.benchmark = self.benchmark_fn(outcome)
+                    self._persist(outcome, key)
+
                 outcome.stage = "benchmarked"
                 outcome.violations = self.constraints.check_benchmark(outcome.benchmark)
 
@@ -299,6 +361,77 @@ class Optimizer:
         outcome.score = score_candidate(outcome, self.objective)
         outcome.duration_s = time.perf_counter() - started
         return outcome
+
+    def _benchmark_key(self, outcome: CandidateOutcome) -> str:
+        """What makes this candidate's benchmark reusable.
+
+        The served weights, plus everything about how they were served and
+        driven. Context length and KV dtype are candidate properties rather than
+        benchmark settings, but they are launch flags, so a change to either
+        means a different server and a different measurement.
+        """
+        candidate = outcome.candidate
+        return benchmark_key(
+            served_model=outcome.served_model or self.model.id,
+            backend=self.backend,
+            hardware=self.hardware,
+            environment=self.environment,
+            settings={
+                **self.benchmark_settings,
+                "max_model_len": candidate.max_model_len,
+                "kv_dtype": candidate.kv_dtype,
+            },
+        )
+
+    def _persist(self, outcome: CandidateOutcome, key: str) -> None:
+        """Write a measured benchmark to its own record, so a later search reuses it.
+
+        Its own, rather than attached to the candidate's evaluation record.
+        Context length is not a compression parameter, so candidates that differ
+        only in it share one artifact and one evaluation while having genuinely
+        different benchmarks. Attaching each to the shared evaluation record
+        would mean the last one written silently replaced the rest.
+        """
+        if self.store is None or outcome.benchmark is None:
+            return
+
+        benchmark = outcome.benchmark
+        candidate = outcome.candidate
+        served = outcome.served_model or self.model.id
+
+        config = RunConfig(
+            model=ModelSpec(id=served),
+            deployment=DeploymentSpec(
+                backend=self.backend,
+                endpoint=benchmark.endpoint,
+                served_model=served,
+                prompt_tokens=benchmark.prompt_tokens_requested or 1,
+                max_tokens=benchmark.max_tokens or 1,
+                concurrency_levels=[p.concurrency for p in benchmark.phases] or [1],
+            ),
+            label=candidate.id,
+            output_dir=self.store.root,
+        )
+
+        record = RunRecord(
+            run_id=self.store.new_run_id(config),
+            config=config,
+            config_fingerprint=config.fingerprint,
+            benchmark_key=key,
+            candidate_id=candidate.id,
+            model=ModelInfo(id=served),
+            hardware=self.hardware,
+            environment=self.environment,
+            deployment=benchmark,
+            compression=outcome.artifact,
+        )
+
+        try:
+            self.store.save(record)
+        except OSError as exc:
+            # A search that produced good numbers should not fail because they
+            # could not be filed. The cost is only that the next run repeats it.
+            logger.warning("could not cache benchmark for %s: %s", candidate.id, exc)
 
     def _needs_benchmark(self) -> bool:
         """Benchmark when a constraint or the objective depends on it.

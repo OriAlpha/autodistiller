@@ -20,7 +20,10 @@ from .config import RunConfig
 from .metadata.environment import EnvironmentInfo
 from .metadata.hardware import HardwareInfo
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+"""2 adds the Phase 6 cache keys. Version 1 records still load: the new
+fields are optional, and a record without them simply never matches a
+cache lookup, so it is history rather than a reusable result."""
 
 
 class MetricValue(BaseModel):
@@ -245,6 +248,15 @@ class RunRecord(BaseModel):
 
     config: RunConfig
     config_fingerprint: str
+
+    # Phase 6. Two keys because a record can hold two independently expensive
+    # results; see :mod:`autodistiller.cache`.
+    experiment_key: str | None = None
+    benchmark_key: str | None = None
+    candidate_id: str | None = Field(
+        default=None, description="Which optimizer candidate produced this record"
+    )
+
     model: ModelInfo
     hardware: HardwareInfo
     environment: EnvironmentInfo

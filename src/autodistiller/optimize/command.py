@@ -21,10 +21,21 @@ from ..runner import run_evaluation
 from ..serving.backends import resolve_backend
 from ..serving.benchmark import run_deployment_benchmark
 from ..serving.launcher import LaunchSpec, serving
+from ..store import RunStore
 from .constraints import Constraints, Objective
 from .pipeline import CandidateOutcome, OptimizationResult, Optimizer
 
 ProgressFn = Callable[[str], None]
+
+BENCHMARK_PROMPT_TOKENS = 256
+BENCHMARK_MAX_TOKENS = 128
+BENCHMARK_CONCURRENCY = (1, 8)
+"""The request shape the optimizer benchmarks candidates with.
+
+Defined once because two things need to agree on it: the benchmarker that
+drives the server, and the cache key that decides whether an earlier benchmark
+still describes the same measurement.
+"""
 
 WSL_VLLM_TEMPLATE = (
     'wsl -d Ubuntu -e bash -lc "'
@@ -64,6 +75,7 @@ def build_evaluator(
     base_model: ModelSpec,
     output_dir: Path,
     seed: int = 1234,
+    reuse: bool = True,
 ) -> Callable[[str, Candidate], RunRecord]:
     """Screen quality with the Phase 1 engine, unchanged.
 
@@ -85,7 +97,7 @@ def build_evaluator(
             label=candidate.id,
             output_dir=output_dir,
         )
-        return run_evaluation(config, save=True)
+        return run_evaluation(config, save=True, reuse=reuse)
 
     return evaluate
 
@@ -95,9 +107,9 @@ def build_benchmarker(
     *,
     base_model: ModelSpec,
     backend: str = "vllm",
-    prompt_tokens: int = 256,
-    max_tokens: int = 128,
-    concurrency_levels: tuple[int, ...] = (1, 8),
+    prompt_tokens: int = BENCHMARK_PROMPT_TOKENS,
+    max_tokens: int = BENCHMARK_MAX_TOKENS,
+    concurrency_levels: tuple[int, ...] = BENCHMARK_CONCURRENCY,
     progress: ProgressFn | None = None,
 ) -> Callable[[CandidateOutcome], DeploymentBenchmark]:
     """Start a server for the candidate, measure it, and shut it down."""
@@ -147,9 +159,15 @@ def optimize(
     max_candidates: int = 12,
     stop_early: bool = True,
     skip_benchmark: bool = False,
+    reuse: bool = True,
     progress: ProgressFn | None = None,
 ) -> OptimizationResult:
-    """Run the whole search: generate, screen, compress, evaluate, benchmark, rank."""
+    """Run the whole search: generate, screen, compress, evaluate, benchmark, rank.
+
+    ``reuse`` turns the Phase 6 cache off. Everything measured is written to
+    ``runs_dir`` and looked up there, so a repeated search costs only the stages
+    whose inputs actually changed.
+    """
     shape = load_shape(model.id, revision=model.revision, trust_remote_code=model.trust_remote_code)
     if progress is not None:
         progress(f"{shape.describe()}")
@@ -185,10 +203,17 @@ def optimize(
         objective=objective,
         backend=backend,
         artifacts_root=artifacts_root,
-        evaluate_fn=build_evaluator(tasks, base_model=model, output_dir=runs_dir),
+        evaluate_fn=build_evaluator(tasks, base_model=model, output_dir=runs_dir, reuse=reuse),
         benchmark_fn=benchmark_fn,
         calibration=calibration,
         stop_early=stop_early,
+        store=RunStore(runs_dir),
+        reuse=reuse,
+        benchmark_settings={
+            "prompt_tokens": BENCHMARK_PROMPT_TOKENS,
+            "max_tokens": BENCHMARK_MAX_TOKENS,
+            "concurrency_levels": list(BENCHMARK_CONCURRENCY),
+        },
         progress=progress,
     )
     return optimizer.run(candidate_set)
