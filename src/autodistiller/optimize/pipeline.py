@@ -197,6 +197,7 @@ class Optimizer:
         benchmark_fn: Callable[[CandidateOutcome], DeploymentBenchmark] | None = None,
         compress_fn: Callable[[Candidate], CompressionArtifact] | None = None,
         calibration=None,
+        llama_cpp_dir: str | None = None,
         stop_early: bool = True,
         store: RunStore | None = None,
         reuse: bool = True,
@@ -212,6 +213,7 @@ class Optimizer:
         self.benchmark_fn = benchmark_fn
         self.compress_fn = compress_fn or self._default_compress
         self.calibration = calibration
+        self.llama_cpp_dir = llama_cpp_dir
         self.stop_early = stop_early
         self.store = store
         self.reuse = reuse
@@ -234,6 +236,7 @@ class Optimizer:
         spec = CompressionSpec(
             method=candidate.method,
             calibration=self.calibration,
+            llama_cpp_dir=self.llama_cpp_dir,
             output_dir=None,
         )
         return run_compression(self.model, spec, output_root=self.artifacts_root, reuse=self.reuse)

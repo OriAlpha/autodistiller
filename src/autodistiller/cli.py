@@ -570,10 +570,24 @@ def compress(
     max_seq_length: int = typer.Option(2048, help="Calibration sequence length"),
     output_dir: Path | None = typer.Option(None, "--output-dir", "-o"),
     artifacts_root: Path = typer.Option(Path("artifacts"), "--artifacts-root"),
-    compress_backend: str = typer.Option("llmcompressor", "--compress-backend"),
-    serving_backend: str = typer.Option("vllm", "--serving-backend"),
+    compress_backend: str | None = typer.Option(
+        None,
+        "--compress-backend",
+        help="Override the toolchain. Defaults to whichever produces the method.",
+    ),
+    serving_backend: str | None = typer.Option(
+        None,
+        "--serving-backend",
+        help="Runtime this artifact must be servable by. Defaults to the method's own.",
+    ),
     compress_python: str | None = typer.Option(
         None, "--compress-python", help="Reuse an interpreter that already has the backend"
+    ),
+    llama_cpp_dir: str | None = typer.Option(
+        None,
+        "--llama-cpp",
+        envvar="LLAMA_CPP_DIR",
+        help="llama.cpp checkout, for GGUF methods. Also read from LLAMA_CPP_DIR.",
     ),
     trust_remote_code: bool = typer.Option(False),
     refresh: bool = typer.Option(
@@ -597,12 +611,13 @@ def compress(
 
     spec = CompressionSpec(
         method=method,
-        backend=compress_backend,
+        backend=compress_backend or None,
         calibration=calibration_spec,
         num_calibration_samples=samples,
         max_seq_length=max_seq_length,
         output_dir=output_dir,
         python_executable=compress_python,
+        llama_cpp_dir=llama_cpp_dir,
     )
 
     hardware = detect_hardware()
@@ -658,6 +673,7 @@ def candidates(
     """Generate the search space: what is worth measuring, and what is not."""
     from .candidates import generate_candidates, load_shape
     from .candidates.memory import parse_size
+    from .serving.backends import resolve_backend
 
     try:
         shape = load_shape(model)
@@ -696,6 +712,8 @@ def candidates(
             budget_bytes=budget,
             methods=tuple(method) if method else None,
             context_lengths=context_lengths,
+            # KV cache types are backend-specific; llama.cpp has no fp8.
+            kv_dtypes=resolve_backend(backend).kv_dtypes,
             concurrency=concurrency,
             include_baseline=not no_baseline,
             max_candidates=max_candidates,
@@ -772,12 +790,20 @@ def optimize(
     ),
     method: list[str] | None = typer.Option(None, "--method", help="Restrict the search space"),
     max_candidates: int = typer.Option(12, "--max-candidates"),
+    llama_cpp_dir: str | None = typer.Option(
+        None,
+        "--llama-cpp",
+        envvar="LLAMA_CPP_DIR",
+        help="llama.cpp checkout, for GGUF methods. Also read from LLAMA_CPP_DIR.",
+    ),
     concurrency: int = typer.Option(8, "--concurrency", help="Sequences the KV cache must hold"),
     launch_template: str | None = typer.Option(
         None, "--launch", help="Command template to start a server. See --launch-preset."
     ),
     launch_preset: str = typer.Option(
-        "none", "--launch-preset", help="none | wsl-vllm | native-vllm"
+        "none",
+        "--launch-preset",
+        help="none | wsl-vllm | native-vllm | native-llamacpp",
     ),
     stop_early: bool = typer.Option(True, "--stop-early/--no-stop-early"),
     artifacts_root: Path = typer.Option(Path("artifacts"), "--artifacts-root"),
@@ -799,7 +825,12 @@ def optimize(
     _configure_logging(verbose)
 
     from .candidates.memory import parse_size
-    from .optimize.command import NATIVE_VLLM_TEMPLATE, WSL_VLLM_STOP, WSL_VLLM_TEMPLATE
+    from .optimize.command import (
+        NATIVE_LLAMACPP_TEMPLATE,
+        NATIVE_VLLM_TEMPLATE,
+        WSL_VLLM_STOP,
+        WSL_VLLM_TEMPLATE,
+    )
     from .optimize.command import optimize as run_optimize
     from .optimize.constraints import Constraints, Objective
     from .serving.launcher import LaunchSpec, wsl_path
@@ -836,11 +867,20 @@ def optimize(
     except (ValueError, FileNotFoundError) as exc:
         raise typer.BadParameter(str(exc)) from exc
 
+    from .serving.backends import resolve_backend
+
+    try:
+        backend_spec = resolve_backend(backend)
+    except KeyError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
     template = launch_template
     if template is None and launch_preset != "none":
-        template = {"wsl-vllm": WSL_VLLM_TEMPLATE, "native-vllm": NATIVE_VLLM_TEMPLATE}.get(
-            launch_preset
-        )
+        template = {
+            "wsl-vllm": WSL_VLLM_TEMPLATE,
+            "native-vllm": NATIVE_VLLM_TEMPLATE,
+            "native-llamacpp": NATIVE_LLAMACPP_TEMPLATE,
+        }.get(launch_preset)
         if template is None:
             raise typer.BadParameter(f"unknown --launch-preset {launch_preset!r}")
 
@@ -852,6 +892,10 @@ def optimize(
         LaunchSpec(
             template=template,
             stop_template=stop,
+            port=backend_spec.default_port,
+            url=f"http://localhost:{backend_spec.default_port}",
+            # The KV cache flag is not the same word in every runtime.
+            kv_flag_template=backend_spec.kv_flag_template,
             # Artifact paths are local; the server is not.
             path_translator=wsl_path if is_wsl else None,
         )
@@ -876,6 +920,7 @@ def optimize(
             backend=backend,
             profile=profile,
             calibration=calibration_spec,
+            llama_cpp_dir=llama_cpp_dir,
             launch=launch,
             artifacts_root=artifacts_root,
             runs_dir=output_dir,

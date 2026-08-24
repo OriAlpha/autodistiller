@@ -87,6 +87,14 @@ class LaunchSpec:
     path_translator: Callable[[str], str] | None = None
     """Rewrites the model path for the far side of a boundary. See ``wsl_path``."""
 
+    kv_flag_template: str = "--kv-cache-dtype {kv_dtype}"
+    """The flag that selects a non-default KV cache type.
+
+    Backend-specific: vLLM takes one ``--kv-cache-dtype``, llama.cpp takes a
+    separate type for keys and values. Only used when the dtype is not the
+    default, so the common case stays flagless.
+    """
+
     stop_template: str | None = None
     """How to stop the server, when killing the launched process is not enough.
 
@@ -101,7 +109,7 @@ class LaunchSpec:
     ) -> str:
         # kv_dtype is passed as the backend's flag only when it is not the
         # default, so templates stay readable for the common case.
-        kv_flag = "" if kv_dtype == "auto" else f"--kv-cache-dtype {kv_dtype}"
+        kv_flag = "" if kv_dtype == "auto" else self.kv_flag_template.format(kv_dtype=kv_dtype)
         if self.path_translator is not None:
             model = self.path_translator(model)
         return self.template.format(

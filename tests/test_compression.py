@@ -335,9 +335,32 @@ def test_schemes_are_real_preset_names():
     valid = set(preset.PRESET_SCHEMES)
 
     for method in METHODS.values():
+        if method.is_gguf:
+            continue
         assert method.scheme in valid, (
             f"{method.name} declares scheme {method.scheme!r}, "
             f"which is not a preset. Valid: {', '.join(sorted(valid))}"
+        )
+
+
+def test_gguf_schemes_are_real_llama_quantize_types():
+    """The same guard for the other family.
+
+    A GGUF scheme is passed straight to `llama-quantize` as its type argument,
+    and an invented one fails after the convert step has already run -- which is
+    the whole model converted for nothing. llama.cpp's own file-type enum ships
+    in the `gguf` package, so the valid set is checkable here rather than at the
+    end of a long job.
+    """
+    file_type = pytest.importorskip("gguf").LlamaFileType
+    valid = {name.removeprefix("MOSTLY_") for name in (t.name for t in file_type)}
+
+    for method in METHODS.values():
+        if not method.is_gguf:
+            continue
+        assert method.scheme in valid, (
+            f"{method.name} declares scheme {method.scheme!r}, which llama-quantize "
+            f"does not accept. Valid: {', '.join(sorted(valid))}"
         )
 
 

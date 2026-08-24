@@ -51,6 +51,44 @@ class CompressionMethod:
     backends: tuple[str, ...] = ("vllm",)
     notes: str = ""
 
+    bits_per_weight: float | None = None
+    """Measured average bits per weight across the whole file, when the nominal
+    width does not describe the format.
+
+    llama.cpp's K-quants are mixed: a "4-bit" Q4_K_M holds attention and feed
+    forward tensors at several widths and lands near 4.85 bits once the block
+    scales are counted. Deriving a size from ``weight_bits`` alone would
+    under-estimate every GGUF candidate by around 20%, which is the difference
+    between fitting in VRAM and not.
+    """
+
+    quantizes_embeddings: bool = False
+    """Whether the format compresses the embedding and output tensors too.
+
+    compressed-tensors leaves them at 16-bit because they are quantization
+    sensitive, which is why a 4-bit model is never a quarter of its 16-bit size.
+    GGUF quantizes them as well, so the same nominal width produces a
+    noticeably smaller file -- most visibly on small models with large
+    vocabularies.
+    """
+
+    compression_backend: str = "llmcompressor"
+    """The tool that produces this format.
+
+    Picking a method is picking a toolchain, so the user should not have to name
+    both. It also decides the shape of what comes out, which is why ``produces``
+    is derived from it rather than repeated on every method.
+    """
+
+    @property
+    def produces(self) -> str:
+        """Shape of the artifact: a Hugging Face ``directory``, or a GGUF ``file``."""
+        return "file" if self.compression_backend == "llama.cpp" else "directory"
+
+    @property
+    def is_gguf(self) -> bool:
+        return self.compression_backend == "llama.cpp"
+
     @property
     def compresses_activations(self) -> bool:
         return self.activation_bits < 16
@@ -67,6 +105,11 @@ class CompressionMethod:
 
 # Everything here is produced by an existing implementation. AutoDistiller does
 # not own a kernel, and the roadmap is explicit that it should not start.
+#
+# Two families, because two runtimes want different things. The compressed-tensors
+# methods come from llmcompressor and are served by vLLM; the GGUF methods come
+# from llama.cpp's own quantizer and are served by llama-server. A method knows
+# which backends can serve it, so the search space filters itself.
 METHODS: dict[str, CompressionMethod] = {
     method.name: method
     for method in (
@@ -134,6 +177,80 @@ METHODS: dict[str, CompressionMethod] = {
             needs_calibration=True,
             notes="Static scales are calibrated once, so this needs data but "
             "avoids per-token scale computation at inference time.",
+        ),
+        CompressionMethod(
+            name="gguf-q8-0",
+            description="GGUF Q8_0: 8-bit, the near-lossless llama.cpp baseline",
+            weight_bits=8,
+            activation_bits=16,
+            scheme="Q8_0",
+            algorithm="rtn",
+            required_capability="fp16",
+            needs_calibration=False,
+            backends=("llama.cpp",),
+            compression_backend="llama.cpp",
+            bits_per_weight=8.5,
+            quantizes_embeddings=True,
+            notes="Not a K-quant: a flat 8-bit block format. The safest GGUF.",
+        ),
+        CompressionMethod(
+            name="gguf-q6-k",
+            description="GGUF Q6_K: 6-bit K-quant",
+            weight_bits=6,
+            activation_bits=16,
+            scheme="Q6_K",
+            algorithm="rtn",
+            required_capability="fp16",
+            needs_calibration=False,
+            backends=("llama.cpp",),
+            compression_backend="llama.cpp",
+            bits_per_weight=6.56,
+            quantizes_embeddings=True,
+        ),
+        CompressionMethod(
+            name="gguf-q5-k-m",
+            description="GGUF Q5_K_M: 5-bit K-quant, medium mix",
+            weight_bits=5,
+            activation_bits=16,
+            scheme="Q5_K_M",
+            algorithm="rtn",
+            required_capability="fp16",
+            needs_calibration=False,
+            backends=("llama.cpp",),
+            compression_backend="llama.cpp",
+            bits_per_weight=5.69,
+            quantizes_embeddings=True,
+        ),
+        CompressionMethod(
+            name="gguf-q4-k-m",
+            description="GGUF Q4_K_M: 4-bit K-quant, medium mix",
+            weight_bits=4,
+            activation_bits=16,
+            scheme="Q4_K_M",
+            algorithm="rtn",
+            required_capability="fp16",
+            needs_calibration=False,
+            backends=("llama.cpp",),
+            compression_backend="llama.cpp",
+            bits_per_weight=4.85,
+            quantizes_embeddings=True,
+            notes="The usual llama.cpp default: the best quality-per-byte of the "
+            "K-quants for most models.",
+        ),
+        CompressionMethod(
+            name="gguf-q3-k-m",
+            description="GGUF Q3_K_M: 3-bit K-quant, for tight memory",
+            weight_bits=3,
+            activation_bits=16,
+            scheme="Q3_K_M",
+            algorithm="rtn",
+            required_capability="fp16",
+            needs_calibration=False,
+            backends=("llama.cpp",),
+            compression_backend="llama.cpp",
+            bits_per_weight=3.74,
+            quantizes_embeddings=True,
+            notes="Quality falls off here, especially below about 7B parameters.",
         ),
     )
 }

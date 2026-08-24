@@ -7,6 +7,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Phase 9 of the roadmap: llama.cpp as a second deployment backend. This completes
+the v1.0 scope.
+
+### Added
+
+- **`--backend llama.cpp`**, end to end: GGUF candidates, GGUF artifacts,
+  benchmarks in `llama-server`, and recommendations. The benchmark client needed
+  no changes -- both runtimes speak the OpenAI API -- so what this phase actually
+  adds is a second *format*.
+- **GGUF methods**: `gguf-q8-0`, `gguf-q6-k`, `gguf-q5-k-m`, `gguf-q4-k-m`,
+  `gguf-q3-k-m`, produced by driving llama.cpp's own `convert_hf_to_gguf.py` and
+  `llama-quantize`. AutoDistiller writes no GGUF bytes, the same bargain as the
+  llmcompressor adapter.
+- **Picking a method picks the toolchain.** `--method gguf-q4-k-m` routes to
+  llama.cpp without naming it, and `--serving-backend` now defaults to whichever
+  runtime serves the chosen method rather than to vLLM.
+- **Backend-specific semantics, kept rather than papered over.** llama-server is
+  handed the `.gguf` file where vLLM is handed the directory; the KV cache flag
+  is `--cache-type-k`, not `--kv-cache-dtype`; the default port is 8080; and
+  llama.cpp is never offered an fp8 KV cache, which it has no concept of, so the
+  search cannot generate candidates it could not serve.
+- `--launch-preset native-llamacpp`. Unlike vLLM, llama.cpp builds on Windows and
+  needs no WSL wrapper. The preset offloads all layers with `-ngl 999`, because a
+  CPU-served candidate benchmarked against a GPU-served baseline is not a
+  comparison.
+- Quality screening loads GGUF through Transformers, which dequantizes it: the
+  weights carry the quantization error, which is what a quality comparison needs.
+  Deployment numbers still come from `llama-server` itself. Adds a `gguf`
+  dependency, mirroring `compressed-tensors` in Phase 3.
+- `--llama-cpp` / `LLAMA_CPP_DIR` to locate a checkout. llama.cpp is not pip
+  installable, so when it is missing the error names which half is absent -- the
+  converter script or the built binary -- instead of failing inside a subprocess.
+- GGUF artifacts export like any other. They carry their own config and tokenizer,
+  so the Hugging Face checks are skipped rather than failing a working artifact.
+
+### Fixed
+
+- **The memory estimator sized GGUF from its nominal bit width.** A K-quant is a
+  mix, not four bits everywhere: `gguf-q4-k-m` averages 4.85 bits per weight. GGUF
+  also quantizes embeddings, which compressed-tensors leaves at 16-bit. Published
+  bits-per-weight figures come from 7B-class models where embeddings are a
+  rounding error, so applying them to a model carrying 26% of its parameters in
+  the embedding under-reported by around 15% -- and a screen that under-estimates
+  produces candidates that OOM at serve time. Estimates now land within 10% of
+  published GGUF sizes for Qwen3-0.6B.
+- `--compress-backend` and `--serving-backend` no longer have to be spelled out
+  for a GGUF method, which previously failed with "backend 'vllm' cannot serve
+  Q4_K_M" against a default the user never chose.
+
+### Verified
+
+Candidate generation, method filtering, routing and the failure path are verified
+against Qwen3-0.6B: `--backend llama.cpp` generates only GGUF candidates, drops
+the fp8 KV variants, and a search without the tooling installed fails each GGUF
+candidate with an actionable message while completing normally.
+
+**Not verified end to end.** llama.cpp is not installed on the development
+machine, so no GGUF has actually been built or served. The subprocess calls are
+covered by tests with the tooling faked; the conversion, quantization and
+`llama-server` benchmark remain unexercised against the real binaries.
+
 Phase 8 of the roadmap: export and reproducibility.
 
 ### Added

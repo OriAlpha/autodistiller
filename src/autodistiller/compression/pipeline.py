@@ -106,7 +106,13 @@ def _is_complete(directory: Path) -> bool:
 
     A crashed or interrupted run leaves the directory and the config behind but
     no weights, and reusing that would fail much later and much less clearly.
+
+    Either shape counts: a Hugging Face directory from llmcompressor, or a GGUF
+    file from llama.cpp. Asking the shape-agnostic question here saves threading
+    the method through every caller to answer it.
     """
+    if any(directory.glob("*.gguf")):
+        return True
     return (directory / "config.json").is_file() and any(directory.glob("*.safetensors"))
 
 
@@ -162,7 +168,14 @@ def run_compression(
     serve, wastes minutes to reach a useless result.
     """
     method = resolve_method(spec.method)
-    availability = check_method(method, profile=profile, backend=serving_backend)
+
+    # Naming a method is naming a runtime, so an unspecified serving backend
+    # means "whichever one serves this". The check still fires when the caller
+    # asks for a combination that cannot work -- a GGUF built for vLLM is
+    # minutes spent reaching a useless result -- but it should not fire on a
+    # default the user never chose.
+    target = serving_backend or (method.backends[0] if method.backends else None)
+    availability = check_method(method, profile=profile, backend=target)
     if not availability.available:
         raise ValueError(f"{method.name} is not usable here: {'; '.join(availability.reasons)}")
 
@@ -173,11 +186,17 @@ def run_compression(
             progress(f"reusing {method.name} artifact at {job.output_dir}")
         return cached
 
-    backend = resolve_compression_backend(spec.backend, python_executable=spec.python_executable)
+    # Picking a method is picking a toolchain, so the spec need not name both.
+    backend_name = spec.backend or method.compression_backend
+    backend = resolve_compression_backend(
+        backend_name,
+        python_executable=spec.python_executable,
+        llama_cpp_dir=spec.llama_cpp_dir,
+    )
 
     usable, detail = backend.available()
     if not usable:
-        raise RuntimeError(f"compression backend {spec.backend!r} unavailable: {detail}")
+        raise RuntimeError(f"compression backend {backend_name!r} unavailable: {detail}")
 
     artifact = backend.compress(job, progress=progress)
     write_artifact_sidecar(job, artifact)

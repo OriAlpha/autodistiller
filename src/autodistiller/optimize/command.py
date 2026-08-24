@@ -57,6 +57,16 @@ the command exits 127.
 
 NATIVE_VLLM_TEMPLATE = "vllm serve {model} --port {port} --max-model-len {max_model_len} {kv_flag}"
 
+NATIVE_LLAMACPP_TEMPLATE = (
+    "llama-server -m {model} --port {port} -c {max_model_len} -ngl 999 {kv_flag}"
+)
+"""llama.cpp builds natively on Windows, so unlike vLLM it needs no WSL wrapper.
+
+``-ngl 999`` offloads every layer it can to the GPU. llama.cpp defaults to CPU,
+and a CPU-served candidate benchmarked against a GPU-served baseline is not a
+comparison, it is a mistake.
+"""
+
 WSL_VLLM_STOP = (
     "wsl -d Ubuntu -e bash -lc "
     '"pkill -f vllm-env/bin/vllm; sleep 8; pkill -9 -f vllm-env/bin/vllm; true"'
@@ -116,7 +126,11 @@ def build_benchmarker(
     backend_spec = resolve_backend(backend)
 
     def benchmark(outcome: CandidateOutcome) -> DeploymentBenchmark:
-        model = outcome.served_model or base_model.id
+        # The same artifact is named differently depending on who serves it:
+        # vLLM takes the directory, llama-server the .gguf inside it.
+        model = (
+            backend_spec.model_path(outcome.served_model) if outcome.served_model else base_model.id
+        )
         candidate = outcome.candidate
 
         with serving(
@@ -150,6 +164,7 @@ def optimize(
     backend: str = "vllm",
     profile: GPUProfile | None = None,
     calibration: DatasetSpec | None = None,
+    llama_cpp_dir: str | None = None,
     launch: LaunchSpec | None = None,
     artifacts_root: Path = Path("artifacts"),
     runs_dir: Path = Path("runs"),
@@ -172,6 +187,7 @@ def optimize(
     if progress is not None:
         progress(f"{shape.describe()}")
 
+    backend_spec = resolve_backend(backend)
     candidate_set = generate_candidates(
         shape,
         backend=backend,
@@ -179,6 +195,7 @@ def optimize(
         budget_bytes=constraints.max_vram_bytes,
         methods=methods,
         context_lengths=context_lengths,
+        kv_dtypes=backend_spec.kv_dtypes,
         concurrency=concurrency,
         max_candidates=max_candidates,
     )
@@ -206,6 +223,7 @@ def optimize(
         evaluate_fn=build_evaluator(tasks, base_model=model, output_dir=runs_dir, reuse=reuse),
         benchmark_fn=benchmark_fn,
         calibration=calibration,
+        llama_cpp_dir=llama_cpp_dir,
         stop_early=stop_early,
         store=RunStore(runs_dir),
         reuse=reuse,
@@ -220,6 +238,7 @@ def optimize(
 
 
 __all__ = [
+    "NATIVE_LLAMACPP_TEMPLATE",
     "NATIVE_VLLM_TEMPLATE",
     "WSL_VLLM_STOP",
     "WSL_VLLM_TEMPLATE",

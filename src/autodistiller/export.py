@@ -110,6 +110,13 @@ def read_quant_method(directory: Path) -> str | None:
     return quantization.get("quant_method") if isinstance(quantization, dict) else None
 
 
+def artifact_format(directory: Path) -> str | None:
+    """What kind of artifact this directory holds: ``gguf``, a quant_method, or None."""
+    if any(Path(directory).glob("*.gguf")):
+        return "gguf"
+    return read_quant_method(directory)
+
+
 def read_artifact_sidecar(directory: Path) -> CompressionArtifact | None:
     """The recipe AutoDistiller recorded when it produced these weights.
 
@@ -142,6 +149,20 @@ def inspect_artifact(directory: Path, *, backend: str = "vllm") -> list[Check]:
 
     if not directory.is_dir():
         return [Check("directory", False, f"{directory} does not exist")]
+
+    if gguf_files := sorted(directory.glob("*.gguf")):
+        # A GGUF file carries its own config and tokenizer, so the Hugging Face
+        # checks below have nothing to look for. Asking them anyway would report
+        # a working artifact as broken.
+        total = sum(f.stat().st_size for f in gguf_files)
+        checks.append(Check("weights", True, f"{gguf_files[0].name}, {total / 1024**3:.2f} GiB"))
+        checks.append(
+            Check("format", backend == "llama.cpp", "GGUF, served by llama.cpp")
+            if backend == "llama.cpp"
+            else Check("format", False, f"GGUF, which {backend} cannot serve")
+        )
+        checks.append(Check("self-contained", True, "config and tokenizer are inside the GGUF"))
+        return checks
 
     has_config = (directory / "config.json").is_file()
     checks.append(
@@ -188,27 +209,30 @@ def inspect_artifact(directory: Path, *, backend: str = "vllm") -> list[Check]:
     return checks
 
 
-def gguf_note(quant_method: str | None) -> str:
-    """Whether a GGUF conversion applies here, and what to run if it does.
+def gguf_note(quant_method: str | None, *, source_model: str | None = None) -> str:
+    """Whether a GGUF build applies here, and how to get one.
 
-    The roadmap asks for GGUF export *where applicable*, and the honest answer
-    for a compressed-tensors artifact is that it is not: GGUF carries its own
-    quantization schemes, and llama.cpp converts from unquantized Hugging Face
-    weights rather than from someone else's quantized ones. Converting the base
-    model and quantizing inside llama.cpp is the supported path, so that is the
-    command reported. The conversion itself belongs to Phase 9, where llama.cpp
-    becomes a measured backend rather than a suggestion.
+    "Where applicable" is doing real work in the roadmap's wording. GGUF carries
+    its own quantization schemes and llama.cpp converts from *unquantized*
+    Hugging Face weights, so there is no path from a compressed-tensors artifact
+    to a GGUF one -- the honest answer is to build it from the source model
+    instead. AutoDistiller can do that itself now that llama.cpp is a backend,
+    so the note names the command rather than the raw tooling.
     """
+    model = source_model or "<model>"
+
+    if quant_method == "gguf":
+        return "Already GGUF."
+
+    build = f"autodistiller compress --model {model} --method gguf-q4-k-m"
     if quant_method is not None:
         return (
-            f"Not applicable: these weights are {quant_method}, and llama.cpp converts from "
-            f"unquantized Hugging Face weights. Convert the source model instead, then "
-            f"quantize with llama-quantize."
+            f"These weights are {quant_method}, and llama.cpp converts from unquantized "
+            f"Hugging Face weights rather than from another format's quantized ones. "
+            f"Build a GGUF from the source model instead:\n\n    {build}\n\n"
+            f"See `autodistiller methods` for the other GGUF types."
         )
-    return (
-        "python convert_hf_to_gguf.py <model> --outfile model.gguf  "
-        "# from a llama.cpp checkout, then: llama-quantize model.gguf model-q4.gguf Q4_K_M"
-    )
+    return f"{build}\n\nSee `autodistiller methods` for the other GGUF types."
 
 
 class ExportManifest(BaseModel):
@@ -351,7 +375,10 @@ def build_manifest(
         environment=record.environment,
         serve_command=resolve_backend(backend).launch_command(served, max_model_len=max_model_len),
         reproduce=_reproduce_commands(record, artifact),
-        gguf=gguf_note(read_quant_method(directory) if directory else None),
+        gguf=gguf_note(
+            artifact_format(directory) if directory else None,
+            source_model=artifact.source_model if artifact else record.model.id,
+        ),
         checks=[{"name": c.name, "ok": c.ok, "detail": c.detail} for c in checks],
     )
 
@@ -486,6 +513,7 @@ __all__ = [
     "SERVABLE_QUANT_METHODS",
     "Check",
     "ExportManifest",
+    "artifact_format",
     "build_manifest",
     "export",
     "gguf_note",

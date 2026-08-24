@@ -178,7 +178,13 @@ class CompressionSpec(StrictModel):
     """
 
     method: str = Field(description="See `autodistiller methods`")
-    backend: str = "llmcompressor"
+    backend: str | None = Field(
+        default=None,
+        description=(
+            "Compression toolchain. Defaults to whichever one produces the chosen "
+            "method: llmcompressor for compressed-tensors, llama.cpp for GGUF."
+        ),
+    )
     calibration: DatasetSpec | None = Field(
         default=None, description="Required for calibrated methods (GPTQ, AWQ, INT8 activations)"
     )
@@ -193,6 +199,10 @@ class CompressionSpec(StrictModel):
     )
     python_executable: str | None = Field(
         default=None, description="Reuse a prepared interpreter instead of `uv run --with`"
+    )
+    llama_cpp_dir: str | None = Field(
+        default=None,
+        description="llama.cpp checkout, for GGUF methods. Also read from LLAMA_CPP_DIR.",
     )
 
 

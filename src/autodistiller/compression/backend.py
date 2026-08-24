@@ -249,20 +249,36 @@ class LLMCompressorBackend(CompressionBackend):
         )
 
 
+def _llama_cpp_backend() -> type[CompressionBackend]:
+    """Imported lazily: gguf.py imports this module, so a top-level import cycles."""
+    from .gguf import LlamaCppBackend
+
+    return LlamaCppBackend
+
+
 COMPRESSION_BACKENDS: dict[str, type[CompressionBackend]] = {
     "llmcompressor": LLMCompressorBackend,
 }
 
 
-def resolve_compression_backend(name: str, **kwargs) -> CompressionBackend:
+def _resolve_backend_class(name: str) -> type[CompressionBackend]:
+    if name.lower() == "llama.cpp":
+        return _llama_cpp_backend()
     try:
-        factory = COMPRESSION_BACKENDS[name.lower()]
+        return COMPRESSION_BACKENDS[name.lower()]
     except KeyError:
         raise KeyError(
             f"unknown compression backend {name!r}; "
-            f"available: {', '.join(sorted(COMPRESSION_BACKENDS))}"
+            f"available: llama.cpp, {', '.join(sorted(COMPRESSION_BACKENDS))}"
         ) from None
-    return factory(**kwargs)
+
+
+def resolve_compression_backend(name: str, **kwargs) -> CompressionBackend:
+    factory = _resolve_backend_class(name)
+    # The two adapters take different knobs; passing llmcompressor's to
+    # llama.cpp would fail on a keyword rather than on anything meaningful.
+    accepted = factory.__init__.__code__.co_varnames
+    return factory(**{k: v for k, v in kwargs.items() if k in accepted})
 
 
 def default_python() -> str:

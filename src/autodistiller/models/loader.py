@@ -134,6 +134,22 @@ def _weights_size_bytes(model: Any) -> int:
     return params + buffers
 
 
+def gguf_file_in(model_id: str) -> str | None:
+    """The GGUF filename inside an artifact directory, if that is what this is.
+
+    Transformers reads GGUF by being handed the directory plus the filename, and
+    it dequantizes on load: the weights come back as ordinary tensors carrying
+    the quantization error. That is exactly what a quality screen wants to
+    measure, and exactly not a claim about llama.cpp's inference kernels --
+    which is why deployment numbers still come from llama-server itself.
+    """
+    directory = Path(model_id)
+    if not directory.is_dir():
+        return None
+    found = sorted(directory.glob("*.gguf"))
+    return found[0].name if found else None
+
+
 def load_model(spec: Any) -> LoadedModel:
     """Load a model + tokenizer described by a :class:`~autodistiller.config.ModelSpec`."""
     device = resolve_device(spec.device)
@@ -146,6 +162,10 @@ def load_model(spec: Any) -> LoadedModel:
         "revision": spec.revision,
         "trust_remote_code": spec.trust_remote_code,
     }
+
+    if (gguf_file := gguf_file_in(spec.id)) is not None:
+        logger.info("Loading %s as GGUF (%s), dequantized for evaluation", spec.id, gguf_file)
+        common["gguf_file"] = gguf_file
 
     config = AutoConfig.from_pretrained(spec.id, **common)
     tokenizer = AutoTokenizer.from_pretrained(spec.id, use_fast=True, **common)

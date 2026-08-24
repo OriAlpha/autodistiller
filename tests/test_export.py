@@ -200,18 +200,25 @@ def test_a_directory_that_does_not_exist_fails_rather_than_raises(tmp_path):
 # --- GGUF, where applicable ---------------------------------------------
 
 
-def test_gguf_is_refused_for_quantized_weights():
-    """llama.cpp converts from unquantized Hugging Face weights, so claiming a
-    conversion path here would be wrong."""
-    note = gguf_note("compressed-tensors")
-    assert "Not applicable" in note
+def test_gguf_is_built_from_the_source_model_not_converted():
+    """There is no path from a compressed-tensors artifact to a GGUF one: GGUF
+    carries its own schemes and llama.cpp converts from unquantized weights. The
+    note has to send you to the source model rather than imply a conversion."""
+    note = gguf_note("compressed-tensors", source_model="Qwen/Qwen3-0.6B")
     assert "compressed-tensors" in note
+    assert "autodistiller compress" in note
+    assert "Qwen/Qwen3-0.6B" in note
+    assert "gguf-q4-k-m" in note
 
 
-def test_gguf_gives_a_command_for_unquantized_weights():
-    note = gguf_note(None)
-    assert "convert_hf_to_gguf.py" in note
-    assert "llama-quantize" in note
+def test_gguf_gives_a_build_command_for_unquantized_weights():
+    note = gguf_note(None, source_model="Qwen/Qwen3-0.6B")
+    assert note.startswith("autodistiller compress")
+    assert "--method gguf-q4-k-m" in note
+
+
+def test_an_artifact_that_is_already_gguf_says_so():
+    assert gguf_note("gguf") == "Already GGUF."
 
 
 # --- the manifest -------------------------------------------------------

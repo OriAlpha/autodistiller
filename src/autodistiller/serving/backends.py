@@ -17,6 +17,7 @@ proves annoying in practice.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 DEFAULT_PORT = 8000
 
@@ -31,7 +32,29 @@ class Backend:
     # the reported token counts stay honest either way.
     supports_ignore_eos: bool = True
     supports_concurrency: bool = True
+    artifact_shape: str = "directory"
+    """What this runtime is pointed at: a Hugging Face ``directory``, or a
+    single GGUF ``file``."""
+
+    kv_dtypes: tuple[str, ...] = ("auto", "fp8")
+    """KV cache types worth searching over. Backend-specific: llama.cpp has its
+    own quantized cache vocabulary and no fp8, so offering fp8 there would
+    generate candidates it cannot serve."""
+
+    kv_flag_template: str = "--kv-cache-dtype {kv_dtype}"
+    """How this runtime is told to use a non-default KV cache type."""
+
     notes: str = ""
+
+    def model_path(self, artifact_dir: str) -> str:
+        """The path to hand this runtime for an artifact AutoDistiller produced.
+
+        vLLM takes the directory. llama-server takes the ``.gguf`` inside it, so
+        the same artifact is named differently depending on who is serving it --
+        which is the backend-specific semantics the roadmap asks to preserve
+        rather than paper over.
+        """
+        return artifact_dir
 
     def launch_command(
         self,
@@ -64,7 +87,14 @@ class VLLMBackend(Backend):
 
 @dataclass(frozen=True)
 class LlamaCppBackend(Backend):
-    """Phase 9. The client already works against it; only the launch differs."""
+    """llama.cpp's llama-server, driven through the same OpenAI-compatible client."""
+
+    def model_path(self, artifact_dir: str) -> str:
+        directory = Path(artifact_dir)
+        if directory.is_file():
+            return artifact_dir  # already a .gguf
+        found = sorted(directory.glob("*.gguf")) if directory.is_dir() else []
+        return str(found[0]) if found else artifact_dir
 
     def launch_command(
         self,
@@ -92,7 +122,11 @@ BACKENDS: dict[str, Backend] = {
         description="llama.cpp llama-server (GGUF)",
         default_port=8080,
         supports_ignore_eos=False,
-        notes="Phase 9. Benchmarked through the same OpenAI-compatible client.",
+        artifact_shape="file",
+        kv_dtypes=("auto",),
+        kv_flag_template="--cache-type-k {kv_dtype} --cache-type-v {kv_dtype}",
+        notes="Serves GGUF. Runs on CPU as well as CUDA, and needs no ignore_eos: "
+        "token counts stay honest without it, but decode timings vary more.",
     ),
 }
 

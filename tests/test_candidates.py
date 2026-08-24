@@ -107,14 +107,40 @@ def test_quantization_never_shrinks_embeddings():
 
 
 def test_fewer_bits_means_fewer_bytes():
+    """Within one format family. Across families the comparison is not about
+    bits: GGUF quantizes the embeddings too, so its 4-bit is smaller than
+    compressed-tensors' 4-bit for a reason the bit width does not show."""
     shape = qwen3_06b()
     sizes = {
         name: weight_bytes(shape, method)
         for name, method in METHODS.items()
-        if method.weight_bits in (4, 8)
+        if method.weight_bits in (4, 8) and not method.is_gguf
     }
     assert min(sizes.values()) == sizes["int4-gptq"]
     assert weight_bytes(shape, None) > max(sizes.values())
+
+
+def test_gguf_is_smaller_than_the_same_width_elsewhere():
+    """compressed-tensors leaves embeddings at 16-bit and GGUF does not, which
+    on a model carrying a quarter of its parameters in the embedding is the
+    difference between the two formats at the same nominal width."""
+    shape = qwen3_06b()
+    assert weight_bytes(shape, METHODS["gguf-q4-k-m"]) < weight_bytes(shape, METHODS["int4-gptq"])
+
+
+def test_gguf_sizes_follow_their_published_bits_per_weight():
+    """A K-quant is a mix of widths, so its size does not follow the headline
+    number. These estimates are checked against what llama.cpp actually
+    produces for this model."""
+    shape = qwen3_06b()
+    mib = 1024**2
+    for name, published in (
+        ("gguf-q8-0", 610),
+        ("gguf-q5-k-m", 420),
+        ("gguf-q4-k-m", 380),
+    ):
+        estimate = weight_bytes(shape, METHODS[name]) / mib
+        assert abs(estimate - published) / published < 0.10, f"{name}: {estimate:.0f} MiB"
 
 
 # --- KV cache, against what vLLM reported -------------------------------
@@ -264,9 +290,21 @@ def test_hardware_filters_out_unsupported_formats():
 
 
 def test_backend_filters_independently_of_hardware():
+    """A Blackwell card can run every compressed-tensors format, and llama.cpp
+    can serve none of them. Hardware support and backend support are separate
+    questions and this is where that separation shows."""
     result = generate_candidates(qwen3_06b(), profile=BLACKWELL, backend="llama.cpp")
-    assert all(c.is_baseline for c in result.accepted)
+
+    served = {c.method for c in result.accepted if not c.is_baseline}
+    assert served, "llama.cpp should accept the GGUF methods"
+    assert all(METHODS[name].is_gguf for name in served)
     assert any("llama.cpp" in reason for r in result.rejected for reason in r.reasons)
+
+
+def test_vllm_does_not_accept_gguf():
+    result = generate_candidates(qwen3_06b(), profile=BLACKWELL, backend="vllm")
+    served = {c.method for c in result.accepted if not c.is_baseline}
+    assert served and not any(METHODS[name].is_gguf for name in served)
 
 
 def test_memory_rejects_what_cannot_fit():

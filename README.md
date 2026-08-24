@@ -17,7 +17,7 @@ algorithm. It composes them, measures them under real deployment conditions, and
 
 ---
 
-## Status: Phases 1–8
+## Status: Phases 1–9
 
 Phase 1 is complete and usable on its own. Its milestone is deliberately unglamorous:
 
@@ -43,8 +43,9 @@ good as the baseline it is measured against. So Phase 1 ships:
 | Persistent experiment cache | [`cache.py`](src/autodistiller/cache.py), [`store.py`](src/autodistiller/store.py) |
 | Pareto trade-offs and named recommendations | [`optimize/pareto.py`](src/autodistiller/optimize/pareto.py) |
 | Deployable, reproducible export | [`export.py`](src/autodistiller/export.py) |
+| GGUF and llama.cpp as a second backend | [`compression/gguf.py`](src/autodistiller/compression/gguf.py) |
 
-Phases 9–10 (llama.cpp, post-v1 research) are on the
+Phase 10 is post-v1 research, deliberately outside the v1 critical path. See the
 [roadmap](#roadmap) below.
 
 ### On isolation
@@ -325,11 +326,63 @@ you can move; without it the bundle refers to the weights where they already are
 
 ### GGUF
 
-Not yet, and deliberately. GGUF carries its own quantization schemes and
-llama.cpp converts from *unquantized* Hugging Face weights, so there is no
-conversion path from a compressed-tensors artifact — the manifest says so rather
-than implying one. For an uncompressed model it reports the `convert_hf_to_gguf.py`
-and `llama-quantize` commands. Making llama.cpp a measured backend is Phase 9.
+GGUF artifacts export the same way. They carry their own config and tokenizer, so
+the Hugging Face checks do not apply and are not run — asking for a `tokenizer.json`
+inside a GGUF directory would report a working artifact as broken.
+
+There is still no conversion *from* a compressed-tensors artifact: GGUF carries
+its own quantization schemes and llama.cpp converts from unquantized weights. The
+manifest says so and points at the command that builds one from the source model
+instead.
+
+---
+
+## Two backends
+
+`--backend vllm` and `--backend llama.cpp` search different spaces, because they
+serve different formats:
+
+| | vLLM | llama.cpp |
+|---|---|---|
+| Format | compressed-tensors | GGUF |
+| Methods | `int8`, `int4-gptq`, `int4-awq`, `fp8`, … | `gguf-q8-0`, `gguf-q6-k`, `gguf-q5-k-m`, `gguf-q4-k-m`, `gguf-q3-k-m` |
+| Built by | llmcompressor | `convert_hf_to_gguf.py` + `llama-quantize` |
+| Artifact | a directory | a single `.gguf` |
+| KV cache types | `auto`, `fp8` | `auto` |
+| Default port | 8000 | 8080 |
+
+Picking a method picks the toolchain, so `--method gguf-q4-k-m` routes to
+llama.cpp on its own. The search filters itself: a GGUF method is never offered
+to vLLM, and llama.cpp is never offered an fp8 KV cache it has no concept of.
+
+```bash
+uv run autodistiller optimize --model Qwen/Qwen3-0.6B --backend llama.cpp   --launch-preset native-llamacpp --objective throughput
+```
+
+llama.cpp is not pip installable, so point AutoDistiller at a built checkout with
+`--llama-cpp` or `LLAMA_CPP_DIR`. When it is missing, the error names which half —
+the converter script or the binary — rather than failing inside a subprocess.
+
+### Sizing GGUF honestly
+
+A K-quant is a mix of widths, not its headline number: `gguf-q4-k-m` averages about
+4.85 bits per weight. GGUF also quantizes the embeddings, which compressed-tensors
+leaves at 16-bit — so at the same nominal width a GGUF artifact is smaller.
+
+Both matter for screening. Published bits-per-weight figures are measured on
+7B-class models where embeddings are a rounding error; Qwen3-0.6B carries 26% of
+its parameters in a 151936-entry embedding, and llama.cpp keeps those tensors
+above the headline type. Estimating from the headline number alone under-reports
+by around 15%, and a memory screen that under-estimates produces candidates that
+OOM at serve time. Estimates land within 10% of published sizes for this model.
+
+### Quality screening
+
+Quality is screened by loading the GGUF through Transformers, which dequantizes
+it: the weights come back carrying the quantization error, which is what a quality
+comparison needs. It is not a claim about llama.cpp's inference kernels — those
+are measured where they run, in `llama-server`, and reported as the deployment
+numbers.
 
 ---
 
@@ -467,7 +520,7 @@ numbers can never be reused, so both gates run before anything is uploaded.
 | 6 | Persistent experiment cache | **done** |
 | 7 | Pareto analysis | **done** |
 | 8 | Export & reproducibility | **done** |
-| 9 | Multi-backend expansion (llama.cpp) | next |
+| 9 | Multi-backend expansion (llama.cpp) | **done** |
 | 10 | Post-v1 research (distillation, pruning, Bayesian search) | post-v1 |
 
 ### v1.0 target

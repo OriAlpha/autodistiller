@@ -7,10 +7,13 @@ touched.
 
 Three terms:
 
-* **Weights.** Quantization acts on the transformer blocks. Embeddings and the
-  output head stay at 16-bit, which is why a 4-bit model is never a quarter of
-  its 16-bit size -- and why the gap is widest on small models with large
-  vocabularies.
+* **Weights.** Format-dependent, and the two families differ in a way that
+  matters. compressed-tensors quantizes the transformer blocks and leaves
+  embeddings and the output head at 16-bit, which is why a 4-bit model is never
+  a quarter of its 16-bit size. GGUF quantizes those tensors too, but keeps them
+  above the headline type. Either way the gap is widest on small models with
+  large vocabularies, so neither can be estimated from a nominal bit width
+  alone.
 * **KV cache.** Two tensors per layer per KV head per token. Under continuous
   batching this scales with concurrency, and on long contexts it overtakes the
   weights entirely.
@@ -32,6 +35,14 @@ BYTES_PER_GIB = 1024**3
 
 QUANT_GROUP_SIZE = 128
 """Weights per shared scale for grouped integer quantization."""
+
+GGUF_EMBEDDING_FLOOR_BPW = 6.56
+"""Bits per weight llama.cpp keeps embedding and output tensors at, at minimum.
+
+Q6_K. The K-quant mixes hold those tensors above the headline type because they
+are the most quantization-sensitive in the file, so a Q3_K_M model is not 3.74
+bits everywhere.
+"""
 
 RUNTIME_OVERHEAD_FRACTION = 0.10
 """Fraction of device memory for activations, CUDA graphs and fragmentation.
@@ -93,9 +104,38 @@ def weight_bytes(shape: ModelShape, method: CompressionMethod | None) -> int:
     """Bytes the weights occupy under a compression method.
 
     ``None`` means the uncompressed baseline at 16-bit.
+
+    Two formats, two shapes. compressed-tensors quantizes the transformer blocks
+    and leaves embeddings and the output head at 16-bit, so the nominal width
+    plus the group scales describes it. GGUF quantizes everything and mixes
+    widths within a single K-quant, so its published bits-per-weight describes
+    it and the nominal width does not.
     """
     if method is None:
         return shape.n_parameters * 2
+
+    if method.bits_per_weight is not None:
+        # A published whole-file average, which already accounts for block
+        # scales and the mixed widths a K-quant uses internally.
+        total = int(shape.transformer_params * method.bits_per_weight / 8)
+
+        if not method.quantizes_embeddings:
+            return total + shape.embedding_params * 2
+
+        # Those averages are measured on 7B-class models, where embeddings are a
+        # rounding error. On a small model with a large vocabulary they are not:
+        # Qwen3-0.6B carries 26% of its parameters in a 151936-entry embedding,
+        # and llama.cpp deliberately keeps those tensors above the headline type
+        # because they are the most quantization-sensitive in the file. Applying
+        # the headline average to them under-estimates the artifact by roughly
+        # 15%, and a memory screen that under-estimates produces candidates that
+        # OOM at serve time.
+        #
+        # ponytail: one floor rather than llama.cpp's per-tensor type table,
+        # which is version-dependent and would need tracking upstream. Replace
+        # with the real table if measured GGUF sizes drift from these estimates.
+        embedding_bpw = max(method.bits_per_weight, GGUF_EMBEDDING_FLOOR_BPW)
+        return total + int(shape.embedding_params * embedding_bpw / 8)
 
     bits = method.weight_bits
     quantized = shape.transformer_params * bits // 8
