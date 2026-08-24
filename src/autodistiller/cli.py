@@ -5,6 +5,7 @@
     evaluate   measure a model and save a run record
     compare    check a candidate against a baseline
     runs/show  browse past runs
+    export     make a measured result deployable and reproducible
     history    the experiment cache: what has been measured, what can be reused
     methods    compression methods, and whether they are usable here
     compress   produce a compressed artifact
@@ -51,6 +52,7 @@ from .reporting.console import (
     render_compression,
     render_deployment,
     render_environment,
+    render_export,
     render_hardware,
     render_optimization,
     render_pareto,
@@ -389,6 +391,55 @@ def show(
         typer.echo(record.to_json())
     else:
         render_run(record, verbose=verbose)
+
+
+@app.command(name="export")
+def export_run(
+    run: str = typer.Argument(..., help="Run id, run directory, or path to record.json"),
+    runs_dir: Path = typer.Option(Path("runs"), "--runs-dir"),
+    output_dir: Path | None = typer.Option(
+        None,
+        "--output-dir",
+        "-o",
+        help="Assemble a standalone bundle here. Default: write beside the weights.",
+    ),
+    backend: str = typer.Option("vllm", "--backend", "-b", help="Runtime the result targets"),
+    copy_weights: bool = typer.Option(
+        False, "--copy-weights", help="Copy the weights into the bundle rather than referring to it"
+    ),
+    as_json: bool = typer.Option(False, "--json", help="Emit the manifest instead of a report"),
+) -> None:
+    """Make a measured result deployable and reproducible.
+
+    Writes the manifest, a deployment note and the exact config beside the
+    weights, so the directory you would serve is the one that explains itself.
+    Exits non-zero if the artifact would not actually load.
+    """
+    from .export import export as export_result
+
+    try:
+        record = RunStore(runs_dir).resolve(run)
+    except FileNotFoundError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+    try:
+        manifest, destination = export_result(
+            record,
+            backend=backend,
+            output_dir=output_dir,
+            copy_weights=copy_weights,
+        )
+    except (KeyError, ValueError, OSError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+
+    if as_json:
+        typer.echo(manifest.to_json())
+    else:
+        console.print(render_export(manifest, destination))
+
+    if not manifest.deployable:
+        raise typer.Exit(code=1)
 
 
 @app.command()
@@ -737,6 +788,11 @@ def optimize(
     no_pareto: bool = typer.Option(
         False, "--no-pareto", help="Skip the trade-off analysis and print only the winner"
     ),
+    export_dir: Path | None = typer.Option(
+        None,
+        "--export",
+        help="Export the recommended configuration here once the search finishes",
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
     """Find the best deployment configuration under explicit constraints."""
@@ -854,6 +910,48 @@ def optimize(
 
     if result.recommended is None:
         raise typer.Exit(code=1)
+
+    # Opt-in: a search should not write files into directories the user did not
+    # point it at. `autodistiller export <run-id>` covers the in-place case.
+    if export_dir is not None:
+        _export_recommendation(result, backend=backend, output_dir=export_dir)
+
+
+def _export_recommendation(result, *, backend: str, output_dir: Path | None) -> None:
+    """Make the winner deployable without the user hunting for its run id.
+
+    Only exports when the winner has a stored record behind it. Without one
+    there is nothing whose provenance could be written down, and a manifest
+    asserting a result it cannot evidence is worse than no manifest.
+    """
+    from .export import export as export_result
+
+    best = result.recommended
+    record = best.record if best is not None else None
+    if record is None:
+        if output_dir is not None:
+            console.print(
+                "[yellow]note:[/yellow] the recommended configuration has no stored run "
+                "record, so there is nothing to export."
+            )
+        return
+
+    try:
+        manifest, destination = export_result(
+            record,
+            backend=backend,
+            quality_retention=best.quality_retention,
+            artifact_dir=best.artifact.output_dir if best.artifact else None,
+            output_dir=output_dir,
+        )
+    except (KeyError, ValueError, OSError) as exc:
+        # A search that produced good numbers should not fail because they could
+        # not be filed. The result is already printed above.
+        console.print(f"[yellow]could not export:[/yellow] {exc}")
+        return
+
+    console.print()
+    console.print(render_export(manifest, destination))
 
 
 @app.command()

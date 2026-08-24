@@ -325,6 +325,15 @@ class Optimizer:
                 if record.created_at < self._started_at:
                     outcome.reused.append("evaluation")
 
+                # "Save the exact recipe with each result": an evaluation of a
+                # compressed candidate is a result *about* an artifact, and
+                # without this the record names the artifact directory as its
+                # model and says nothing about what produced it.
+                if outcome.artifact is not None and record.compression is None:
+                    record.compression = outcome.artifact
+                    if self.store is not None:
+                        self.store.save(record)
+
                 if candidate.is_baseline:
                     outcome.quality_retention = 1.0
                 elif baseline_record is not None:

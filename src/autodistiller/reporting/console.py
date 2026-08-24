@@ -499,12 +499,47 @@ def render_recommendations(report) -> Table:
     return table
 
 
+def render_export(manifest, destination) -> Panel:
+    """Render what was exported, and whether it would actually serve."""
+    table = Table(show_header=False, box=None, pad_edge=False)
+    table.add_column(style="cyan", no_wrap=True)
+    table.add_column(overflow="fold")
+
+    recipe = manifest.artifact.recipe if manifest.artifact else None
+    table.add_row("Source model", manifest.source_model)
+    table.add_row("Recipe", recipe.label if recipe else "uncompressed baseline")
+    table.add_row("Serving", manifest.served_path)
+    if manifest.artifact_bytes:
+        table.add_row("Size on disk", _gib(manifest.artifact_bytes))
+    if manifest.quality_retention is not None:
+        table.add_row("Quality retention", f"{manifest.quality_retention * 100:.2f}%")
+    table.add_row("From run", manifest.run_id)
+    table.add_row("Written to", str(destination))
+
+    table.add_row("", "")
+    for check in manifest.checks:
+        mark = Text("PASS", style="green") if check["ok"] else Text("FAIL", style="bold red")
+        table.add_row(check["name"], Text.assemble(mark, "  ", check["detail"]))
+
+    table.add_row("", "")
+    table.add_row("Serve it", Text(manifest.serve_command, style="bold"))
+
+    ok = manifest.deployable
+    return Panel(
+        table,
+        title=f"Export - {'deployable' if ok else 'NOT deployable'}",
+        title_align="left",
+        border_style="green" if ok else "red",
+    )
+
+
 __all__ = [
     "console",
     "render_candidates",
     "render_compression",
     "render_deployment",
     "render_environment",
+    "render_export",
     "render_hardware",
     "render_optimization",
     "render_pareto",

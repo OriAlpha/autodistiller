@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Phase 8 of the roadmap: export and reproducibility.
+
+### Added
+
+- **`autodistiller export <run>`**: writes a manifest, a `DEPLOY.md` note and
+  the exact config beside the weights, so the directory you would serve is the
+  one that explains itself. Nothing is converted -- llmcompressor already writes
+  a Hugging Face directory, so the artifact *is* the export. What was missing
+  was the provenance tying it to the measurements and a verified claim that a
+  server can load it.
+- **Deployability is checked, not asserted.** Weights present, tokenizer
+  present, and the quantization format one the target runtime actually has a
+  kernel for (read from `quantization_config.quant_method`, which is what the
+  runtime dispatches on). `export` exits non-zero when the artifact would not
+  load. An artifact that benchmarks beautifully and then cannot be served is the
+  failure this exists to catch.
+- The manifest carries the recipe, the calibration fingerprint, the metrics, the
+  deployment benchmark, the hardware and the software stack, plus the commands
+  that rebuild it. The saved config re-hashes to the same experiment.
+- `optimize --export DIR` exports the winning configuration, so finding its run
+  id by hand is not a step. `--copy-weights` assembles a bundle that can be
+  moved; without it the bundle refers to the weights where they already are.
+- Export recovers the recipe from the artifact's own sidecar when the run record
+  has none -- the normal case for weights produced by `compress` directly, and
+  for an evaluation of a compressed candidate, which records the artifact
+  directory as its model rather than the recipe that built it.
+- GGUF is reported as not applicable to compressed-tensors artifacts, with the
+  reason: llama.cpp converts from unquantized Hugging Face weights and carries
+  its own quantization schemes. For an uncompressed model the manifest gives the
+  `convert_hf_to_gguf.py` and `llama-quantize` commands. Making llama.cpp a
+  measured backend is Phase 9.
+
+### Fixed
+
+- The optimizer recorded a candidate's compression artifact only when it also
+  benchmarked it, so an evaluation of a compressed candidate named the artifact
+  directory as its model and said nothing about the recipe that produced it.
+  The roadmap asks for the exact recipe to be saved with each result; it now is.
+
+### Verified
+
+Qwen3-0.6B on an RTX 5070: exporting an FP8 artifact passes all four checks and
+emits a `vllm serve` command against the directory it wrote itself into, and
+`optimize --export` produces the same bundle for the winning candidate.
+
 ## [0.3.0] - 2026-08-24
 
 Phases 4 to 7 of the roadmap: AutoDistiller now makes the compression decision

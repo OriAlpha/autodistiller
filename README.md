@@ -17,7 +17,7 @@ algorithm. It composes them, measures them under real deployment conditions, and
 
 ---
 
-## Status: Phases 1–7
+## Status: Phases 1–8
 
 Phase 1 is complete and usable on its own. Its milestone is deliberately unglamorous:
 
@@ -42,8 +42,9 @@ good as the baseline it is measured against. So Phase 1 ships:
 | Constrained optimization and ranking | [`optimize/`](src/autodistiller/optimize) |
 | Persistent experiment cache | [`cache.py`](src/autodistiller/cache.py), [`store.py`](src/autodistiller/store.py) |
 | Pareto trade-offs and named recommendations | [`optimize/pareto.py`](src/autodistiller/optimize/pareto.py) |
+| Deployable, reproducible export | [`export.py`](src/autodistiller/export.py) |
 
-Phases 8–10 (export, llama.cpp, post-v1 research) are on the
+Phases 9–10 (llama.cpp, post-v1 research) are on the
 [roadmap](#roadmap) below.
 
 ### On isolation
@@ -282,6 +283,56 @@ only want the winner.
 
 ---
 
+## Export and deploy
+
+A measured recommendation is only worth something if someone else can deploy it
+and rebuild it:
+
+```bash
+uv run autodistiller export <run_id>
+```
+
+That writes three files beside the weights, so the directory you would serve is
+the one that explains itself:
+
+| File | What it carries |
+|---|---|
+| `autodistiller-manifest.json` | Recipe, calibration fingerprint, metrics, benchmark, hardware, stack |
+| `DEPLOY.md` | How to serve it, what it scored, how to rebuild it |
+| `autodistiller-config.yaml` | The exact config, which re-hashes to the same experiment |
+
+Export **checks** deployability rather than asserting it, and exits non-zero if
+the artifact would not load:
+
+```
+config      PASS  config.json present
+weights     PASS  1 file(s), 0.70 GiB
+tokenizer   PASS  tokenizer.json, tokenizer_config.json
+format      PASS  compressed-tensors, which vllm has kernels for
+
+Serve it    vllm serve artifacts/Qwen3-0.6B-fp8-7deef795 --port 8000 --max-model-len 2048
+```
+
+Nothing is converted — llmcompressor already writes a Hugging Face directory, so
+the artifact *is* the export. What was missing was the provenance tying it to the
+measurements that justify it, and a verified claim that a server can load it.
+An artifact that benchmarks beautifully and then cannot be served is the failure
+these checks exist to catch.
+
+`optimize --export DIR` does the same for the winning configuration, so you never
+have to work out which run id it was. Add `--copy-weights` to assemble a bundle
+you can move; without it the bundle refers to the weights where they already are.
+
+### GGUF
+
+Not yet, and deliberately. GGUF carries its own quantization schemes and
+llama.cpp converts from *unquantized* Hugging Face weights, so there is no
+conversion path from a compressed-tensors artifact — the manifest says so rather
+than implying one. For an uncompressed model it reports the `convert_hf_to_gguf.py`
+and `llama-quantize` commands. Making llama.cpp a measured backend is Phase 9.
+
+---
+
 ## Tasks
 
 Run `uv run autodistiller tasks` for the live list.
@@ -415,8 +466,8 @@ numbers can never be reused, so both gates run before anything is uploaded.
 | 5 | Constrained optimization | **done** |
 | 6 | Persistent experiment cache | **done** |
 | 7 | Pareto analysis | **done** |
-| 8 | Export & reproducibility | next |
-| 9 | Multi-backend expansion (llama.cpp) | planned |
+| 8 | Export & reproducibility | **done** |
+| 9 | Multi-backend expansion (llama.cpp) | next |
 | 10 | Post-v1 research (distillation, pruning, Bayesian search) | post-v1 |
 
 ### v1.0 target
