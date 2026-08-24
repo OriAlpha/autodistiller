@@ -25,11 +25,11 @@ import json
 import shutil
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from importlib import metadata
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from . import __version__
 from .compression.pipeline import ARTIFACT_SIDECAR
 from .metadata.environment import EnvironmentInfo
 from .metadata.hardware import HardwareInfo
@@ -41,6 +41,19 @@ from .results import (
     TaskResult,
 )
 from .serving.backends import resolve_backend
+
+
+def _package_version() -> str:
+    """Read the version from installed metadata rather than from the package.
+
+    ``autodistiller/__init__.py`` re-exports this module as part of the public
+    API, so importing the package from here would be a cycle.
+    """
+    try:
+        return metadata.version("autodistiller")
+    except metadata.PackageNotFoundError:  # running from a source tree
+        return "unknown"
+
 
 MANIFEST_FILENAME = "autodistiller-manifest.json"
 README_FILENAME = "DEPLOY.md"
@@ -246,7 +259,7 @@ class ExportManifest(BaseModel):
 
     schema_version: int = MANIFEST_SCHEMA_VERSION
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-    autodistiller_version: str = __version__
+    autodistiller_version: str = Field(default_factory=_package_version)
 
     run_id: str
     candidate_id: str | None = None
