@@ -7,6 +7,120 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-24
+
+Phases 4 to 7 of the roadmap: AutoDistiller now makes the compression decision
+itself, does not measure the same thing twice, and shows the trade-off rather
+than only the winner.
+
+### Added
+
+#### Candidate generation (Phase 4)
+
+- **`autodistiller candidates`**: the search space, before spending anything on
+  it. Compression method x context length x KV cache dtype, filtered by hardware
+  support, backend support and estimated memory.
+- Model dimensions are read from the Hugging Face config alone, so a whole
+  search space is screened for a few kilobytes rather than a download per
+  candidate.
+- Memory estimates account for embeddings and `lm_head` staying 16-bit, which is
+  why a 4-bit model is never a quarter of its 16-bit size.
+- Rejected candidates are kept with their reasons. "Your GPU has no FP8" is an
+  answer; a silently shorter list is not.
+
+#### Constrained optimization (Phase 5)
+
+- **`autodistiller optimize`**: the roadmap's headline command. Candidates run
+  through progressively more expensive stages -- memory estimate, compression,
+  quality screen, deployment benchmark -- and are dropped as soon as they fail,
+  so the costly work only lands on configurations still worth it.
+- Constraints decide what may be recommended; the objective decides which of
+  those wins, and also sets the search order. That ordering is what makes
+  stopping early honest: under throughput the most compressed candidate is
+  proven first, so the first qualifying candidate is the fastest qualifying one.
+- Server lifecycle management, so a dozen candidates can be benchmarked in
+  sequence without starting each one by hand.
+
+#### Persistent experiment cache (Phase 6)
+
+- **Nothing is measured twice.** `evaluate`, `compress` and `optimize` reuse an
+  identical earlier result instead of repeating it. Each takes `--refresh` to
+  measure again anyway.
+- **Experiment keys** (`cache.py`) covering what the roadmap asks for: model,
+  hardware, backend, compression method, calibration data, software versions and
+  benchmark configuration. Two keys rather than one, because an evaluation and a
+  deployment benchmark are independently expensive and independently
+  invalidated: changing the concurrency sweep should not discard a perplexity
+  measurement.
+- The stack half of the key is narrow on purpose -- `autodistiller`, `torch`,
+  `transformers`, `tokenizers`, `datasets`, CUDA, Python minor. Keying on every
+  installed version is defensible and useless: a `safetensors` patch bump would
+  discard every cached result without changing any of them.
+- **Compressed artifacts are reused**, which is the largest saving: the
+  optimizer repeats compression more than anything else, and it is the only
+  stage measured in minutes. An `autodistiller-artifact.json` sidecar records
+  what a directory holds; weights are verified present before anything is
+  reused, so an interrupted run is not mistaken for a finished one.
+- **Deployment benchmarks are persisted** and reused. `RunRecord` already had
+  `deployment` and `compression` fields; the optimizer now fills them, so a
+  repeated search pays only for the stages whose inputs actually changed.
+- **`autodistiller history`**: what has been measured and what can be reused,
+  with `--rebuild` and `--json`. Reads `runs/index.jsonl` -- one row per record,
+  keys and summary, no metrics -- so a lookup does not parse every run ever
+  done. Derived state: delete it and it rebuilds. Also the shape a shared
+  benchmark database would want, being flat rows carrying a complete key rather
+  than a local file layout.
+- `autodistiller runs --model` to filter history by model.
+- `RunRecord.schema_version` is 2, adding `experiment_key`, `benchmark_key` and
+  `candidate_id`. Version 1 records still load; they are history rather than
+  reusable results, and never match a lookup.
+
+#### Pareto analysis (Phase 7)
+
+- **Trade-offs, not a single score.** `optimize` reports the configurations
+  where you cannot improve one axis without losing another, across quality,
+  VRAM, latency and throughput, and names the best-quality, fastest, smallest
+  and balanced options. Each says what choosing it costs.
+- A candidate is never ranked on a number nobody measured. Treating an
+  unmeasured throughput as best or worst would put it on the frontier for a
+  reason that is not a measurement; those candidates are reported separately.
+- An axis never mixes measured and estimated values. When nothing was
+  benchmarked the VRAM axis falls back to estimates and is labelled as such.
+- The frontier is drawn over the axes that have data. Keeping latency and
+  throughput in the set when nothing was benchmarked would make every candidate
+  incomparable and the frontier empty -- true, and useless.
+- Ties on an objective break towards the frontier: two candidates can score
+  identically while one is beaten outright on every other axis.
+- `--no-pareto` prints only the winner. `--no-stop-early` is what makes the
+  frontier worth looking at, since early stopping measures exactly one
+  qualifying candidate.
+
+### Fixed
+
+- **Compressed artifacts could silently overwrite each other.** The output
+  directory was named `<model>-<method>`, which ignores the calibration data,
+  the `ignore` list and the sequence length -- all of which change the produced
+  weights. Compressing one model and method with two different calibration sets
+  wrote both to the same directory, the second replacing the first, while every
+  record already written still pointed at the path and described weights that
+  were no longer there. Directories are now content-addressed by the recipe.
+- **Two runs in the same second shared a directory.** Run ids are timestamped to
+  the second, so a repeated fast evaluation wrote the second record straight
+  over the first. The store now disambiguates ids within its own namespace;
+  `--refresh` on a cached evaluation reached this reliably.
+- The optimizer attached each candidate's benchmark to that candidate's
+  evaluation record. Context length is not a compression parameter, so
+  candidates differing only in it share one artifact and one evaluation while
+  having genuinely different benchmarks -- and all but the last were lost.
+  Benchmarks are now recorded separately.
+
+### Verified
+
+Qwen3-0.6B on an RTX 5070: a repeated `evaluate` returns the cached record
+instead of re-running, and a repeated `compress --method fp8` reuses the
+artifact rather than spending 17.7s producing it again. A repeated `optimize`
+reports its reused stages and reaches the same recommendation.
+
 ## [0.2.0] - 2026-08-23
 
 Phases 2 and 3 of the roadmap: deployment profiling and compression.
@@ -82,7 +196,8 @@ First release. Phase 1 of the roadmap: the evaluation engine.
 - Metadata capture for hardware, CUDA, and library versions.
 - CLI: `env`, `tasks`, `evaluate`, `compare`, `runs`, `show`.
 
-[Unreleased]: https://github.com/OriAlpha/Autodistiller/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/OriAlpha/Autodistiller/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/OriAlpha/Autodistiller/releases/tag/v0.3.0
 [0.2.0]: https://github.com/OriAlpha/Autodistiller/releases/tag/v0.2.0
 [0.1.1]: https://github.com/OriAlpha/Autodistiller/releases/tag/v0.1.1
 [0.1.0]: https://github.com/OriAlpha/Autodistiller/releases/tag/v0.1.0

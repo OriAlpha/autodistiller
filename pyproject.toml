@@ -1,6 +1,6 @@
 [project]
 name = "autodistiller"
-version = "0.2.0"
+version = "0.3.0"
 description = "Automatically find the best LLM deployment configuration for your hardware and quality constraints."
 readme = "README.md"
 requires-python = ">=3.10,<3.14"
