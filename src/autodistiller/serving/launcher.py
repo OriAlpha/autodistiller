@@ -22,10 +22,12 @@ import shlex
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import IO
 
 import httpx
 
@@ -143,17 +145,22 @@ def wait_until_stopped(url: str, *, timeout_s: int = STOP_TIMEOUT_S) -> bool:
     return False
 
 
-def _last_words(process: subprocess.Popen, *, lines: int = 12) -> str:
+def _last_words(log: IO[str] | None, *, lines: int = 12) -> str:
     """The tail of a dead server's stderr, for the error that reports its death.
 
-    Reading is safe only once the process has exited, which is the only place
-    this is called from. Truncated to a tail because a serving runtime's startup
-    log is long and the reason it stopped is at the end.
+    Read from a file rather than a pipe, deliberately. A pipe holds about 64 KB
+    before the writer blocks, and vLLM prints more than that within seconds of
+    starting -- so capturing stderr through PIPE and reading it only after the
+    process exits deadlocks the very process being waited on. It then hangs
+    until the readiness timeout having produced nothing, which is a worse
+    failure than the silence it was meant to fix.
     """
-    if process.stderr is None:
+    if log is None:
         return ""
     try:
-        tail = [line.rstrip() for line in process.stderr.read().splitlines() if line.strip()]
+        log.flush()
+        log.seek(0)
+        tail = [line.rstrip() for line in log.read().splitlines() if line.strip()]
     except Exception:
         return ""
     if not tail:
@@ -194,7 +201,13 @@ def check_port_is_free(url: str) -> None:
     )
 
 
-def wait_until_ready(url: str, *, timeout_s: int, process: subprocess.Popen | None = None) -> None:
+def wait_until_ready(
+    url: str,
+    *,
+    timeout_s: int,
+    process: subprocess.Popen | None = None,
+    log: IO[str] | None = None,
+) -> None:
     """Poll until the endpoint serves models, or give up.
 
     Watches the process too: a server that has already exited will never become
@@ -207,7 +220,7 @@ def wait_until_ready(url: str, *, timeout_s: int, process: subprocess.Popen | No
         if process is not None and process.poll() is not None:
             raise ServerError(
                 f"server exited with code {process.returncode} before becoming ready"
-                + _last_words(process)
+                + _last_words(log)
             )
         try:
             response = httpx.get(endpoint, timeout=3.0)
@@ -291,23 +304,22 @@ def serving(
         progress(f"starting {model} ({command[:80]}{'...' if len(command) > 80 else ''})")
 
     env = {**os.environ, **spec.env}
+    # A file, not a pipe. Nothing drains the pipe while readiness is polled, so
+    # a runtime that prints more than the buffer holds -- which vLLM does within
+    # seconds -- would block on its own stderr and never start. See _last_words.
+    log = tempfile.TemporaryFile(mode="w+", errors="replace")  # noqa: SIM115 -- closed in finally
     process = subprocess.Popen(
         command if spec.shell else shlex.split(command),
         shell=spec.shell,
         env=env,
         stdout=subprocess.DEVNULL,
-        # Kept, not discarded: when a server dies before it is ready, its own
-        # last words are the only thing that says why. Without them the failure
-        # reads "exited with code 1", which is true and useless.
-        stderr=subprocess.PIPE,
-        text=True,
-        errors="replace",
+        stderr=log,
         # Its own process group on POSIX, so the whole tree can be signalled.
         start_new_session=sys.platform != "win32",
     )
 
     try:
-        wait_until_ready(spec.url, timeout_s=spec.ready_timeout_s, process=process)
+        wait_until_ready(spec.url, timeout_s=spec.ready_timeout_s, process=process, log=log)
         if progress is not None:
             progress(f"server ready at {spec.url}")
         yield spec.url
@@ -315,6 +327,8 @@ def serving(
         if progress is not None:
             progress("stopping server")
         _terminate(process)
+        with contextlib.suppress(Exception):
+            log.close()
 
         if spec.stop_template:
             with contextlib.suppress(Exception):

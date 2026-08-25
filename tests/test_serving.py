@@ -785,3 +785,55 @@ def test_a_short_generation_is_not_mistaken_for_a_stall():
 
     assert phase.throughput_efficiency > 0.5
     assert not phase.warnings
+
+
+def test_a_dying_server_reports_its_own_last_words():
+    """ "exited with code 1" is true and useless. The runtime printed the reason
+    and it has to survive to the error that reports the death."""
+    import subprocess
+    import tempfile
+
+    from autodistiller.serving.launcher import _last_words
+
+    with tempfile.TemporaryFile(mode="w+") as log:
+        log.write("loading weights\nValueError: not enough memory for KV cache\n")
+        assert "not enough memory" in _last_words(log)
+        assert subprocess  # imported for symmetry with the caller
+
+
+def test_a_server_that_printed_nothing_adds_nothing():
+    import tempfile
+
+    from autodistiller.serving.launcher import _last_words
+
+    with tempfile.TemporaryFile(mode="w+") as log:
+        assert _last_words(log) == ""
+    assert _last_words(None) == ""
+
+
+def test_capturing_stderr_cannot_block_the_server():
+    """A pipe holds ~64 KB before the writer blocks, and nothing drains it while
+    readiness is polled -- so PIPE deadlocks the process being waited on. A file
+    has no such limit, and this is the regression that proves it stays a file."""
+    import inspect
+    import subprocess as sp
+
+    from autodistiller.serving import launcher
+
+    source = inspect.getsource(launcher.serving)
+    assert "stderr=log" in source
+    assert f"stderr={sp.PIPE}" not in source and "stderr=subprocess.PIPE" not in source
+
+
+def test_a_long_startup_log_is_truncated_to_its_tail():
+    """The reason a server stopped is at the end, and a startup log is long."""
+    import tempfile
+
+    from autodistiller.serving.launcher import _last_words
+
+    with tempfile.TemporaryFile(mode="w+") as log:
+        log.write("\n".join(f"line {n}" for n in range(500)) + "\nfinal cause\n")
+        tail = _last_words(log, lines=5)
+        assert "final cause" in tail
+        assert "line 0" not in tail
+        assert tail.count("\n") <= 5
