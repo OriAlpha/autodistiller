@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- README shows a complete `optimize` run end to end -- the command, the tables
+  it prints, and what the numbers mean -- using measured output from Qwen3-4B on
+  an 8 GiB card, where bf16 does not fit and quantizing is the only way to run
+  the model at all. Includes the size reduction against bf16 (67% for int4-awq)
+  and why the accuracy differences between methods are not real.
+
 ## [1.0.1] - 2026-08-25
 
 ### Fixed

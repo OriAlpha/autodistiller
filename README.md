@@ -96,32 +96,68 @@ Nothing is measured twice — repeat any of these and it reuses the earlier resu
 
 Real output from the tool, on an RTX 5070 Laptop (8 GiB), vLLM 0.27, plugged in.
 
-### Qwen3-4B — where quantizing is not optional
+### A complete run: Qwen3-4B on an 8 GiB card
 
-bf16 Qwen3-4B needs ~8 GB of weights, so it does not fit. Every option below is
-one you would actually have to choose between. Accuracy is `acc_norm` on 128
-questions each from hellaswag and arc_easy:
+bf16 Qwen3-4B is 7.49 GiB of weights, so it does not fit. Quantizing is not an
+optimisation here, it is the only way to run the model at all.
 
-| Method | Size | hellaswag | arc_easy | Throughput | TTFT |
+```bash
+uv run autodistiller optimize --model Qwen/Qwen3-4B --max-vram 8GiB   --task hellaswag --task arc_easy   --method fp8 --method int4-awq --method int8-weight-only   --calibration wikitext2 --launch-preset wsl-vllm   --no-stop-early --objective throughput
+```
+
+It compresses each method, evaluates accuracy on both tasks, starts a real vLLM
+server for each survivor and benchmarks it, then ranks:
+
+```
+| Candidate                | Stage       | Quality               |     Size | Throughput | TTFT |
+|--------------------------|-------------|-----------------------|----------|------------|------|
+| int4-awq-ctx2048         | benchmarked | hellaswag 0.5625 ±.044| 2.48 GiB |  641 tok/s | 60ms |
+|                          |             | arc_easy  0.7422 ±.039|          |            |      |
+| int8-weight-only-ctx2048 | benchmarked | hellaswag 0.5781 ±.044| 4.17 GiB |  463 tok/s | 68ms |
+|                          |             | arc_easy  0.7812 ±.037|          |            |      |
+| fp8-ctx2048              | benchmarked | hellaswag 0.5703 ±.044| 4.12 GiB |  444 tok/s | 67ms |
+|                          |             | arc_easy  0.7734 ±.037|          |            |      |
+
+Search took 20.4 min -- 13.0 compressing, 25.1 evaluating
+```
+
+Then the trade-offs, and what each option costs:
+
+```
+Pareto frontier - hellaswag/acc_norm vs Peak VRAM vs TTFT p50 vs Peak throughput
+| Candidate                | hellaswag/acc_norm | Peak VRAM | TTFT p50 | Peak throughput | Verdict        |
+|--------------------------|--------------------|-----------|----------|-----------------|----------------|
+| int4-awq-ctx2048         |             0.5625 |  7.75 GiB |     60ms |       641 tok/s | Pareto-optimal |
+| fp8-ctx2048              |             0.5703 |  7.82 GiB |     67ms |       444 tok/s | Pareto-optimal |
+| int8-weight-only-ctx2048 |             0.5781 |  7.82 GiB |     68ms |       463 tok/s | Pareto-optimal |
+
+Recommendations
+| Option               | Candidate        | Wins on                   | Gives up                          |
+|----------------------|------------------|---------------------------|-----------------------------------|
+| fastest (throughput) | int4-awq-ctx2048 | peak throughput 641 tok/s | hellaswag/acc_norm 0.5625 against |
+|                      |                  |                           | a best of 0.5781 (within noise -- |
+|                      |                  |                           | not a measurable difference)      |
+| smallest             | int4-awq-ctx2048 | artifact size 2.48 GiB    | (same)                            |
+```
+
+### What that tells you
+
+| Method | Size | vs bf16 | hellaswag | arc_easy | Throughput |
 |---|---|---|---|---|---|
-| **`int4-awq`** | **2.48 GiB** | 0.5625 ±0.044 | 0.7422 ±0.039 | **641 tok/s** | **60 ms** |
-| `int8-weight-only` | 4.17 GiB | 0.5781 ±0.044 | 0.7812 ±0.037 | 463 tok/s | 68 ms |
-| `fp8` | 4.12 GiB | 0.5703 ±0.044 | 0.7734 ±0.037 | 444 tok/s | 67 ms |
+| bf16 (does not fit) | 7.49 GiB | — | — | — | — |
+| **`int4-awq`** | **2.48 GiB** | **67% smaller** | 0.5625 ±.044 | 0.7422 ±.039 | **641 tok/s** |
+| `fp8` | 4.12 GiB | 45% smaller | 0.5703 ±.044 | 0.7734 ±.037 | 444 tok/s |
+| `int8-weight-only` | 4.17 GiB | 44% smaller | 0.5781 ±.044 | 0.7812 ±.037 | 463 tok/s |
 
-Read the error bars. The accuracy spread is 0.016; the standard error is 0.044 —
-nearly three times larger. **These models are not measurably different in
-accuracy**, and int4-awq is 44% faster and 40% smaller. The tool says so rather
-than leaving you to notice:
+**Read the error bars.** The accuracy spread across all three is 0.016 while the
+standard error on each is 0.044 — nearly three times larger. These models are
+**not measurably different in accuracy**, so int4-awq is 67% smaller and 44%
+faster for no cost anyone can demonstrate. The tool says "within noise" rather
+than letting you read 0.5625 vs 0.5781 as a real loss.
 
-```
- Option                 Candidate   Wins on                      Gives up
- fastest (throughput)   int4-awq    peak throughput 641 tok/s    hellaswag/acc_norm 0.5625 against a
-                                                                 best of 0.5781 (within noise -- not
-                                                                 a measurable difference)
-```
-
-That run took **20.4 min** — most of it evaluation, and only that fast because
-the cache reused four compressions and four benchmarks from an earlier search.
+That 20.4 minutes is fast only because the cache reused four compressions and
+four benchmarks from an earlier search. A cold run of the same command is closer
+to an hour, most of it evaluation.
 
 ### Qwen3-0.6B — where it is optional
 
