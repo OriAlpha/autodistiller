@@ -31,10 +31,14 @@ choosing it.
 
 ```
  Option                 Candidate   Wins on                      Gives up
- best quality           baseline    quality retention 100.00%    780 tok/s against a best of 1320
- fastest (throughput)   int4-awq    peak throughput 1320 tok/s   quality 94.10% against 100.00%
- smallest               int4-awq    artifact size 0.51 GiB       quality 94.10% against 100.00%
+ fastest (throughput)   int4-awq    peak throughput 641 tok/s    hellaswag/acc_norm 0.5625 against a
+                                                                 best of 0.5781 (within noise -- not
+                                                                 a measurable difference)
+ best quality           int8-w-o    hellaswag/acc_norm 0.5781    peak throughput 463 against 641 tok/s
 ```
+
+It reports error bars and says when a difference is too small to be real, because a
+recommendation built on noise is worse than no recommendation.
 
 It does not implement quantization itself. It drives the tools that do — LLM Compressor,
 llama.cpp — measures the results honestly, and picks.
@@ -90,42 +94,56 @@ Nothing is measured twice — repeat any of these and it reuses the earlier resu
 
 ## What it measured
 
-Qwen3-0.6B on an RTX 5070 Laptop (8 GiB), vLLM 0.27, plugged in. Produced by the tool itself.
+Real output from the tool, on an RTX 5070 Laptop (8 GiB), vLLM 0.27, plugged in.
 
-**Compression** — wikitext-2 perplexity, same baseline for every row:
+### Qwen3-4B — where quantizing is not optional
 
-| Method | Size | Quality kept |
-|---|---|---|
-| baseline (bf16) | 1.11 GiB | 100% |
-| `int8-weight-only` | 0.72 GiB | 100.2% |
-| `fp8` | 0.71 GiB | 99.0% |
-| `int4-awq` | 0.51 GiB | 86.4% |
+bf16 Qwen3-4B needs ~8 GB of weights, so it does not fit. Every option below is
+one you would actually have to choose between. Accuracy is `acc_norm` on 128
+questions each from hellaswag and arc_easy:
 
-**Speed** — measured inside vLLM, zero failed requests:
+| Method | Size | hellaswag | arc_easy | Throughput | TTFT |
+|---|---|---|---|---|---|
+| **`int4-awq`** | **2.48 GiB** | 0.5625 ±0.044 | 0.7422 ±0.039 | **641 tok/s** | **60 ms** |
+| `int8-weight-only` | 4.17 GiB | 0.5781 ±0.044 | 0.7812 ±0.037 | 463 tok/s | 68 ms |
+| `fp8` | 4.12 GiB | 0.5703 ±0.044 | 0.7734 ±0.037 | 444 tok/s | 67 ms |
 
-| Concurrency | bf16 | fp8 | fp8 gain |
+Read the error bars. The accuracy spread is 0.016; the standard error is 0.044 —
+nearly three times larger. **These models are not measurably different in
+accuracy**, and int4-awq is 44% faster and 40% smaller. The tool says so rather
+than leaving you to notice:
+
+```
+ Option                 Candidate   Wins on                      Gives up
+ fastest (throughput)   int4-awq    peak throughput 641 tok/s    hellaswag/acc_norm 0.5625 against a
+                                                                 best of 0.5781 (within noise -- not
+                                                                 a measurable difference)
+```
+
+That run took **20.4 min** — most of it evaluation, and only that fast because
+the cache reused four compressions and four benchmarks from an earlier search.
+
+### Qwen3-0.6B — where it is optional
+
+Small enough that bf16 fits, so here you get quality *retention* against a real
+baseline:
+
+| Method | Size | Quality kept | Throughput @c32 |
 |---|---|---|---|
-| 1 | 195 tok/s | 253 tok/s | **1.30x** |
-| 4 | 649 tok/s | 824 tok/s | 1.27x |
-| 16 | 2144 tok/s | 2626 tok/s | 1.22x |
-| 32 | 3036 tok/s | 3623 tok/s | 1.19x |
+| baseline (bf16) | 1.11 GiB | 100% | 3036 tok/s |
+| `int8-weight-only` | 0.72 GiB | 100.2% | — |
+| `fp8` | 0.71 GiB | 99.0% | **3623 tok/s** |
+| `int4-awq` | 0.51 GiB | 86.4% | — |
 
-So on this model FP8 is the pick: ~25% faster for 1% of quality. INT4 saves another 0.2 GiB but
-costs 13.6% — the kind of trade-off you want to see before choosing, not after.
+Note the reversal: **fp8 wins at 0.6B, int4-awq wins at 4B.** At 4B on an 8 GiB
+card the model is memory-bandwidth-bound, so halving the weights beats cheaper
+arithmetic. You would not guess that; you have to measure it, which is the point.
 
-**GGUF**, for llama.cpp, measured the same way:
-
-| Method | Size | Served by |
-|---|---|---|
-| `gguf-q4-k-m` | 0.45 GiB | llama-server, 55 tok/s at concurrency 1 (CPU-only build) |
-
-Those tok/s are not comparable to the vLLM rows above — that llama.cpp build has no CUDA. The size
-is real, and within 1% of what the candidate screen predicted before anything was built.
-
-> **Your numbers will differ.** The same model on the same GPU measured **3x apart** during
-> development: once because the laptop was on battery (GPU capped to 34 W), once because another
-> process held 5.9 GiB of the card. That is why every run records the hardware and software it ran
-> on, and why a cached result is never reused across a change in either.
+> **Your numbers will differ.** The same model on the same GPU measured **3x
+> apart** during development: once because the laptop was on battery (GPU capped
+> to 34 W), once because another process held 5.9 GiB of the card. That is why
+> every run records the hardware and software it ran on, and why a cached result
+> is never reused across a change in either.
 
 ---
 
@@ -159,8 +177,8 @@ Phases 1–9 are done, which is the whole v1.0 scope.
 | 4 Candidate generation | done | 9 llama.cpp | done |
 | 5 Constrained optimization | done | 10 Post-v1 research | later |
 
-Both backends are verified end to end against real binaries: vLLM on GPU, and llama.cpp built and
-run for real (CPU-only so far, so its numbers below are not GPU numbers).
+Both backends are verified end to end against real binaries: vLLM on GPU, and llama.cpp built from
+source and actually run — CPU-only so far, so GGUF throughput has not been measured on a GPU.
 
 **On Windows**, llama.cpp's binaries are Linux executables, so build it in WSL and add
 `--llama-cpp-wsl`:

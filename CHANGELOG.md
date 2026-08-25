@@ -120,6 +120,29 @@ would have survived a first user:
 
 ### Also in this release
 
+- **Quality is reported even without a baseline.** An 8 GiB card cannot hold
+  bf16 Qwen3-4B, so no baseline survives screening and there is no retention to
+  compute -- but the evaluation still ran and still cost twelve minutes a
+  candidate. Its result was then thrown away and the column showed `-`. The
+  measured metric is now shown instead, every task rather than only the first,
+  and it takes part in the Pareto frontier: without it a candidate scoring worse
+  came back "Pareto-optimal, gives up: nothing".
+- **A difference smaller than its error bars is called what it is.** Accuracy on
+  a few hundred questions carries a standard error near 0.044, and the spread
+  between quantization methods was 0.016. The trade-off note now reads "within
+  noise -- not a measurable difference" rather than implying a cost that the
+  measurement cannot support.
+- **`--port`**, because the default was already taken on the development machine
+  by an unrelated service, and **a pre-flight check** that refuses to launch into
+  a port something else is answering on. Two failure modes, and the quiet one is
+  worse: the benchmark would have measured the other service and reported its
+  numbers as the model's.
+- **Search runtime is reported.** It was tracked and never shown, which made the
+  roadmap's own target -- roughly an hour for a small model -- unverifiable from
+  the output. The staging docstring claimed the quality screen costs "seconds";
+  measured on Qwen3-4B at `--limit 256` it is twelve minutes and the most
+  expensive stage in the search. Corrected to the measured figures.
+
 - **A quality floor that cannot be checked is no longer reported as met.**
   `--min-quality` compares a candidate against a baseline, and when no baseline
   survives memory screening -- which is what happens the moment the unquantized

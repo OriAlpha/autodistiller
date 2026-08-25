@@ -391,3 +391,68 @@ def test_a_tie_on_the_objective_breaks_towards_the_frontier():
     best = report.recommendation_for(Objective.QUALITY)
     assert id(best.outcome) == id(optimal)
     assert best.on_frontier
+
+
+# --- quality without a baseline -----------------------------------------
+
+
+def _measured(name: str, *, value: float, higher_is_better: bool, **kw):
+    from autodistiller.results import MetricValue
+
+    outcome = _outcome(name, quality=None, **kw)
+    outcome.quality_metric = MetricValue(
+        name="perplexity" if not higher_is_better else "acc",
+        value=value,
+        higher_is_better=higher_is_better,
+        stderr=0.31,
+    )
+    return outcome
+
+
+def test_measured_quality_keeps_quality_on_the_frontier():
+    """The real Qwen3-4B numbers. Without a baseline, quality dropped off the
+    frontier entirely and int4-awq came back dominant with "gives up: nothing"
+    -- while actually scoring 7% worse perplexity than the 8-bit options."""
+    awq = _measured("int4-awq", value=12.7405, higher_is_better=False, throughput=641, vram=7 * GIB)
+    fp8 = _measured("fp8", value=11.8805, higher_is_better=False, throughput=444, vram=7 * GIB)
+
+    report = ParetoReport([awq, fp8])
+    assert report.quality_axis.key == "quality"
+    assert "perplexity" in report.quality_axis.label
+
+    # Neither dominates now: one is faster, the other scores better.
+    frontier = report.frontier
+    assert len(frontier.optimal) == 2, "a real trade-off must not read as domination"
+
+
+def test_lower_is_better_metrics_are_oriented_correctly():
+    """Perplexity falls as quality rises, so the axis has to invert it or the
+    worst model wins."""
+    good = _measured("a", value=11.9, higher_is_better=False, throughput=500)
+    bad = _measured("b", value=12.7, higher_is_better=False, throughput=500)
+
+    axis = ParetoReport([good, bad]).quality_axis
+    assert axis.value(good) > axis.value(bad)
+    assert "11.9" in axis.format(good)  # renders the real number, not the negation
+
+
+def test_higher_is_better_metrics_pass_through():
+    """Accuracy needs no inversion, and the tool supports accuracy tasks."""
+    strong = _measured("a", value=0.71, higher_is_better=True, throughput=500)
+    weak = _measured("b", value=0.64, higher_is_better=True, throughput=500)
+
+    axis = ParetoReport([strong, weak]).quality_axis
+    assert axis.value(strong) > axis.value(weak)
+    assert "0.71" in axis.format(strong)
+
+
+def test_retention_is_preferred_when_a_baseline_exists():
+    with_baseline = _outcome("a", quality=0.99, throughput=500)
+    assert ParetoReport([with_baseline]).quality_axis.label == "Quality retention"
+
+
+def test_mixed_metrics_are_not_forced_onto_one_axis():
+    """Perplexity and accuracy are not the same number."""
+    a = _measured("a", value=11.9, higher_is_better=False, throughput=500)
+    b = _measured("b", value=0.71, higher_is_better=True, throughput=500)
+    assert ParetoReport([a, b]).quality_axis.label == "Quality retention"

@@ -229,17 +229,32 @@ async def _warm_until_stable(
 
 
 def _throughput_efficiency(phase: ConcurrencyResult) -> float | None:
-    """Measured throughput against what the per-token timings imply.
+    """Measured throughput against what this phase's own timings predict.
 
-    At concurrency C each in-flight stream emits a token every TPOT seconds, so
-    C/TPOT is the decode ceiling. A healthy phase lands a little under it -- the
-    gap is prefill, which produces no output tokens. A phase that lands far under
-    it spent its wall-clock time on something other than serving.
+    A request costs one prefill plus one decode per token after the first, so at
+    concurrency C the predicted rate is ``C * n / (TTFT + (n-1) * TPOT)``.
+    Prefill has to be in there: it produces no output tokens, so on a short
+    generation it dominates, and a decode-only ceiling would declare every
+    short-output workload a stall. It is the same arithmetic the server is
+    doing, which is what makes a large gap mean the wall clock went somewhere
+    the timings cannot see.
     """
-    if phase.tpot is None or phase.tpot.p50 <= 0 or phase.output_tokens_per_s <= 0:
+    ok_requests = phase.n_requests - phase.n_failed
+    if phase.tpot is None or phase.ttft is None or ok_requests <= 0:
         return None
-    implied = phase.concurrency / phase.tpot.p50
-    return phase.output_tokens_per_s / implied if implied > 0 else None
+    if phase.tpot.p50 <= 0 or phase.output_tokens_per_s <= 0:
+        return None
+
+    tokens_per_request = phase.total_output_tokens / ok_requests
+    if tokens_per_request < 2:
+        return None  # nothing decoded, so there is no rate to predict
+
+    per_request_s = phase.ttft.p50 + (tokens_per_request - 1) * phase.tpot.p50
+    if per_request_s <= 0:
+        return None
+
+    predicted = phase.concurrency * tokens_per_request / per_request_s
+    return phase.output_tokens_per_s / predicted if predicted > 0 else None
 
 
 def _aggregate(
@@ -274,10 +289,10 @@ def _aggregate(
     if efficiency is not None and efficiency < MIN_THROUGHPUT_EFFICIENCY and phase.tpot is not None:
         slowest = phase.request_latency.max if phase.request_latency else 0.0
         median = phase.request_latency.p50 if phase.request_latency else 0.0
+        predicted = phase.output_tokens_per_s / efficiency if efficiency else 0.0
         phase.warnings.append(
-            f"throughput is {efficiency * 100:.0f}% of what the per-token timings imply "
-            f"({phase.output_tokens_per_s:.0f} vs "
-            f"{phase.concurrency / phase.tpot.p50:.0f} tok/s); "
+            f"throughput is {efficiency * 100:.0f}% of what this phase's own timings "
+            f"predict ({phase.output_tokens_per_s:.0f} vs {predicted:.0f} tok/s); "
             f"slowest request {slowest:.2f}s against a median of {median:.2f}s. "
             f"A stall inflated this measurement -- treat it as unreliable."
         )

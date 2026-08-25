@@ -803,3 +803,19 @@ def test_a_measured_baseline_still_enforces_the_floor_normally():
     )
     result = optimizer.run(_small_set(n=3))
     assert result.qualified
+
+
+def test_a_search_reports_how_long_it_took():
+    """The roadmap sets a target of roughly an hour for a small model, and a
+    search that cannot say how long it took cannot be held to it."""
+    baseline = _record("base", perplexity=10.0)
+    optimizer = _optimizer(
+        evaluate_fn=lambda t, c: baseline if c.is_baseline else _record("c", perplexity=10.2),
+        compress_fn=lambda c: _artifact(c.method, GIB // 2),
+        stop_early=False,
+    )
+    timing = optimizer.run(_small_set(n=3)).timing()
+
+    assert timing["total"] > 0
+    assert set(timing) == {"total", "compressing", "evaluating", "benchmarking"}
+    assert all(v >= 0 for v in timing.values())

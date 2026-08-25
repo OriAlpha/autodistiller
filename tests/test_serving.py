@@ -10,6 +10,7 @@ not show up as 200ms.
 from __future__ import annotations
 
 import asyncio
+import contextlib as _contextlib
 import json
 
 import httpx
@@ -542,6 +543,7 @@ def test_launch_spec_applies_the_translator():
 
 
 def _request(total_s: float, *, ttft_s: float = 0.058, tokens: int = 128) -> RequestMetrics:
+    """One streamed request. Defaults mirror a real measured request."""
     return RequestMetrics(
         ok=True, total_s=total_s, ttft_s=ttft_s, n_prompt_tokens=256, n_output_tokens=tokens
     )
@@ -589,7 +591,17 @@ def test_efficiency_is_absent_when_there_is_nothing_to_compare():
 # --- warmup -------------------------------------------------------------
 
 
-def _stalling_server(*, slow_requests: int, slow_delay: float = 0.30):
+WARM_DELAY = 0.05
+"""How long a "warm" fake request takes.
+
+Deliberately not smaller. Warmup settles when three consecutive requests land
+within 25% of the fastest seen, and at a 5ms delay ordinary scheduling jitter is
+comfortably more than 25% -- so the fixture, not the code, decided whether the
+test passed. At 50ms the same jitter is under 10%.
+"""
+
+
+def _stalling_server(*, slow_requests: int, slow_delay: float = 0.40):
     """A server that answers /v1/models before it is warm.
 
     Which is what vLLM does: it reports healthy, then pays for CUDA graph
@@ -606,7 +618,7 @@ def _stalling_server(*, slow_requests: int, slow_delay: float = 0.30):
             200,
             content=_sse_body(
                 n_tokens=4,
-                ttft_delay=slow_delay if cold else 0.005,
+                ttft_delay=slow_delay if cold else WARM_DELAY,
                 token_delay=0.001,
                 include_usage=True,
                 prompt_tokens=16,
@@ -626,15 +638,61 @@ def test_warmup_absorbs_the_cold_start_so_the_phase_does_not():
     assert state["seen"] > 3, "warmup stopped before the server was warm"
     phase = result.phases[0]
     assert not phase.warnings
-    assert phase.request_latency.max < 0.2  # no cold request reached the measurement
+    assert phase.request_latency.max < 0.20  # no cold request (0.40s) reached it
 
 
-def test_a_warm_server_is_not_warmed_ten_times():
-    """Warming until stable must not mean always paying the cap."""
-    transport, state = _stalling_server(slow_requests=0)
-    _run_sweep(transport, concurrency_levels=(1,), warmup_requests=2)
+def _warmup_calls(latencies: list[float], *, minimum: int = 2, maximum: int = 10) -> int:
+    """How many requests warmup uses against a scripted sequence of latencies.
 
-    assert state["seen"] <= 3 + 8  # settled after the minimum, then the phase ran
+    Drives the decision directly with no wall clock involved. The earlier
+    version of this test ran a fake server on real sleeps and failed whenever
+    the machine was busy -- it was measuring the scheduler, not the code.
+    """
+    import autodistiller.serving.benchmark as bm
+
+    calls = {"n": 0}
+
+    async def fake_request(client, **kwargs):
+        index = min(calls["n"], len(latencies) - 1)
+        calls["n"] += 1
+        return RequestMetrics(ok=True, total_s=latencies[index], ttft_s=0.01, n_output_tokens=4)
+
+    original = bm.stream_request
+    bm.stream_request = fake_request
+    try:
+        asyncio.run(
+            bm._warm_until_stable(
+                None,
+                url="http://fake",
+                model=MODEL,
+                prompt="hi",
+                max_tokens=4,
+                use_chat=False,
+                ignore_eos=True,
+                minimum=minimum,
+                maximum=maximum,
+            )
+        )
+    finally:
+        bm.stream_request = original
+    return calls["n"]
+
+
+def test_a_warm_server_settles_immediately():
+    """Steady latencies from the first request: nothing to wait out."""
+    assert _warmup_calls([0.50] * 12) == 3
+
+
+def test_a_cold_start_is_waited_out_but_not_forever():
+    """Three slow requests, then steady. Warmup must absorb the slow ones and
+    then stop -- not stop early, and not run to the cap."""
+    assert _warmup_calls([9.0, 4.0, 1.0] + [0.50] * 12) == 6
+
+
+def test_a_server_that_never_settles_stops_at_the_cap():
+    """Alternating fast and slow never satisfies the stability rule, and a
+    longer wait would not fix it."""
+    assert _warmup_calls([0.5, 5.0] * 20, maximum=10) == 10
 
 
 def test_warmup_is_bounded_when_a_server_never_settles():
@@ -652,3 +710,78 @@ def test_warmup_stops_when_the_server_is_failing():
     transport = fake_server(status=500)
     result = _run_sweep(transport, concurrency_levels=(1,), warmup_requests=2)
     assert result.phases[0].n_failed == 8
+
+
+@_contextlib.contextmanager
+def _patched_get(*, status: int = 200, payload=None, raises=None):
+    """Stand in for httpx.get inside the launcher."""
+    import autodistiller.serving.launcher as launcher
+
+    class _Resp:
+        status_code = status
+
+        def json(self):
+            if payload is None:
+                raise ValueError("no json")
+            return payload
+
+    def fake_get(url, **kwargs):
+        if raises is not None:
+            raise raises
+        return _Resp()
+
+    original = launcher.httpx.get
+    launcher.httpx.get = fake_get
+    try:
+        yield
+    finally:
+        launcher.httpx.get = original
+
+
+# --- launching into an occupied port --------------------------------------
+
+
+def test_a_port_already_serving_something_is_refused():
+    """A squatter that answers 200 is the dangerous case: the benchmark would
+    measure it and report the numbers as the model's."""
+    from autodistiller.serving.launcher import ServerError, check_port_is_free
+
+    squatter = _patched_get(status=200, payload={"data": [{"id": "some-other-service"}]})
+    with pytest.raises(ServerError, match="already in use"), squatter:
+        check_port_is_free("http://fake")
+
+
+def test_a_port_answering_anything_at_all_is_refused():
+    """404 is occupied too. On WSL2 a Windows process holding the port stops
+    localhost forwarding, so the server we launch is unreachable and readiness
+    would time out blaming the wrong thing."""
+    from autodistiller.serving.launcher import ServerError, check_port_is_free
+
+    with pytest.raises(ServerError, match="HTTP 404"), _patched_get(status=404, payload=None):
+        check_port_is_free("http://fake")
+
+
+def test_a_refused_connection_means_the_port_is_free():
+    from autodistiller.serving.launcher import check_port_is_free
+
+    with _patched_get(raises=httpx.ConnectError("refused")):
+        check_port_is_free("http://fake")  # must not raise
+
+
+def test_the_refusal_names_what_is_squatting():
+    from autodistiller.serving.launcher import ServerError, check_port_is_free
+
+    squatter = _patched_get(status=200, payload={"data": [{"id": "stockedge-api"}]})
+    with pytest.raises(ServerError) as excinfo, squatter:
+        check_port_is_free("http://fake")
+    assert "stockedge-api" in str(excinfo.value)
+
+
+def test_a_short_generation_is_not_mistaken_for_a_stall():
+    """Prefill produces no output tokens, so on a 4-token generation it dominates
+    the wall clock. A decode-only ceiling called that a stall; it is not one."""
+    results = [_request(0.053, ttft_s=0.050, tokens=4) for _ in range(8)]
+    phase = _aggregate(results, duration_s=0.62, concurrency=1)
+
+    assert phase.throughput_efficiency > 0.5
+    assert not phase.warnings

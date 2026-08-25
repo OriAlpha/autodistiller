@@ -25,10 +25,12 @@ Two rules keep the view honest:
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from ..regression import SIGNIFICANCE_SIGMA
 from .constraints import Objective, Score, score_candidate
 
 if TYPE_CHECKING:  # pipeline imports this module, so the outcome type is a cycle
@@ -60,6 +62,18 @@ class Axis:
     render: Callable[[float], str]
     estimated: bool = False
     """Whether this axis carries predictions rather than measurements."""
+
+    uncertainty: Callable[[CandidateOutcome], float | None] | None = None
+    """How much this axis's value could move if the measurement were repeated.
+
+    Only quality has one: accuracy on a few hundred questions carries a standard
+    error, and a gap smaller than that error is not a difference. Throughput and
+    VRAM are single readings with no error bar to offer, so they have none and
+    every gap on them is taken at face value.
+    """
+
+    def error(self, outcome: CandidateOutcome) -> float | None:
+        return self.uncertainty(outcome) if self.uncertainty else None
 
     def value(self, outcome: CandidateOutcome) -> float | None:
         return self.extract(outcome)
@@ -107,6 +121,53 @@ QUALITY = Axis(
     extract=lambda o: o.quality_retention,
     render=lambda v: f"{v * 100:.2f}%",
 )
+
+
+def _measured_quality(outcome: CandidateOutcome) -> float | None:
+    """The metric as measured, oriented so that larger is always better.
+
+    Perplexity falls as quality rises and accuracy climbs, so a single axis has
+    to normalise the direction. Negating is enough: the frontier only ever
+    compares values on the same axis, and the renderer puts the sign back.
+    """
+    metric = outcome.quality_metric
+    if metric is None:
+        return None
+    return metric.value if metric.higher_is_better else -metric.value
+
+
+def measured_quality_axis(outcomes: Sequence[CandidateOutcome]) -> Axis | None:
+    """A quality axis built from what was measured rather than from a ratio.
+
+    Without a baseline there is no retention, and dropping quality from the
+    frontier entirely is how a candidate that is 7% worse comes back as
+    dominant and "gives up: nothing". The comparison is still real -- these
+    candidates were measured the same way on the same data -- it just has no
+    reference point outside the set.
+    """
+    metrics = [o.quality_metric for o in outcomes if o.quality_metric is not None]
+    if not metrics:
+        return None
+
+    name = metrics[0].name
+    if any(m.name != name for m in metrics):
+        return None  # different metrics are not one axis
+
+    higher_is_better = metrics[0].higher_is_better
+    task = next(
+        (o.quality_metric_task for o in outcomes if getattr(o, "quality_metric_task", None)),
+        None,
+    )
+    return Axis(
+        key="quality",
+        label=f"{task}/{name}" if task else f"{name} (measured)",
+        higher_is_better=True,  # _measured_quality has already oriented it
+        extract=_measured_quality,
+        render=lambda v: f"{(v if higher_is_better else -v):.4g}",
+        estimated=False,
+        uncertainty=lambda o: o.quality_metric.stderr if o.quality_metric else None,
+    )
+
 
 VRAM = Axis(
     key="vram",
@@ -267,10 +328,39 @@ def _trade_off_note(
         best = max(values) if axis.higher_is_better else min(values)
         if best == mine or not axis.better(best, mine):
             continue
-        notes.append(
-            f"{axis.label.lower()} {axis.render(mine)} against a best of {axis.render(best)}"
-        )
+
+        note = f"{axis.label.lower()} {axis.render(mine)} against a best of {axis.render(best)}"
+
+        # A gap smaller than the error bars is not a cost. Saying it is turns
+        # noise into a reason to pick differently, which is the whole failure
+        # this analysis exists to avoid.
+        if _within_noise(outcome, others, axis, mine, best):
+            note += " (within noise -- not a measurable difference)"
+        notes.append(note)
     return "; ".join(notes)
+
+
+def _within_noise(
+    outcome: CandidateOutcome,
+    others: Sequence[CandidateOutcome],
+    axis: Axis,
+    mine: float,
+    best: float,
+) -> bool:
+    """Whether a gap on this axis is smaller than the two measurements' error."""
+    my_error = axis.error(outcome)
+    if my_error is None:
+        return False
+
+    leader = next(
+        (o for o in others if axis.value(o) == best and axis.error(o) is not None),
+        None,
+    )
+    if leader is None:
+        return False
+
+    combined = math.hypot(my_error, axis.error(leader) or 0.0)
+    return abs(best - mine) <= SIGNIFICANCE_SIGMA * combined
 
 
 class ParetoReport:
@@ -293,7 +383,14 @@ class ParetoReport:
         # every candidate incomparable and the frontier empty -- technically
         # true, and useless. The frontier should be drawn over the evidence that
         # exists, and say which axes those were.
-        candidates = (QUALITY, self.vram_axis, TTFT, THROUGHPUT)
+        # Retention when there is a baseline to divide by, otherwise the raw
+        # measurement. Either way quality stays on the frontier.
+        quality = QUALITY
+        if not any(o.quality_retention is not None for o in self.outcomes):
+            quality = measured_quality_axis(self.outcomes) or QUALITY
+        self.quality_axis = quality
+
+        candidates = (quality, self.vram_axis, TTFT, THROUGHPUT)
         self.axes: tuple[Axis, ...] = tuple(
             axis
             for axis in candidates
@@ -304,9 +401,9 @@ class ParetoReport:
     def trade_offs(self) -> list[Frontier]:
         """The three the roadmap names: quality against each cost axis."""
         return [
-            pareto_frontier(self.outcomes, (QUALITY, self.vram_axis)),
-            pareto_frontier(self.outcomes, (QUALITY, TTFT)),
-            pareto_frontier(self.outcomes, (QUALITY, THROUGHPUT)),
+            pareto_frontier(self.outcomes, (self.quality_axis, self.vram_axis)),
+            pareto_frontier(self.outcomes, (self.quality_axis, TTFT)),
+            pareto_frontier(self.outcomes, (self.quality_axis, THROUGHPUT)),
         ]
 
     @property
@@ -384,5 +481,6 @@ __all__ = [
     "ParetoReport",
     "Recommendation",
     "dominates",
+    "measured_quality_axis",
     "pareto_frontier",
 ]

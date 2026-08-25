@@ -4,12 +4,20 @@ Runs candidates through progressively more expensive stages and drops them as
 soon as they fail, so the costly work only ever happens on configurations that
 are still plausible:
 
-===============  ==========  ====================================
-memory estimate  free        arithmetic over the model config
-compress         minutes     one llmcompressor run
-quality screen   seconds     perplexity against the baseline
-benchmark        minutes     a real server, started and measured
-===============  ==========  ====================================
+===============  ===========================  ==========================
+memory estimate  free                         arithmetic over the config
+compress         1-7 min                      one backend run
+quality screen   scales with --limit          perplexity vs the baseline
+benchmark        2-3 min                      a real server, measured
+===============  ===========================  ==========================
+
+Measured on Qwen3-4B, an RTX 5070 and ``--limit 256``. The quality screen is
+listed by what drives it rather than by a number because it is the one stage the
+user sets the cost of: at ``--limit 8`` it is seconds, at 256 it took 12 minutes
+and was the most expensive stage in the search -- more than compression, more
+than the benchmark. Screening still runs before benchmarking, because it is the
+stage that can reject a candidate on quality alone, but "cheap" is a property of
+the limit and not of the stage.
 
 Ordering is set by the objective, which is what makes stopping early honest: the
 first candidate that qualifies is the best one under that objective, not merely
@@ -63,6 +71,26 @@ class CandidateOutcome:
     quality_metrics: dict[str, float] = field(default_factory=dict)
     quality_retention: float | None = None
     quality_stderr: float | None = None
+    quality_metric_task: str | None = None
+    measured_metrics: dict[str, MetricValue] = field(default_factory=dict)
+    """Each task's headline metric, keyed by task name.
+
+    Every task the user asked for, not just the first. Running two tasks and
+    reporting one discards half of what the evaluation cost.
+    """
+
+    quality_metric: MetricValue | None = None
+    """The metric the frontier ranks on: the first task's.
+
+    One task has to be picked, because absolute scores from different tasks are
+    not one axis -- 0.56 on hellaswag is not worse than 0.74 on arc_easy, they
+    are different questions. The axis is labelled with the task it used.
+
+    Retention needs a baseline, and a baseline is exactly what is missing when
+    the unquantized model does not fit -- the case the tool most exists for. The
+    measurement still happened and still costs the same minutes, so it is kept
+    here and reported rather than discarded for want of something to divide by.
+    """
     warnings: list[str] = field(default_factory=list)
     """Things that do not disqualify a candidate but change how much its numbers
     are worth. A measurement too noisy to settle the constraint it was checked
@@ -114,6 +142,25 @@ class OptimizationResult:
     @property
     def qualified(self) -> list[CandidateOutcome]:
         return [o for o in self.outcomes if o.qualified]
+
+    def timing(self) -> dict[str, float]:
+        """Wall-clock seconds by stage, across every candidate.
+
+        Reported because the roadmap sets a target -- roughly an hour for a
+        small model -- and a search that cannot say how long it took cannot be
+        held to it. The split matters more than the total: which stage dominates
+        depends on the model and on --limit, not on the design.
+        """
+        compressing = sum(o.artifact.duration_s for o in self.outcomes if o.artifact is not None)
+        evaluating = sum(o.record.total_duration_s for o in self.outcomes if o.record is not None)
+        measured = sum(o.duration_s for o in self.outcomes)
+        return {
+            "total": self.duration_s or measured,
+            "compressing": compressing,
+            "evaluating": evaluating,
+            # What is left is the servers: starting, warming and sweeping them.
+            "benchmarking": max(measured - compressing - evaluating, 0.0),
+        }
 
     @property
     def reused_stages(self) -> dict[str, int]:
@@ -437,6 +484,15 @@ class Optimizer:
                     record.compression = outcome.artifact
                     if self.store is not None:
                         self.store.save(record)
+
+                # Whatever the run measured, kept whether or not it can be
+                # turned into a ratio.
+                for task in record.tasks:
+                    if (primary := task.primary_metric) is not None:
+                        outcome.measured_metrics[task.name] = primary
+                if record.tasks and (primary := record.tasks[0].primary_metric) is not None:
+                    outcome.quality_metric = primary
+                    outcome.quality_metric_task = record.tasks[0].name
 
                 if candidate.is_baseline:
                     outcome.quality_retention = 1.0

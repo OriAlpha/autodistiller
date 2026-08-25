@@ -285,6 +285,32 @@ def render_candidates(candidate_set, *, show_rejected: bool = True) -> Table:
     return table
 
 
+def _quality_cell(outcome) -> str:
+    """Retention when there is a baseline, otherwise what was measured.
+
+    Showing "-" for a measurement that took minutes is the worst of both: the
+    cost was paid and the answer withheld. Without a baseline the absolute
+    number is still the thing a reader wants -- it says whether this candidate
+    came out better or worse than the others.
+    """
+    if outcome.quality_retention is not None:
+        return f"{outcome.quality_retention * 100:.2f}%"
+
+    measured = getattr(outcome, "measured_metrics", None) or {}
+    if not measured:
+        return "-"
+
+    # Every task, not just the first: running two and reporting one throws away
+    # half of what the evaluation cost.
+    lines = []
+    for task, metric in measured.items():
+        text = f"{metric.value:.4g}"
+        if metric.stderr:
+            text += f" ±{metric.stderr:.2g}"
+        lines.append(f"{task} {text}" if len(measured) > 1 else text)
+    return "\n".join(lines)
+
+
 def render_optimization(result) -> Table:
     """Render every configuration that was tried, and how far each one got."""
     table = Table(
@@ -322,7 +348,7 @@ def render_optimization(result) -> Table:
         table.add_row(
             outcome.candidate.id,
             outcome.stage,
-            f"{outcome.quality_retention * 100:.2f}%" if outcome.quality_retention else "-",
+            _quality_cell(outcome),
             _gib(outcome.weights_bytes),
             f"{peak.output_tokens_per_s:.0f} tok/s" if peak else "-",
             f"{single.ttft.p50 * 1000:.0f}ms" if single and single.ttft else "-",

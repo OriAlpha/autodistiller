@@ -825,6 +825,12 @@ def optimize(
         "--launch-preset",
         help="none | wsl-vllm | native-vllm | wsl-llamacpp | native-llamacpp",
     ),
+    port: int | None = typer.Option(
+        None,
+        "--port",
+        help="Port to serve candidates on. Defaults to the backend's own; "
+        "change it when something else already holds that port.",
+    ),
     stop_early: bool = typer.Option(True, "--stop-early/--no-stop-early"),
     artifacts_root: Path = typer.Option(Path("artifacts"), "--artifacts-root"),
     output_dir: Path = typer.Option(Path("runs"), "--output-dir", "-o"),
@@ -916,8 +922,8 @@ def optimize(
         LaunchSpec(
             template=template,
             stop_template=stop,
-            port=backend_spec.default_port,
-            url=f"http://localhost:{backend_spec.default_port}",
+            port=port or backend_spec.default_port,
+            url=f"http://localhost:{port or backend_spec.default_port}",
             # The KV cache flag is not the same word in every runtime.
             kv_flag_template=backend_spec.kv_flag_template,
             # Artifact paths are local; the server is not.
@@ -964,6 +970,18 @@ def optimize(
     console.print(render_optimization(result))
     console.print()
     console.print(result.explain())
+
+    timing = result.timing()
+    if timing["total"] > 0:
+        parts = ", ".join(
+            f"{seconds / 60:.1f} {stage}"
+            for stage, seconds in timing.items()
+            if stage != "total" and seconds > 0
+        )
+        console.print(
+            f"[dim]Search took {timing['total'] / 60:.1f} min"
+            + (f" -- {parts}[/dim]" if parts else "[/dim]")
+        )
 
     if result.qualified and not no_pareto:
         report = result.pareto()

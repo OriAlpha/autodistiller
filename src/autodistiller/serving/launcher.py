@@ -143,6 +143,39 @@ def wait_until_stopped(url: str, *, timeout_s: int = STOP_TIMEOUT_S) -> bool:
     return False
 
 
+def check_port_is_free(url: str) -> None:
+    """Refuse to launch into a port something else is already answering on.
+
+    Two failure modes, and the quiet one is worse. If the squatter does not
+    answer ``/v1/models`` with a 200, readiness polls until it times out and
+    then blames the server we launched -- which never got a chance, because on
+    WSL2 a Windows process holding the port stops localhost forwarding
+    altogether. If the squatter *does* answer with a 200, the benchmark measures
+    it and reports the numbers as the model's.
+
+    Anything that responds at all means occupied. A refused connection is what
+    free looks like.
+    """
+    try:
+        response = httpx.get(f"{url.rstrip('/')}/v1/models", timeout=3.0)
+    except Exception:
+        return  # nothing there, which is what we want
+
+    served = ""
+    try:
+        models = [m.get("id", "?") for m in response.json().get("data", [])]
+        served = f" serving {', '.join(models)}" if models else ""
+    except Exception:
+        pass
+
+    raise ServerError(
+        f"{url} is already in use: something answered with HTTP "
+        f"{response.status_code}{served}. Stop it, or point the launch at another "
+        f"port. Benchmarking whatever is already there would report its numbers "
+        f"as the model's."
+    )
+
+
 def wait_until_ready(url: str, *, timeout_s: int, process: subprocess.Popen | None = None) -> None:
     """Poll until the endpoint serves models, or give up.
 
@@ -229,6 +262,9 @@ def serving(
     The teardown runs even when the benchmark raises, because the alternative is
     a stranded process holding VRAM for the rest of the optimization.
     """
+    # Before spending a minute starting something that can never be reached.
+    check_port_is_free(spec.url)
+
     command = spec.command_for(model, max_model_len=max_model_len, kv_dtype=kv_dtype)
     if progress is not None:
         progress(f"starting {model} ({command[:80]}{'...' if len(command) > 80 else ''})")
@@ -281,6 +317,7 @@ __all__ = [
     "DEFAULT_READY_TIMEOUT_S",
     "LaunchSpec",
     "ServerError",
+    "check_port_is_free",
     "serving",
     "wait_until_ready",
     "wait_until_stopped",
