@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.0.0] - 2026-08-24
+## [1.0.0] - 2026-08-25
 
 The v1.0 scope, complete: Hugging Face models on NVIDIA GPUs, vLLM as the first
 deployment backend and llama.cpp as the second, INT4/INT8/AWQ/GPTQ and FP8
