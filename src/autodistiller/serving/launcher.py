@@ -143,6 +143,24 @@ def wait_until_stopped(url: str, *, timeout_s: int = STOP_TIMEOUT_S) -> bool:
     return False
 
 
+def _last_words(process: subprocess.Popen, *, lines: int = 12) -> str:
+    """The tail of a dead server's stderr, for the error that reports its death.
+
+    Reading is safe only once the process has exited, which is the only place
+    this is called from. Truncated to a tail because a serving runtime's startup
+    log is long and the reason it stopped is at the end.
+    """
+    if process.stderr is None:
+        return ""
+    try:
+        tail = [line.rstrip() for line in process.stderr.read().splitlines() if line.strip()]
+    except Exception:
+        return ""
+    if not tail:
+        return ""
+    return "\n  " + "\n  ".join(tail[-lines:])
+
+
 def check_port_is_free(url: str) -> None:
     """Refuse to launch into a port something else is already answering on.
 
@@ -187,7 +205,10 @@ def wait_until_ready(url: str, *, timeout_s: int, process: subprocess.Popen | No
 
     while time.monotonic() < deadline:
         if process is not None and process.poll() is not None:
-            raise ServerError(f"server exited with code {process.returncode} before becoming ready")
+            raise ServerError(
+                f"server exited with code {process.returncode} before becoming ready"
+                + _last_words(process)
+            )
         try:
             response = httpx.get(endpoint, timeout=3.0)
             if response.status_code == 200:
@@ -275,7 +296,12 @@ def serving(
         shell=spec.shell,
         env=env,
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        # Kept, not discarded: when a server dies before it is ready, its own
+        # last words are the only thing that says why. Without them the failure
+        # reads "exited with code 1", which is true and useless.
+        stderr=subprocess.PIPE,
+        text=True,
+        errors="replace",
         # Its own process group on POSIX, so the whole tree can be signalled.
         start_new_session=sys.platform != "win32",
     )

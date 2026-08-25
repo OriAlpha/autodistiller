@@ -420,7 +420,16 @@ class Optimizer:
             outcome = self._run_candidate(candidate, baseline_record)
             result.outcomes.append(outcome)
 
-            if candidate.is_baseline and outcome.error is None and baseline_record is None:
+            # A baseline that was evaluated is a usable quality reference even if
+            # it later failed to serve. Those are separate measurements, and
+            # discarding the quality one because the benchmark died costs every
+            # remaining candidate its retention figure for an unrelated reason.
+            if (
+                candidate.is_baseline
+                and baseline_record is None
+                and outcome.record is not None
+                and outcome.record.tasks
+            ):
                 baseline_record = outcome.record
                 result.baseline_record = baseline_record
 

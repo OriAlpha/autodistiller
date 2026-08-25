@@ -819,3 +819,40 @@ def test_a_search_reports_how_long_it_took():
     assert timing["total"] > 0
     assert set(timing) == {"total", "compressing", "evaluating", "benchmarking"}
     assert all(v >= 0 for v in timing.values())
+
+
+def test_a_baseline_that_failed_to_serve_is_still_a_quality_reference():
+    """Evaluation and benchmarking are separate measurements. A baseline whose
+    server died was still evaluated, and discarding its quality figure costs
+    every remaining candidate its retention for an unrelated reason.
+
+    Found on gemma-2-2b: bf16 evaluated fine, then vLLM exited before becoming
+    ready, and the whole search lost its reference."""
+    baseline = _record("base", perplexity=10.0)
+
+    def benchmark(outcome):
+        if outcome.candidate.is_baseline:
+            raise RuntimeError("server exited with code 1 before becoming ready")
+        return _benchmark(throughput=900)
+
+    optimizer = _optimizer(
+        objective=Objective.THROUGHPUT,
+        evaluate_fn=lambda t, c: baseline if c.is_baseline else _record("c", perplexity=10.5),
+        benchmark_fn=benchmark,
+        stop_early=False,
+    )
+    result = optimizer.run(_small_set(n=3))
+
+    assert result.baseline_record is not None, "a failed benchmark lost the quality reference"
+    measured = [o for o in result.outcomes if not o.candidate.is_baseline and o.error is None]
+    assert measured and all(o.quality_retention is not None for o in measured)
+
+
+def test_a_baseline_that_never_evaluated_is_not_a_reference():
+    """Nothing was measured, so there is nothing to compare against."""
+    optimizer = _optimizer(
+        objective=Objective.SIZE,
+        evaluate_fn=None,
+        stop_early=False,
+    )
+    assert optimizer.run(_small_set(n=2)).baseline_record is None

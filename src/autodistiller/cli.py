@@ -817,6 +817,12 @@ def optimize(
         "its binaries are Linux executables.",
     ),
     concurrency: int = typer.Option(8, "--concurrency", help="Sequences the KV cache must hold"),
+    context: str | None = typer.Option(
+        None,
+        "--context",
+        help="Comma-separated context lengths (default 2048,4096,8192). Pin it to keep "
+        "the search on one, which is what decides whether the baseline fits.",
+    ),
     launch_template: str | None = typer.Option(
         None, "--launch", help="Command template to start a server. See --launch-preset."
     ),
@@ -938,6 +944,13 @@ def optimize(
             "Pass --launch-preset wsl-vllm (or --launch with your own command)."
         )
 
+    context_lengths: tuple[int, ...] | None = None
+    if context:
+        try:
+            context_lengths = tuple(int(part) for part in context.split(",") if part.strip())
+        except ValueError as exc:
+            raise typer.BadParameter(f"--context must be integers: {exc}") from exc
+
     hardware = detect_hardware()
     profile = profile_from_gpu(hardware.gpus[0]) if hardware.gpus else None
 
@@ -956,6 +969,7 @@ def optimize(
             runs_dir=output_dir,
             methods=tuple(method) if method else None,
             concurrency=concurrency,
+            context_lengths=context_lengths,
             max_candidates=max_candidates,
             stop_early=stop_early,
             skip_benchmark=launch is None,
