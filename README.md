@@ -147,6 +147,61 @@ arithmetic. You would not guess that; you have to measure it, which is the point
 
 ---
 
+## Which models work
+
+Any Hugging Face causal LM. There is no supported-model list in the code and no
+per-architecture handling — dimensions come from `config.json` and loading goes
+through `AutoModelForCausalLM`. Every one of these was checked on an 8 GiB card:
+
+| Model | Family | Params |
+|---|---|---|
+| `openai-community/gpt2` | GPT-2 | 0.15B |
+| `TinyLlama/TinyLlama-1.1B-Chat-v1.0` | Llama | 1.10B |
+| `meta-llama/Llama-3.2-1B-Instruct` | Llama 3 | 1.24B |
+| `deepseek-ai/deepseek-coder-1.3b-instruct` | DeepSeek | 1.35B |
+| `stabilityai/stablelm-2-1_6b` | StableLM | 1.64B |
+| `HuggingFaceTB/SmolLM2-1.7B-Instruct` | Llama | 1.71B |
+| `EleutherAI/pythia-1.4b` | GPT-NeoX | 1.82B |
+| `ibm-granite/granite-3.1-2b-instruct` | Granite | 2.53B |
+| `google/gemma-2-2b-it` | Gemma 2 | 2.61B |
+| `meta-llama/Llama-3.2-3B-Instruct` | Llama 3 | 3.21B |
+| `microsoft/Phi-3-mini-4k-instruct` | Phi-3 | 3.82B |
+| `google/gemma-3-4b-it` | Gemma 3 (VLM) | 3.88B |
+| `Qwen/Qwen3-4B` | Qwen 3 | 4.02B |
+| `mistralai/Mistral-7B-Instruct-v0.3` | Mistral | 7.25B |
+| `allenai/OLMo-2-1124-7B` | OLMo 2 | 7.30B |
+| `meta-llama/Llama-3.1-8B-Instruct` | Llama 3 | 8.03B |
+| `tiiuae/falcon-7b-instruct` | Falcon | 10.87B |
+
+Vision-language models are read by their language tower — Gemma 3 keeps the
+decoder in a nested `text_config`, and that is the half that gets quantized and
+whose KV cache dominates memory. The vision encoder is not counted.
+
+**Gated models** (Llama, Gemma) need Hugging Face access: run `hf auth login`,
+then request access on the model page and wait for approval.
+
+**Not supported:** encoder-decoder models (T5, BART), because loading goes
+through `AutoModelForCausalLM`. Non-NVIDIA accelerators are also out of scope —
+the capability rules are keyed on CUDA compute capability.
+
+### Compression methods
+
+| Method | Bits | Calibration | Served by | Needs |
+|---|---|---|---|---|
+| `int8-weight-only` | W8A16 | no | vLLM | INT8 (sm_75+) |
+| `int8` | W8A8 | **yes** | vLLM | INT8 (sm_75+) |
+| `int4-gptq` | W4A16 | **yes** | vLLM | INT4 (sm_75+) |
+| `int4-awq` | W4A16 | **yes** | vLLM | INT4 (sm_75+) |
+| `fp8` | W8A8 | no | vLLM | FP8 (sm_89+) |
+| `fp8-static` | W8A8 | **yes** | vLLM | FP8 (sm_89+) |
+| `gguf-q8-0` … `gguf-q3-k-m` | 8 → 3 bit | no | llama.cpp | any, CPU included |
+
+Methods marked **yes** need `--calibration wikitext2` (or your own corpus) and
+fail immediately with a clear message otherwise. `autodistiller methods` prints
+this for your actual GPU, marking what it can and cannot run.
+
+---
+
 ## Commands
 
 | | |

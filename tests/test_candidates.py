@@ -9,6 +9,8 @@ GPU time on them.
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import pytest
 
 from autodistiller.candidates.generator import (
@@ -384,3 +386,65 @@ def test_a_candidate_knows_its_own_estimate():
     )
     assert candidate.id == "fp8-ctx4096"
     assert "GiB" in candidate.describe()
+
+
+# --- vision-language models ----------------------------------------------
+
+
+def test_a_nested_text_config_is_found():
+    """Gemma 3 and other vision-language models put the decoder's dimensions in
+    `text_config` and leave the top level with neither tower's. Reading the top
+    level fails outright, so the model cannot even be screened."""
+
+    class Text:
+        hidden_size = 2560
+        num_hidden_layers = 34
+        num_attention_heads = 8
+        num_key_value_heads = 4
+        head_dim = 256
+        intermediate_size = 10240
+        vocab_size = 262208
+        max_position_embeddings = 131072
+
+    class Vision:
+        hidden_size = 1152
+        num_hidden_layers = 27
+
+    class Config:
+        text_config = Text()
+        vision_config = Vision()
+        architectures: ClassVar = ["Gemma3ForConditionalGeneration"]
+
+    shape = shape_from_config("google/gemma-3-4b-it", Config())
+
+    assert shape.n_layers == 34, "read the vision tower's depth instead of the decoder's"
+    assert shape.hidden_size == 2560
+    assert shape.vocab_size == 262208
+    # The architecture name lives at the top level, not in the nested config.
+    assert shape.architecture == "Gemma3ForConditionalGeneration"
+
+
+def test_a_flat_config_is_unaffected():
+    """The overwhelming majority of models, which must not change."""
+    shape = qwen3_06b()
+    assert shape.hidden_size == 1024 and shape.n_layers == 28
+
+
+def test_an_empty_text_config_falls_back_to_the_top_level():
+    """Some configs declare the attribute and leave it hollow. Trusting it then
+    would break a model that reads fine from the top level."""
+
+    class Empty:
+        pass
+
+    class Config:
+        text_config = Empty()
+        hidden_size = 768
+        num_hidden_layers = 12
+        num_attention_heads = 12
+        vocab_size = 50257
+        intermediate_size = 3072
+        max_position_embeddings = 1024
+
+    shape = shape_from_config("flat/model", Config())
+    assert shape.hidden_size == 768 and shape.n_layers == 12

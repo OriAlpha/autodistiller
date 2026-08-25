@@ -95,21 +95,53 @@ class ModelShapeRecord(BaseModel):
     kv_bytes_per_token: int
 
 
-def _first_int(config: Any, *names: str, default: int | None = None) -> int:
+def _find_int(config: Any, *names: str) -> int | None:
+    """The first positive integer among these attribute names, or None."""
     for name in names:
         value = getattr(config, name, None)
         if isinstance(value, int) and value > 0:
             return value
+    return None
+
+
+def _first_int(config: Any, *names: str, default: int | None = None) -> int:
+    if (found := _find_int(config, *names)) is not None:
+        return found
     if default is None:
         raise ValueError(f"config has none of {names}")
     return default
 
 
+def text_config_of(config: Any) -> Any:
+    """The language model's own config, for models that nest it.
+
+    A vision-language model puts its two towers side by side: ``text_config``
+    holds the decoder, ``vision_config`` the image encoder, and the top level
+    holds neither's dimensions. Gemma 3 is shaped this way, as are Qwen-VL and
+    Llama 3.2 Vision.
+
+    The decoder is the part that gets quantized and the part whose KV cache
+    dominates memory, so it is the right thing to measure. The vision tower is
+    small by comparison and is not what a serving decision turns on -- but it is
+    also not counted here, so a VLM's estimate is of its language half.
+    """
+    nested = getattr(config, "text_config", None)
+    if nested is None:
+        return config
+    # Only trust it if it actually carries what we need; some configs define the
+    # attribute and leave it empty.
+    return nested if _find_int(nested, "hidden_size", "n_embd", "d_model") else config
+
+
 def shape_from_config(model_id: str, config: Any) -> ModelShape:
     """Extract dimensions from a loaded Hugging Face config object."""
+    architectures_source = config
+    config = text_config_of(config)
     hidden = _first_int(config, "hidden_size", "n_embd", "d_model")
     n_heads = _first_int(config, "num_attention_heads", "n_head", "num_heads")
-    architectures = getattr(config, "architectures", None)
+    architectures = getattr(architectures_source, "architectures", None) or getattr(
+        config, "architectures", None
+    )
 
     return ModelShape(
         model_id=model_id,

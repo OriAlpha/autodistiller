@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Vision-language models could not be read at all.** Gemma 3 keeps its decoder
+  dimensions in a nested `text_config` and leaves the top level with neither
+  tower's, so shape extraction failed outright with "config has none of
+  ('hidden_size', 'n_embd', 'd_model')" and the model could not even be screened.
+  The language tower is now found and measured -- it is the half that gets
+  quantized and whose KV cache dominates memory. The vision encoder is not
+  counted, so a VLM's estimate is of its language half. Same shape as Qwen-VL and
+  Llama 3.2 Vision.
+
+### Added
+
+- README documents which models work, checked rather than claimed: 17 models
+  across 13 architecture families -- GPT-2, GPT-NeoX, Llama, Mistral, Phi-3,
+  Gemma 2 and 3, Qwen, DeepSeek, StableLM, Granite, OLMo, Falcon -- all read with
+  no per-architecture handling. Plus what is genuinely out of scope
+  (encoder-decoder models, non-NVIDIA accelerators) and how to reach gated repos.
+
 ## [1.0.0] - 2026-08-25
 
 The v1.0 scope, complete: Hugging Face models on NVIDIA GPUs, vLLM as the first
