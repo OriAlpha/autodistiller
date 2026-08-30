@@ -107,6 +107,16 @@ def _configure_logging(verbose: bool) -> None:
     )
 
 
+def _int_list(value: str | None, flag: str) -> tuple[int, ...] | None:
+    """Parse a comma-separated integer option, or None if it was not given."""
+    if not value:
+        return None
+    try:
+        return tuple(int(part) for part in value.split(",") if part.strip())
+    except ValueError as exc:
+        raise typer.BadParameter(f"{flag} must be integers: {exc}") from exc
+
+
 def _apply_task_overrides(
     tasks: list[TaskSpec],
     *,
@@ -662,6 +672,80 @@ def compress(
 
 
 @app.command()
+def prune(
+    model: str = typer.Option(..., "--model", "-m", help="Hugging Face id or local path"),
+    drop: int = typer.Option(..., "--drop", help="Transformer blocks to remove"),
+    calibration: str = typer.Option(
+        "wikitext2", "--calibration", help="Corpus the block scores are measured over"
+    ),
+    samples: int = typer.Option(32, "--samples", help="Documents to score over"),
+    max_seq_length: int = typer.Option(2048, help="Scoring sequence length"),
+    output_dir: Path | None = typer.Option(None, "--output-dir", "-o"),
+    artifacts_root: Path = typer.Option(Path("artifacts"), "--artifacts-root"),
+    dtype: str = typer.Option("auto", help="auto | float32 | float16 | bfloat16"),
+    device: str = typer.Option("auto", help="auto | cpu | cuda | cuda:1"),
+    trust_remote_code: bool = typer.Option(False),
+    refresh: bool = typer.Option(
+        False, "--refresh", help="Prune again even if this exact artifact already exists"
+    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Remove the transformer blocks that move the residual stream least.
+
+    The result is an ordinary Hugging Face model, so every other command takes
+    it: evaluate it, quantize it, benchmark it. Quality is not preserved the way
+    quantization roughly preserves it -- measure before serving.
+    """
+    _configure_logging(verbose)
+
+    from .compression.pipeline import artifact_dir, read_cached_artifact, write_artifact_sidecar
+    from .compression.prune import PruneJob, run_prune
+    from .evaluation.datasets import load_text_corpus
+
+    try:
+        corpus = load_text_corpus(resolve_tasks([calibration], limit=samples)[0].dataset)
+    except (ValueError, FileNotFoundError) as exc:
+        raise typer.BadParameter(f"--calibration: {exc}") from exc
+
+    job = PruneJob(
+        model=ModelSpec(
+            id=model,
+            dtype=dtype,  # type: ignore[arg-type]
+            device=device,
+            trust_remote_code=trust_remote_code,
+        ),
+        n_drop=drop,
+        calibration_texts=corpus.documents[:samples],
+        max_length=max_seq_length,
+    )
+    job.output_dir = (
+        Path(output_dir)
+        if output_dir
+        else artifact_dir(model, job.method, artifacts_root, key=job.artifact_key)
+    )
+
+    try:
+        artifact = read_cached_artifact(job) if not refresh else None
+        if artifact is not None:
+            console.print(f"[dim]|[/dim] reusing pruned model at {job.output_dir}")
+        else:
+            artifact = run_prune(job, progress=lambda m: console.print(f"[dim]|[/dim] {m}"))
+            write_artifact_sidecar(job, artifact)
+    except (ValueError, RuntimeError, OSError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+
+    console.print()
+    console.print(render_compression(artifact))
+    console.print()
+    console.print(
+        f"[dim]Measure what it cost:[/dim] autodistiller evaluate --model {job.output_dir}\n"
+        f"[dim]Then quantize it:[/dim]     autodistiller compress --model {job.output_dir} "
+        f"--method int8-weight-only"
+    )
+
+
+@app.command()
 def candidates(
     model: str = typer.Option(..., "--model", "-m", help="Hugging Face id or local path"),
     backend: str = typer.Option("vllm", "--backend", "-b"),
@@ -687,6 +771,9 @@ def candidates(
         None, "--speculative", help="A DFlash draft checkpoint trained for this model"
     ),
     speculative_tokens: int | None = typer.Option(None, "--speculative-tokens"),
+    prune: str | None = typer.Option(
+        None, "--prune", help="Comma-separated block counts to try dropping, e.g. 2,4"
+    ),
     as_json: bool = typer.Option(False, "--json"),
 ) -> None:
     """Generate the search space: what is worth measuring, and what is not."""
@@ -717,12 +804,8 @@ def candidates(
         except ValueError as exc:
             raise typer.BadParameter(str(exc)) from exc
 
-    context_lengths = None
-    if context:
-        try:
-            context_lengths = tuple(int(p) for p in context.split(",") if p.strip())
-        except ValueError as exc:
-            raise typer.BadParameter(f"--context must be integers: {exc}") from exc
+    context_lengths = _int_list(context, "--context")
+    prune_depths = _int_list(prune, "--prune") or ()
 
     draft = None
     if speculative is not None:
@@ -739,6 +822,7 @@ def candidates(
             budget_bytes=budget,
             methods=tuple(method) if method else None,
             context_lengths=context_lengths,
+            prune_depths=prune_depths,
             # KV cache types are backend-specific; llama.cpp has no fp8.
             kv_dtypes=resolve_backend(backend).kv_dtypes,
             speculative=draft,
@@ -859,6 +943,13 @@ def optimize(
         "--context",
         help="Comma-separated context lengths (default 2048,4096,8192). Pin it to keep "
         "the search on one, which is what decides whether the baseline fits.",
+    ),
+    prune: str | None = typer.Option(
+        None,
+        "--prune",
+        help="Comma-separated block counts to try dropping, e.g. 2,4. Each recipe is "
+        "then searched at full depth and at every named depth. Pruning is lossier "
+        "than any quantization here, so it is only searched when asked for.",
     ),
     launch_template: str | None = typer.Option(
         None, "--launch", help="Command template to start a server. See --launch-preset."
@@ -1000,12 +1091,12 @@ def optimize(
             "Pass --launch-preset wsl-vllm (or --launch with your own command)."
         )
 
-    context_lengths: tuple[int, ...] | None = None
-    if context:
-        try:
-            context_lengths = tuple(int(part) for part in context.split(",") if part.strip())
-        except ValueError as exc:
-            raise typer.BadParameter(f"--context must be integers: {exc}") from exc
+    context_lengths = _int_list(context, "--context")
+    prune_depths = _int_list(prune, "--prune") or ()
+    if prune_depths and calibration is None:
+        # Scoring blocks means running the model over real text. Saying so now
+        # beats failing once per pruned candidate, minutes into the search.
+        raise typer.BadParameter("--prune needs --calibration: block scores come from activations")
 
     prompt_text = None
     if prompt_file is not None:
@@ -1053,6 +1144,7 @@ def optimize(
             methods=tuple(method) if method else None,
             concurrency=concurrency,
             context_lengths=context_lengths,
+            prune_depths=prune_depths,
             max_candidates=max_candidates,
             stop_early=stop_early,
             skip_benchmark=launch is None,

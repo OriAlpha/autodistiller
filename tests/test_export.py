@@ -449,3 +449,47 @@ def test_serve_command_names_the_gguf_file_and_the_context_length(tmp_path) -> N
     # vLLM is pointed at the directory, and still gets the context length.
     command = _serve_command("vllm", str(artifact), 4096)
     assert "--max-model-len 4096" in command
+
+
+def test_a_pruned_source_is_rebuilt_before_what_was_built_on_it(tmp_path):
+    """Quantizing a pruned model is two steps, and the bundle must say both.
+
+    The quantized artifact names the pruned directory as its source. A manifest
+    that emits only the compress command starts from the output of a step it
+    never mentions, so nobody can rebuild it from the model they actually have.
+    """
+    from autodistiller.compression.pipeline import ARTIFACT_SIDECAR
+    from autodistiller.compression.prune import PRUNE_SCHEME
+
+    pruned_dir = _lay_down_artifact(tmp_path / "pruned", quant_method=None)
+    pruned = CompressionArtifact(
+        recipe=CompressionRecipe(
+            method="prune4",
+            scheme=PRUNE_SCHEME,
+            algorithm="block-influence",
+            weight_bits=16,
+            activation_bits=16,
+            needs_calibration=True,
+            n_calibration_samples=32,
+            max_seq_length=2048,
+        ),
+        backend="autodistiller-prune",
+        source_model="Qwen/Qwen3-0.6B",
+        output_dir=str(pruned_dir),
+    )
+    (pruned_dir / ARTIFACT_SIDECAR).write_text(pruned.model_dump_json(), encoding="utf-8")
+
+    quantized_dir = _lay_down_artifact(tmp_path / "quantized")
+    record = _record(
+        tmp_path,
+        model_id=str(quantized_dir),
+        artifact=_artifact(quantized_dir, source=str(pruned_dir)),
+    )
+
+    commands = build_manifest(record).reproduce
+
+    assert commands[0].startswith("autodistiller prune")
+    assert "--model Qwen/Qwen3-0.6B" in commands[0]
+    assert "--drop 4" in commands[0]
+    assert commands[1].startswith("autodistiller compress")
+    assert f"--model {pruned_dir}" in commands[1]

@@ -22,6 +22,7 @@ import json
 import logging
 import re
 from pathlib import Path
+from typing import Protocol
 
 from ..config import CompressionSpec, ModelSpec
 from ..evaluation.datasets import load_text_corpus
@@ -102,6 +103,22 @@ def build_job(
     return job
 
 
+class ArtifactJob(Protocol):
+    """What caching an artifact needs of a job: where it writes, and what identifies it.
+
+    Quantization and depth pruning produce artifacts through entirely different
+    toolchains -- one an isolated llmcompressor subprocess, the other plain
+    Transformers in this process -- but they cache identically. Asking for the
+    two attributes actually read keeps one implementation of reuse rather than
+    two that drift.
+    """
+
+    output_dir: Path
+
+    @property
+    def artifact_key(self) -> str: ...
+
+
 def _is_complete(directory: Path) -> bool:
     """Whether a directory holds servable weights rather than a failed attempt.
 
@@ -117,7 +134,7 @@ def _is_complete(directory: Path) -> bool:
     return (directory / "config.json").is_file() and any(directory.glob("*.safetensors"))
 
 
-def read_cached_artifact(job: CompressionJob) -> CompressionArtifact | None:
+def read_cached_artifact(job: ArtifactJob) -> CompressionArtifact | None:
     """The artifact already sitting in this job's directory, if it is the right one."""
     sidecar = job.output_dir / ARTIFACT_SIDECAR
     if not sidecar.is_file() or not _is_complete(job.output_dir):
@@ -144,7 +161,7 @@ def read_cached_artifact(job: CompressionJob) -> CompressionArtifact | None:
     return artifact
 
 
-def write_artifact_sidecar(job: CompressionJob, artifact: CompressionArtifact) -> Path:
+def write_artifact_sidecar(job: ArtifactJob, artifact: CompressionArtifact) -> Path:
     """Record what was produced, next to the weights themselves."""
     path = job.output_dir / ARTIFACT_SIDECAR
     payload = artifact.model_dump(mode="json") | {"artifact_key": job.artifact_key}
@@ -208,6 +225,7 @@ def run_compression(
 
 __all__ = [
     "ARTIFACT_SIDECAR",
+    "ArtifactJob",
     "artifact_dir",
     "build_job",
     "read_cached_artifact",

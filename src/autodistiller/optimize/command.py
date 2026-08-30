@@ -202,6 +202,7 @@ def optimize(
     runs_dir: Path = Path("runs"),
     methods: tuple[str, ...] | None = None,
     context_lengths: tuple[int, ...] | None = None,
+    prune_depths: tuple[int, ...] = (),
     concurrency: int = 8,
     max_candidates: int = 12,
     stop_early: bool = True,
@@ -230,6 +231,7 @@ def optimize(
         kv_dtypes=backend_spec.kv_dtypes,
         speculative=speculative,
         supports_speculative=backend_spec.supports_speculative,
+        prune_depths=prune_depths,
         concurrency=concurrency,
         max_candidates=max_candidates,
     )

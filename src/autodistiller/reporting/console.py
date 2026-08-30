@@ -256,10 +256,17 @@ def render_candidates(candidate_set, *, show_rejected: bool = True) -> Table:
     table.add_column("Status")
 
     def _name(candidate) -> str:
-        # The draft belongs in the name: a speculative candidate is otherwise
-        # the same method, context and KV as its plain twin, differing only in a
-        # weights figure the reader has no reason to connect to a draft model.
-        base = candidate.method or "baseline"
+        # The draft and the depth both belong in the name: either one leaves a
+        # candidate otherwise identical to its twin, differing only in a weights
+        # figure the reader has no reason to connect to a draft or a prune. A
+        # pruned row reading "baseline" is worse than unhelpful -- that is the
+        # name of the one candidate whose weights were not touched at all.
+        if candidate.depth:
+            base = f"prune{candidate.depth}"
+            if candidate.method:
+                base += f" {candidate.method}"
+        else:
+            base = candidate.method or "baseline"
         return f"{base} +{candidate.speculative.label}" if candidate.speculative else base
 
     for index, candidate in enumerate(candidate_set.accepted, start=1):

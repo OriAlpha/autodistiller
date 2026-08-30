@@ -1,8 +1,8 @@
 """Candidate generation.
 
-Enumerates a small, explainable search space: compression method x context
-length x KV cache dtype, filtered by what the hardware supports, what the
-serving backend can run, and what fits in memory.
+Enumerates a small, explainable search space: depth x compression method x
+context length x KV cache dtype, filtered by what the hardware supports, what
+the serving backend can run, and what fits in memory.
 
 Two properties matter more than cleverness here.
 
@@ -16,7 +16,7 @@ no FP8" is a useful answer; a silently shorter list is not.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from ..compression.methods import METHODS, CompressionMethod, check_method, resolve_method
 from ..metadata.profiles import GPUProfile
@@ -46,16 +46,34 @@ class Candidate:
     Orthogonal to ``method``: speculation does not change the target's weights,
     so it composes with every compression method rather than replacing one."""
 
+    depth: int = 0
+    """Transformer blocks removed before anything else happens to the model.
+
+    Also orthogonal to ``method``, but in the other direction: pruning changes
+    how many layers there are and quantization changes how each surviving weight
+    is stored, so a candidate can do both -- prune first, then quantize what is
+    left. Zero means the model keeps every block."""
+
     @property
     def is_baseline(self) -> bool:
-        return self.method is None
+        """The model exactly as it arrived.
+
+        Not merely "unquantized": a pruned candidate has different weights, so
+        it needs an artifact built and cannot stand in as the reference every
+        retention figure is measured against.
+        """
+        return self.method is None and self.depth == 0
 
     @property
     def id(self) -> str:
-        method = self.method or "baseline"
+        parts = []
+        if self.depth:
+            parts.append(f"prune{self.depth}")
+        if self.method:
+            parts.append(self.method)
         kv = "" if self.kv_dtype == "auto" else f"-kv{self.kv_dtype}"
         spec = f"-{self.speculative.label}" if self.speculative else ""
-        return f"{method}-ctx{self.max_model_len}{kv}{spec}"
+        return f"{'-'.join(parts) or 'baseline'}-ctx{self.max_model_len}{kv}{spec}"
 
     def describe(self) -> str:
         return f"{self.id}: {self.estimate.describe()}"
@@ -106,14 +124,21 @@ def _sort_key(candidate: Candidate) -> tuple:
     Phase 5 screens cheaply before benchmarking, and the candidate most likely
     to hold quality is the one worth proving first. The baseline leads because
     everything else is measured against it.
+
+    Depth outranks bit width because it costs more. Dropping four of Qwen3-0.6B's
+    28 blocks moved wikitext-2 perplexity from 17.0 to 29.0; no quantization in
+    the method list comes close to that, so every unpruned candidate is worth
+    proving before the first pruned one.
     """
-    if candidate.method is None:
-        return (0, 0, 0, candidate.max_model_len, "")
-    method = METHODS[candidate.method]
+    method = METHODS[candidate.method] if candidate.method else None
     return (
-        1,
-        -method.weight_bits,
-        -method.activation_bits,
+        0 if candidate.is_baseline else 1,
+        candidate.depth,
+        # An unquantized model stores its weights at 16 bits, which is what puts
+        # a pruned-but-not-quantized candidate ahead of a pruned-and-quantized
+        # one at the same depth.
+        -method.weight_bits if method else -16,
+        -method.activation_bits if method else -16,
         candidate.max_model_len,
         candidate.speculative.label if candidate.speculative else "",
     )
@@ -138,6 +163,7 @@ def generate_candidates(
     kv_dtypes: tuple[str, ...] = KV_DTYPES,
     speculative: SpeculativeSpec | None = None,
     supports_speculative: bool = True,
+    prune_depths: tuple[int, ...] = (),
     concurrency: int = 1,
     include_baseline: bool = True,
     max_candidates: int = DEFAULT_MAX_CANDIDATES,
@@ -165,54 +191,70 @@ def generate_candidates(
     if speculative is not None:
         speculations.append(speculative)
 
-    for method in chosen:
-        for max_model_len in _context_lengths(shape, context_lengths):
-            for kv_dtype in kv_dtypes:
-                for spec in speculations:
-                    reasons: list[str] = []
+    # Zero always, for the same reason: a depth is only worth searching against
+    # the same recipe at full depth, or there is nothing to read the cost off.
+    depths = [0] + [d for d in dict.fromkeys(prune_depths) if d]
 
-                    if method is not None:
-                        availability = check_method(method, profile=profile, backend=backend)
-                        reasons.extend(availability.reasons)
+    for depth in depths:
+        for method in chosen:
+            for max_model_len in _context_lengths(shape, context_lengths):
+                for kv_dtype in kv_dtypes:
+                    for spec in speculations:
+                        reasons: list[str] = []
 
-                    # An FP8 KV cache is its own hardware requirement, independent
-                    # of how the weights are stored.
-                    if (
-                        kv_dtype == "fp8"
-                        and profile is not None
-                        and "fp8" not in profile.capabilities
-                    ):
-                        reasons.append(f"hardware: {profile.name} has no fp8 for the KV cache")
+                        if method is not None:
+                            availability = check_method(method, profile=profile, backend=backend)
+                            reasons.extend(availability.reasons)
 
-                    if spec is not None and not supports_speculative:
-                        reasons.append(f"backend: {backend} cannot run {spec.method} drafts")
+                        # An FP8 KV cache is its own hardware requirement,
+                        # independent of how the weights are stored.
+                        if (
+                            kv_dtype == "fp8"
+                            and profile is not None
+                            and "fp8" not in profile.capabilities
+                        ):
+                            reasons.append(f"hardware: {profile.name} has no fp8 for the KV cache")
 
-                    estimate = estimate_memory(
-                        shape,
-                        method,
-                        max_model_len=max_model_len,
-                        concurrency=concurrency,
-                        kv_dtype=kv_dtype,
-                        budget_bytes=budget_bytes,
-                        draft_bytes=spec.weights_bytes if spec else 0,
-                    )
-                    if not estimate.fits:
-                        reasons.append(
-                            f"memory: needs {estimate.total_gib:.2f} GiB of "
-                            f"{(budget_bytes or 0) / (1024**3):.2f} GiB"
+                        if spec is not None and not supports_speculative:
+                            reasons.append(f"backend: {backend} cannot run {spec.method} drafts")
+
+                        # The final block is never dropped, so the deepest
+                        # useful prune leaves one behind.
+                        if depth and depth > shape.n_layers - 2:
+                            reasons.append(f"depth: cannot drop {depth} of {shape.n_layers} blocks")
+
+                        # Fewer layers is fewer weights *and* a smaller KV cache
+                        # per token, and both fall out of the shape arithmetic
+                        # once the layer count is right.
+                        pruned = replace(shape, n_layers=shape.n_layers - depth) if depth else shape
+
+                        estimate = estimate_memory(
+                            pruned,
+                            method,
+                            max_model_len=max_model_len,
+                            concurrency=concurrency,
+                            kv_dtype=kv_dtype,
+                            budget_bytes=budget_bytes,
+                            draft_bytes=spec.weights_bytes if spec else 0,
                         )
+                        if not estimate.fits:
+                            reasons.append(
+                                f"memory: needs {estimate.total_gib:.2f} GiB of "
+                                f"{(budget_bytes or 0) / (1024**3):.2f} GiB"
+                            )
 
-                    candidate = Candidate(
-                        method=method.name if method else None,
-                        max_model_len=max_model_len,
-                        kv_dtype=kv_dtype,
-                        estimate=estimate,
-                        speculative=spec,
-                    )
-                    if reasons:
-                        result.rejected.append(Rejection(candidate, tuple(reasons)))
-                    else:
-                        result.accepted.append(candidate)
+                        candidate = Candidate(
+                            method=method.name if method else None,
+                            max_model_len=max_model_len,
+                            kv_dtype=kv_dtype,
+                            estimate=estimate,
+                            speculative=spec,
+                            depth=depth,
+                        )
+                        if reasons:
+                            result.rejected.append(Rejection(candidate, tuple(reasons)))
+                        else:
+                            result.accepted.append(candidate)
 
     result.accepted.sort(key=_sort_key)
     if len(result.accepted) > max_candidates:
@@ -233,18 +275,19 @@ def _trim(candidates: list[Candidate], limit: int) -> tuple[list[Candidate], lis
     exactly the candidates a memory-constrained search is for. Taking one per
     family in rotation keeps the space broad, then deepens it.
 
-    A family is a method *and* whether it speculates. Rotating on the method
-    alone has the same failure in the other direction: a speculative candidate
-    shares its method with its plain twin and sorts after it, so one queue per
-    method fills every slot with plain candidates and drops the entire
-    speculative half before anything is measured -- silently, and precisely when
-    the user asked for the comparison by naming a draft.
+    A family is a method, whether it speculates, and how deep it is. Rotating on
+    the method alone has the same failure in the other direction: a speculative
+    or pruned candidate shares its method with its full-depth twin and sorts
+    after it, so one queue per method fills every slot with the twins and drops
+    the entire speculative or pruned half before anything is measured --
+    silently, and precisely when the user asked for the comparison.
     """
-    by_family: dict[tuple[str | None, str | None], list[Candidate]] = {}
+    by_family: dict[tuple[str | None, str | None, int], list[Candidate]] = {}
     for candidate in candidates:
         family = (
             candidate.method,
             candidate.speculative.label if candidate.speculative else None,
+            candidate.depth,
         )
         by_family.setdefault(family, []).append(candidate)
 
