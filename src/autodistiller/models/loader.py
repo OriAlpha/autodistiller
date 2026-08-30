@@ -16,7 +16,7 @@ from typing import Any
 
 import torch
 import transformers
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModel, AutoModelForCausalLM, AutoTokenizer
 
 from ..metadata.hashing import hash_obj
 from ..results import ModelInfo
@@ -150,6 +150,35 @@ def gguf_file_in(model_id: str) -> str | None:
     return found[0].name if found else None
 
 
+DECODER_SUFFIXES = ("ForCausalLM", "ForConditionalGeneration")
+"""Architecture names that predict a next token.
+
+The same list :mod:`autodistiller.candidates.shape` screens on, for the same
+reason: it is the property that decides how a model is loaded, measured and
+served, not the model's family name.
+"""
+
+
+def auto_class_for(config: Any) -> Any:
+    """The Auto class that loads this architecture.
+
+    A causal LM is loaded with its head, because every token-level task scores
+    logits. An encoder has no head worth loading -- what an embedding task needs
+    is the hidden states underneath one -- so ``AutoModel`` is both correct and
+    smaller. Guessing wrong is not subtle: ``AutoModelForCausalLM`` on a BERT
+    checkpoint either refuses or silently attaches a randomly initialised head.
+
+    The causal LM stays the default, and this departs from it only when the
+    config says outright that the model is something else. A config with no
+    ``architectures`` is a local or hand-written one, and reading that silence
+    as "encoder" would change how every such checkpoint has always loaded.
+    """
+    names = [str(name) for name in (getattr(config, "architectures", None) or ())]
+    if names and not any(name.endswith(DECODER_SUFFIXES) for name in names):
+        return AutoModel
+    return AutoModelForCausalLM
+
+
 def load_model(spec: Any) -> LoadedModel:
     """Load a model + tokenizer described by a :class:`~autodistiller.config.ModelSpec`."""
     device = resolve_device(spec.device)
@@ -177,10 +206,12 @@ def load_model(spec: Any) -> LoadedModel:
     if spec.attn_implementation:
         load_kwargs["attn_implementation"] = spec.attn_implementation
 
-    model: Any = AutoModelForCausalLM.from_pretrained(spec.id, config=config, **load_kwargs)
+    model: Any = auto_class_for(config).from_pretrained(spec.id, config=config, **load_kwargs)
     model.to(device)
     model.eval()
-    model.config.use_cache = True
+    # An encoder has no cache to enable, and its config may not carry the flag.
+    if hasattr(model.config, "use_cache"):
+        model.config.use_cache = True
 
     architectures = getattr(config, "architectures", None)
     info = ModelInfo(

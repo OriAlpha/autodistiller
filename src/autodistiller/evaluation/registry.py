@@ -18,7 +18,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Literal
 
-from ..config import DatasetSpec, MultipleChoiceTask, PerplexityTask, TaskSpec
+from ..config import DatasetSpec, EmbeddingTask, MultipleChoiceTask, PerplexityTask, TaskSpec
 
 PresetFactory = Callable[[int | None], TaskSpec]
 
@@ -28,6 +28,26 @@ DEFAULT_SCREENING_LIMIT = 256
 Phase 1 is a screening stage. A full wikitext-2 pass is minutes of GPU time that
 buys very little extra signal about whether a baseline is sane.
 """
+
+
+def _stsb(limit: int | None) -> TaskSpec:
+    """STS-B: the standard sentence-similarity benchmark.
+
+    1500 validation pairs, so a full pass is seconds even on a small GPU and
+    the default limit leaves it whole. Capping it would only widen the error
+    bar on a correlation that is already the cheapest task here.
+    """
+    return EmbeddingTask(
+        name="stsb",
+        dataset=DatasetSpec(
+            source="hub",
+            path="nyu-mll/glue",
+            name="stsb",
+            split="validation",
+            limit=limit,
+        ),
+        score_column="label",
+    )
 
 
 def _wikitext2(limit: int | None) -> TaskSpec:
@@ -119,6 +139,7 @@ PRESETS: dict[str, PresetFactory] = {
     "arc_challenge": _arc_challenge,
     "hellaswag": _hellaswag,
     "piqa": _piqa,
+    "stsb": _stsb,
 }
 
 DEFAULT_TASKS = ("wikitext2",)

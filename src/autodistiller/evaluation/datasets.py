@@ -65,6 +65,28 @@ class MultipleChoiceSet:
         return len(self.examples)
 
 
+@dataclass
+class SentencePair:
+    """Two sentences a human scored for similarity."""
+
+    text_a: str
+    text_b: str
+    score: float
+    id: str | None = None
+
+
+@dataclass
+class SentencePairSet:
+    examples: list[SentencePair]
+    fingerprint: str
+    source: str
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def n_examples(self) -> int:
+        return len(self.examples)
+
+
 def _read_jsonl(path: Path, limit: int | None = None) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     with path.open("r", encoding="utf-8") as handle:
@@ -221,3 +243,54 @@ def load_multiple_choice(
         ]
     )
     return MultipleChoiceSet(examples=examples, fingerprint=fingerprint, source=source)
+
+
+def load_sentence_pairs(
+    spec: DatasetSpec,
+    *,
+    text_a_column: str = "sentence1",
+    text_b_column: str = "sentence2",
+    score_column: str = "label",
+) -> SentencePairSet:
+    """Load scored sentence pairs from a hub dataset or a local JSONL file.
+
+    The expected JSONL schema is one object per line::
+
+        {"sentence1": "a man is playing a guitar",
+         "sentence2": "a man plays a guitar", "label": 4.6}
+
+    The score's scale does not matter. Quality is a rank correlation, so any
+    monotonic scale gives the same answer -- 0-5 as STS-B uses, or 0-1.
+    """
+    source = f"{spec.source}:{spec.path}"
+
+    if spec.source == "text":
+        raise ValueError("embedding tasks need source 'jsonl' or 'hub', not 'text'")
+    if spec.source == "jsonl":
+        path = Path(spec.path)
+        if not path.exists():
+            raise FileNotFoundError(f"dataset not found: {path}")
+        rows = _read_jsonl(path, spec.limit)
+    else:
+        rows = _load_hub_rows(spec)
+
+    examples: list[SentencePair] = []
+    for index, row in enumerate(rows):
+        examples.append(
+            SentencePair(
+                id=str(row.get("id", index)),
+                text_a=str(_require_column(row, text_a_column, source)),
+                text_b=str(_require_column(row, text_b_column, source)),
+                score=float(_require_column(row, score_column, source)),
+            )
+        )
+
+    if not examples:
+        raise ValueError(f"{source}: no examples found")
+
+    # A rank correlation over fewer than three points is not a measurement.
+    if len(examples) < 3:
+        raise ValueError(f"{source}: need at least 3 pairs to correlate, got {len(examples)}")
+
+    fingerprint = hash_obj([{"a": e.text_a, "b": e.text_b, "score": e.score} for e in examples])
+    return SentencePairSet(examples=examples, fingerprint=fingerprint, source=source)

@@ -103,8 +103,41 @@ class MultipleChoiceTask(StrictModel):
     )
 
 
+class EmbeddingTask(StrictModel):
+    """Sentence-pair similarity: the screening metric for an embedding model.
+
+    Perplexity and multiple choice both need a model that predicts tokens. An
+    encoder produces a vector and nothing else, so quality is measured on what
+    the vector is for: whether two sentences a human called similar land close
+    together.
+
+    Absolute per model, like every other task here -- a score, not a comparison.
+    That is what lets two runs be compared afterwards through the same retention
+    machinery rather than needing both models loaded at once.
+    """
+
+    kind: Literal["embedding"] = "embedding"
+    name: str
+    dataset: DatasetSpec
+    batch_size: int = Field(default=16, ge=1)
+    max_length: int | None = Field(
+        default=None, description="Encoder window; defaults to the model's own"
+    )
+    pooling: Literal["mean", "cls"] = Field(
+        default="mean",
+        description=(
+            "How token vectors become one sentence vector. Mean over unmasked "
+            "positions is what sentence-transformers models are trained with; "
+            "cls takes the first token, which BERT classifiers use."
+        ),
+    )
+    text_a_column: str = "sentence1"
+    text_b_column: str = "sentence2"
+    score_column: str = "label"
+
+
 TaskSpec = Annotated[
-    PerplexityTask | MultipleChoiceTask,
+    PerplexityTask | MultipleChoiceTask | EmbeddingTask,
     Field(discriminator="kind"),
 ]
 
