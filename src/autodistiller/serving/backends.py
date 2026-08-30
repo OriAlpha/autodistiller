@@ -45,6 +45,13 @@ class Backend:
     kv_flag_template: str = "--kv-cache-dtype {kv_dtype}"
     """How this runtime is told to use a non-default KV cache type."""
 
+    supports_speculative: bool = False
+    """Whether this runtime can serve a speculative draft alongside the target."""
+
+    speculative_flag_template: str = "--speculative-config '{config}'"
+    """How this runtime is handed a draft. The JSON is single-quoted so a shell
+    passes it through as one argument."""
+
     notes: str = ""
 
     def model_path(self, artifact_dir: str) -> str:
@@ -115,6 +122,7 @@ BACKENDS: dict[str, Backend] = {
     "vllm": VLLMBackend(
         name="vllm",
         description="vLLM OpenAI-compatible server",
+        supports_speculative=True,
         notes="Linux/WSL only. On an 8 GiB card, lower --gpu-memory-utilization "
         "if the KV cache will not fit.",
     ),

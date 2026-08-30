@@ -448,3 +448,243 @@ def test_an_empty_text_config_falls_back_to_the_top_level():
 
     shape = shape_from_config("flat/model", Config())
     assert shape.hidden_size == 768 and shape.n_layers == 12
+
+
+def test_rejects_models_the_arithmetic_does_not_describe() -> None:
+    """An encoder has the same config field names and no KV cache.
+
+    Without a guard the formulas run and return a confident wrong estimate,
+    which is worse than none: it is what candidates are screened against.
+    """
+
+    class Encoder:
+        architectures: ClassVar[list[str]] = ["BertForMaskedLM"]
+        num_hidden_layers = 12
+        hidden_size = 768
+        num_attention_heads = 12
+        intermediate_size = 3072
+        vocab_size = 30522
+        max_position_embeddings = 512
+
+    with pytest.raises(ValueError, match="not a decoder-only"):
+        shape_from_config("bert-base-uncased", Encoder())
+
+    class EncoderDecoder(Encoder):
+        architectures: ClassVar[list[str]] = ["WhisperForConditionalGeneration"]
+        is_encoder_decoder = True
+
+    with pytest.raises(ValueError, match="encoder-decoder"):
+        shape_from_config("openai/whisper-small", EncoderDecoder())
+
+    class Decoder(Encoder):
+        architectures: ClassVar[list[str]] = ["Qwen3ForCausalLM"]
+        num_key_value_heads = 4
+
+    assert shape_from_config("Qwen/Qwen3-0.6B", Decoder()).n_kv_heads == 4
+
+
+def test_moe_weights_count_every_expert() -> None:
+    """A MoE layer is one gated MLP per expert, not one per layer.
+
+    Counting it as dense reports Qwen3-30B-A3B as 3.34B and screens it as
+    something that fits on an 8 GiB card. Every expert is resident whether or
+    not a token routes to it, so the total is what a fit decision turns on --
+    the active count the model's name advertises is about compute.
+    """
+
+    class Base:
+        architectures: ClassVar[list[str]] = ["XForCausalLM"]
+        tie_word_embeddings = False
+
+    def params_b(**fields: object) -> float:
+        config = type("C", (Base,), fields)
+        return shape_from_config("m", config()).n_parameters / 1e9
+
+    qwen3_moe = dict(
+        num_hidden_layers=48,
+        hidden_size=2048,
+        num_attention_heads=32,
+        num_key_value_heads=4,
+        head_dim=128,
+        vocab_size=151936,
+        max_position_embeddings=40960,
+        intermediate_size=6144,
+        moe_intermediate_size=768,
+        num_experts=128,
+    )
+    assert params_b(**qwen3_moe) == pytest.approx(30.5, rel=0.03)
+
+    # num_local_experts, and experts that use intermediate_size directly.
+    assert params_b(
+        num_hidden_layers=32,
+        hidden_size=4096,
+        num_attention_heads=32,
+        num_key_value_heads=8,
+        vocab_size=32000,
+        max_position_embeddings=32768,
+        intermediate_size=14336,
+        num_local_experts=8,
+    ) == pytest.approx(46.7, rel=0.03)
+
+    # An always-on shared expert on top of the routed ones.
+    assert params_b(
+        num_hidden_layers=28,
+        hidden_size=3584,
+        num_attention_heads=28,
+        num_key_value_heads=4,
+        vocab_size=151936,
+        max_position_embeddings=32768,
+        intermediate_size=18944,
+        moe_intermediate_size=2560,
+        num_experts=64,
+        shared_expert_intermediate_size=20480,
+    ) == pytest.approx(57.4, rel=0.03)
+
+    # A dense model must be untouched by any of it.
+    dense = dict(qwen3_moe)
+    dense.pop("moe_intermediate_size")
+    dense.pop("num_experts")
+    shape = shape_from_config("dense", type("C", (Base,), dense)())
+    assert not shape.is_moe
+    assert shape.mlp_params_per_layer == 3 * 2048 * 6144
+
+
+def _draft_config(block_size: int = 16, nested: bool = False) -> object:
+    """A DFlash draft's config, shaped like the published checkpoints."""
+    fields: dict[str, object] = {
+        "architectures": ["DFlashDraftModel"],
+        "num_hidden_layers": 5,
+        "hidden_size": 5120,
+        "intermediate_size": 17408,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+        "vocab_size": 248320,
+        "max_position_embeddings": 262144,
+        "tie_word_embeddings": False,
+        "dtype": "bfloat16",
+    }
+    # DFlash puts it at the top level, DFlash2 inside dflash_config.
+    fields["dflash_config"] = {"block_size": block_size} if nested else {}
+    if not nested:
+        fields["block_size"] = block_size
+    return type("DraftConfig", (), fields)()
+
+
+def test_draft_shape_is_read_where_the_causal_guard_would_refuse() -> None:
+    """A draft is not a servable causal LM, but it is the same block arithmetic.
+
+    `shape_from_config` rightly rejects `DFlashDraftModel`; the draft parser
+    reuses ModelShape without that guard rather than duplicating the formulas.
+    """
+    from autodistiller.candidates.speculative import draft_shape_from_config
+
+    config = _draft_config()
+    with pytest.raises(ValueError, match="not a decoder-only"):
+        shape_from_config("z-lab/X-DFlash", config)
+
+    shape = draft_shape_from_config("z-lab/X-DFlash", config)
+    assert shape.n_layers == 5
+    assert shape.architecture == "DFlashDraftModel"
+    # 5 blocks over hidden 5120, plus two untied 248320-row embedding tables.
+    assert shape.n_parameters == pytest.approx(4.14e9, rel=0.02)
+
+
+def test_speculative_candidates_carry_the_draft_and_its_memory() -> None:
+    """A draft sits on the device beside the target for the whole run.
+
+    Not counting it is the same class of mistake as not counting the KV cache:
+    a candidate that is screened as fitting and then OOMs at serve time.
+    """
+    from autodistiller.candidates.generator import generate_candidates
+    from autodistiller.candidates.speculative import SpeculativeSpec
+
+    class Config:
+        architectures: ClassVar[list[str]] = ["Qwen3ForCausalLM"]
+        num_hidden_layers = 28
+        hidden_size = 1024
+        num_attention_heads = 16
+        num_key_value_heads = 8
+        head_dim = 128
+        intermediate_size = 3072
+        vocab_size = 151936
+        max_position_embeddings = 40960
+
+    shape = shape_from_config("Qwen/Qwen3-0.6B", Config())
+    draft = SpeculativeSpec(
+        method="dflash", model="z-lab/X", n_tokens=15, weights_bytes=2 * 1024**3
+    )
+
+    plain = generate_candidates(shape, methods=("fp8",), context_lengths=(2048,))
+    with_draft = generate_candidates(
+        shape, methods=("fp8",), context_lengths=(2048,), speculative=draft
+    )
+
+    # Every recipe is offered both ways, so the comparison is measurable.
+    assert len(with_draft.accepted) == 2 * len(plain.accepted)
+
+    speculative = [c for c in with_draft.accepted if c.speculative]
+    assert all(c.id.endswith("-dflash15") for c in speculative)
+    assert all(c.estimate.draft_bytes == 2 * 1024**3 for c in speculative)
+
+    # The draft is real memory: the same recipe carries 2 GiB more of weights,
+    # and the overhead fraction grows with the larger footprint rather than
+    # being computed against the target alone.
+    by_id = {c.id: c for c in with_draft.accepted}
+    speculative_fp8 = by_id["fp8-ctx2048-dflash15"].estimate
+    plain_fp8 = by_id["fp8-ctx2048"].estimate
+    assert speculative_fp8.weights_bytes - plain_fp8.weights_bytes == 2 * 1024**3
+    assert speculative_fp8.overhead_bytes > plain_fp8.overhead_bytes
+    assert "draft 2.00" in speculative_fp8.describe()
+    assert "draft" not in plain_fp8.describe()
+
+    # A runtime that cannot serve a draft says so rather than shipping one.
+    refused = generate_candidates(
+        shape,
+        methods=("fp8",),
+        context_lengths=(2048,),
+        speculative=draft,
+        supports_speculative=False,
+        backend="llama.cpp",
+    )
+    assert not [c for c in refused.accepted if c.speculative]
+    assert any("cannot run dflash drafts" in r for j in refused.rejected for r in j.reasons)
+
+
+def test_trim_keeps_both_halves_of_a_speculative_search() -> None:
+    """The candidate cap must not silently delete the comparison.
+
+    A speculative candidate shares its method with its plain twin and sorts
+    after it, so rotating the trim on method alone fills every slot with plain
+    candidates and drops the entire speculative half -- precisely when the user
+    asked for the comparison by naming a draft.
+    """
+    from autodistiller.candidates.generator import generate_candidates
+    from autodistiller.candidates.speculative import SpeculativeSpec
+
+    class Config:
+        architectures: ClassVar[list[str]] = ["Qwen3ForCausalLM"]
+        num_hidden_layers = 36
+        hidden_size = 2560
+        num_attention_heads = 32
+        num_key_value_heads = 8
+        head_dim = 128
+        intermediate_size = 9728
+        vocab_size = 151936
+        max_position_embeddings = 40960
+
+    shape = shape_from_config("Qwen/Qwen3-4B", Config())
+    draft = SpeculativeSpec(method="dflash", model="d", n_tokens=15, weights_bytes=1024**3)
+
+    result = generate_candidates(
+        shape, budget_bytes=8 * 1024**3, speculative=draft, max_candidates=12
+    )
+    speculative = [c for c in result.accepted if c.speculative]
+
+    assert len(result.accepted) == 12
+    assert speculative, "the cap dropped every speculative candidate"
+
+    # Each method that survives should survive both ways, so there is something
+    # to compare rather than a half-answered question.
+    plain_methods = {c.method for c in result.accepted if not c.speculative}
+    assert {c.method for c in speculative} == plain_methods

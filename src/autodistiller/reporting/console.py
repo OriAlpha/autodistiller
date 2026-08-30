@@ -191,7 +191,7 @@ def render_deployment(benchmark) -> Table:
             Text(str(phase.n_failed), style="red") if phase.n_failed else "0",
         )
 
-    # A stall that inflated a phase must stay visible in a record read back
+    # A stall that skewed a phase must stay visible in a record read back
     # later, not only in the progress output of the run that produced it.
     for phase in benchmark.phases:
         for warning in phase.warnings:
@@ -255,11 +255,18 @@ def render_candidates(candidate_set, *, show_rejected: bool = True) -> Table:
     table.add_column("Est. total", justify="right")
     table.add_column("Status")
 
+    def _name(candidate) -> str:
+        # The draft belongs in the name: a speculative candidate is otherwise
+        # the same method, context and KV as its plain twin, differing only in a
+        # weights figure the reader has no reason to connect to a draft model.
+        base = candidate.method or "baseline"
+        return f"{base} +{candidate.speculative.label}" if candidate.speculative else base
+
     for index, candidate in enumerate(candidate_set.accepted, start=1):
         estimate = candidate.estimate
         table.add_row(
             str(index),
-            Text(candidate.method or "baseline", style="bold" if candidate.is_baseline else ""),
+            Text(_name(candidate), style="bold" if candidate.is_baseline else ""),
             f"{candidate.max_model_len:,}",
             candidate.kv_dtype,
             _gib(estimate.weights_bytes),
@@ -273,7 +280,7 @@ def render_candidates(candidate_set, *, show_rejected: bool = True) -> Table:
             candidate = rejection.candidate
             table.add_row(
                 "-",
-                Text(candidate.method or "baseline", style="dim"),
+                Text(_name(candidate), style="dim"),
                 Text(f"{candidate.max_model_len:,}", style="dim"),
                 Text(candidate.kv_dtype, style="dim"),
                 Text(_gib(candidate.estimate.weights_bytes), style="dim"),
@@ -432,10 +439,11 @@ def render_regression(report: RegressionReport) -> None:
     verdict_styles = {"pass": "green", "fail": "red", "not_comparable": "yellow"}
 
     for comparison in report.comparisons:
-        delta = Text(
-            f"{comparison.delta:+.4f}",
-            style="green" if comparison.improved else "red",
-        )
+        # Three-way: an unchanged metric is not a regression. `improved` is
+        # False for a delta of exactly zero, so styling on it alone paints a
+        # candidate that matched the baseline in the colour of one that lost.
+        style = "dim" if comparison.delta == 0 else ("green" if comparison.improved else "red")
+        delta = Text(f"{comparison.delta:+.4f}", style=style)
         # A change inside combined sampling noise should not be read as a trend.
         if comparison.significant is False:
             delta.append(" (noise)", style="dim")

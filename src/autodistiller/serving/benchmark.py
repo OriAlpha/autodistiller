@@ -17,10 +17,12 @@ import asyncio
 import statistics
 import time
 from collections.abc import Callable
+from pathlib import Path
 
 import httpx
 
 from ..metadata.hardware import device_vram_bytes
+from ..metadata.hashing import hash_text_stream
 from ..results import ConcurrencyResult, DeploymentBenchmark, LatencyStats
 from .client import RequestMetrics, probe_endpoint, stream_request
 
@@ -99,6 +101,33 @@ def build_prompt(target_tokens: int) -> str:
     words_needed = max(int(target_tokens / 1.3), 1)
     words = (_FILLER * (words_needed // len(_FILLER.split()) + 2)).split()
     return " ".join(words[:words_needed])
+
+
+def read_prompt(path: Path) -> str:
+    """A prompt from the user's own traffic, instead of the synthetic filler.
+
+    TTFT and throughput are sensitive to prompt *length* but not to its content,
+    which is why generated filler is honest for them and why it is the default:
+    it is deterministic and identical across candidates. Speculative decoding is
+    the exception. Its whole speedup is the draft model's acceptance rate, and
+    acceptance is a property of the text -- a draft that predicts Lorem-ipsum
+    filler well says nothing about one predicting your traffic. Measured on
+    filler, a speculative speedup is a confident number about nothing.
+
+    # ponytail: one prompt, sent by every request, which is what keeps TTFT
+    # comparable across candidates. A representative *set* would measure
+    # acceptance better but makes prompt length vary within a phase; add it when
+    # a single prompt is visibly not enough.
+    """
+    text = path.read_text(encoding="utf-8", errors="replace").strip()
+    if not text:
+        raise ValueError(f"{path} is empty; a benchmark needs a prompt to send")
+    return text
+
+
+def prompt_fingerprint(text: str) -> str:
+    """Identity of the prompt, for the cache key and the stored record."""
+    return hash_text_stream([text])
 
 
 class _VramSampler:
@@ -294,7 +323,8 @@ def _aggregate(
             f"throughput is {efficiency * 100:.0f}% of what this phase's own timings "
             f"predict ({phase.output_tokens_per_s:.0f} vs {predicted:.0f} tok/s); "
             f"slowest request {slowest:.2f}s against a median of {median:.2f}s. "
-            f"A stall inflated this measurement -- treat it as unreliable."
+            f"A stall inflated the wall clock, so this throughput understates the "
+            f"server -- treat it as unreliable."
         )
 
     return phase
@@ -306,6 +336,7 @@ async def run_deployment_benchmark(
     backend: str,
     model: str | None = None,
     prompt_tokens: int = 256,
+    prompt_text: str | None = None,
     max_tokens: int = 128,
     concurrency_levels: tuple[int, ...] = (1, 4, 16),
     requests_per_level: int | None = None,
@@ -332,7 +363,7 @@ async def run_deployment_benchmark(
     if served_model is None:
         raise ValueError(f"{url} reports no models; pass --served-model explicitly")
 
-    prompt = build_prompt(prompt_tokens)
+    prompt = prompt_text if prompt_text is not None else build_prompt(prompt_tokens)
     phases: list[ConcurrencyResult] = []
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(300.0), transport=transport) as client:
@@ -391,10 +422,11 @@ async def run_deployment_benchmark(
         endpoint=url,
         served_model=served_model,
         prompt_tokens_requested=prompt_tokens,
+        prompt_fingerprint=prompt_fingerprint(prompt) if prompt_text is not None else None,
         max_tokens=max_tokens,
         phases=phases,
         device_total_vram_bytes=vram.total,
     )
 
 
-__all__ = ["build_prompt", "run_deployment_benchmark"]
+__all__ = ["build_prompt", "prompt_fingerprint", "read_prompt", "run_deployment_benchmark"]

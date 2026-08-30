@@ -14,12 +14,13 @@ from pathlib import Path
 
 from ..candidates.generator import Candidate, generate_candidates
 from ..candidates.shape import load_shape
+from ..candidates.speculative import SpeculativeSpec
 from ..config import BaselineInferenceSpec, DatasetSpec, ModelSpec, RunConfig, TaskSpec
 from ..metadata.profiles import GPUProfile
 from ..results import DeploymentBenchmark, RunRecord
 from ..runner import run_evaluation
 from ..serving.backends import resolve_backend
-from ..serving.benchmark import run_deployment_benchmark
+from ..serving.benchmark import prompt_fingerprint, run_deployment_benchmark
 from ..serving.launcher import LaunchSpec, serving
 from ..store import RunStore
 from .constraints import Constraints, Objective
@@ -44,7 +45,7 @@ WSL_VLLM_TEMPLATE = (
     "LIBRARY_PATH=$HOME/cudalibs:$CU/lib:/usr/lib/wsl/lib "
     "PATH=$HOME/vllm-env/bin:$CU/bin:$PATH "
     "$HOME/vllm-env/bin/vllm serve {model} --port {port} "
-    '--max-model-len {max_model_len} --gpu-memory-utilization 0.85 {kv_flag}"'
+    '--max-model-len {max_model_len} {kv_flag} {util_flag} {seqs_flag} {spec_flag}"'
 )
 """Launching vLLM from Windows means going through WSL, with the environment
 Phase 2 had to discover. See docs/vllm-on-wsl.md.
@@ -55,7 +56,10 @@ as ``\\$VAR`` for a POSIX outer shell makes bash treat them as literal text and
 the command exits 127.
 """
 
-NATIVE_VLLM_TEMPLATE = "vllm serve {model} --port {port} --max-model-len {max_model_len} {kv_flag}"
+NATIVE_VLLM_TEMPLATE = (
+    "vllm serve {model} --port {port} --max-model-len {max_model_len} "
+    "{kv_flag} {util_flag} {seqs_flag} {spec_flag}"
+)
 
 NATIVE_LLAMACPP_TEMPLATE = (
     "llama-server -m {model} --port {port} -c {max_model_len} -ngl 999 {kv_flag}"
@@ -137,6 +141,7 @@ def build_benchmarker(
     base_model: ModelSpec,
     backend: str = "vllm",
     prompt_tokens: int = BENCHMARK_PROMPT_TOKENS,
+    prompt_text: str | None = None,
     max_tokens: int = BENCHMARK_MAX_TOKENS,
     concurrency_levels: tuple[int, ...] = BENCHMARK_CONCURRENCY,
     progress: ProgressFn | None = None,
@@ -157,6 +162,10 @@ def build_benchmarker(
             model,
             max_model_len=candidate.max_model_len,
             kv_dtype=candidate.kv_dtype,
+            speculative_config=(
+                candidate.speculative.as_config() if candidate.speculative else None
+            ),
+            speculative_tokens=(candidate.speculative.n_tokens if candidate.speculative else None),
             progress=progress,
         ) as url:
             return asyncio.run(
@@ -164,6 +173,7 @@ def build_benchmarker(
                     url=url,
                     backend=backend,
                     prompt_tokens=prompt_tokens,
+                    prompt_text=prompt_text,
                     max_tokens=max_tokens,
                     concurrency_levels=concurrency_levels,
                     ignore_eos=backend_spec.supports_ignore_eos,
@@ -184,7 +194,10 @@ def optimize(
     profile: GPUProfile | None = None,
     calibration: DatasetSpec | None = None,
     llama_cpp_dir: str | None = None,
+    llama_cpp_wrapper: str | None = None,
     launch: LaunchSpec | None = None,
+    prompt_text: str | None = None,
+    speculative: SpeculativeSpec | None = None,
     artifacts_root: Path = Path("artifacts"),
     runs_dir: Path = Path("runs"),
     methods: tuple[str, ...] | None = None,
@@ -215,6 +228,8 @@ def optimize(
         methods=methods,
         context_lengths=context_lengths,
         kv_dtypes=backend_spec.kv_dtypes,
+        speculative=speculative,
+        supports_speculative=backend_spec.supports_speculative,
         concurrency=concurrency,
         max_candidates=max_candidates,
     )
@@ -230,6 +245,7 @@ def optimize(
             launch,
             base_model=model,
             backend=backend,
+            prompt_text=prompt_text,
             progress=progress,
         )
 
@@ -243,6 +259,7 @@ def optimize(
         benchmark_fn=benchmark_fn,
         calibration=calibration,
         llama_cpp_dir=llama_cpp_dir,
+        llama_cpp_wrapper=llama_cpp_wrapper,
         stop_early=stop_early,
         store=RunStore(runs_dir),
         reuse=reuse,
@@ -250,6 +267,10 @@ def optimize(
             "prompt_tokens": BENCHMARK_PROMPT_TOKENS,
             "max_tokens": BENCHMARK_MAX_TOKENS,
             "concurrency_levels": list(BENCHMARK_CONCURRENCY),
+            # Only when there is one, so a default run keeps the key it already
+            # has on disk: no prompt file means the filler, which is what every
+            # cached benchmark was measured with.
+            **({"prompt": prompt_fingerprint(prompt_text)} if prompt_text else {}),
         },
         progress=progress,
     )

@@ -856,3 +856,47 @@ def test_a_baseline_that_never_evaluated_is_not_a_reference():
         stop_early=False,
     )
     assert optimizer.run(_small_set(n=2)).baseline_record is None
+
+
+def test_optimizer_passes_the_llama_cpp_wrapper_to_compression() -> None:
+    """--llama-cpp-wsl has to reach the compression spec.
+
+    On Windows the llama.cpp binaries are Linux executables, so a dropped
+    wrapper means the toolchain is invoked natively and fails on a flag the
+    user did set.
+    """
+    from unittest import mock
+
+    from autodistiller.candidates.generator import Candidate
+    from autodistiller.candidates.memory import MemoryEstimate
+    from autodistiller.compression.gguf import WSL_COMMAND
+
+    seen = {}
+
+    def fake_run_compression(model, spec, **kwargs):
+        seen["wrapper"] = spec.llama_cpp_wrapper
+        seen["dir"] = spec.llama_cpp_dir
+        raise RuntimeError("stop here")
+
+    optimizer = Optimizer(
+        model=ModelSpec(id="dummy/model"),
+        constraints=Constraints(),
+        llama_cpp_dir="/home/u/llama.cpp",
+        llama_cpp_wrapper=WSL_COMMAND,
+    )
+
+    candidate = Candidate(
+        method="gguf-q4-k-m",
+        max_model_len=2048,
+        kv_dtype="auto",
+        estimate=MemoryEstimate(weights_bytes=1, kv_cache_bytes=1, overhead_bytes=1),
+    )
+
+    with (
+        mock.patch("autodistiller.optimize.pipeline.run_compression", fake_run_compression),
+        pytest.raises(RuntimeError, match="stop here"),
+    ):
+        optimizer._default_compress(candidate)
+
+    assert seen["wrapper"] == WSL_COMMAND
+    assert seen["dir"] == "/home/u/llama.cpp"

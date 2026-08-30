@@ -97,6 +97,40 @@ class LaunchSpec:
     default, so the common case stays flagless.
     """
 
+    speculative_flag_template: str = "--speculative-config '{config}'"
+    """How this runtime is handed a speculative draft. Backend-specific, like
+    ``kv_flag_template``, and unused when nothing is speculating."""
+
+    gpu_memory_utilization: float | None = None
+    """Fraction of the device the runtime may claim.
+
+    Left to the runtime's own default when unset. vLLM fills to this number
+    whatever the model's size, so a fixed value makes measured peak VRAM a
+    readout of the flag rather than of the candidate: a 2.47 GiB model and a
+    4.11 GiB one both come back at 7.9 GiB on an 8 GiB card, and a VRAM budget
+    tighter than the flag can never be satisfied by any candidate.
+    """
+
+    max_num_seqs: int | None = None
+    """Sequences the server is sized for.
+
+    The memory estimate is computed for a concurrency; unless the launch says
+    the same number, the runtime picks its own -- vLLM defaults to 128 -- and
+    allocates for that instead, so the estimate describes a server nobody
+    started. It also bounds the draft token slots below.
+    """
+
+    nested_shell: bool = False
+    """Whether the far side re-parses this command with its own shell.
+
+    A WSL launch is ``wsl -d Ubuntu -e bash -lc "..."``: the command reaches
+    bash as the contents of a double-quoted string, so any double quote inside
+    it has to arrive escaped. Speculative config is JSON, which is nothing but
+    double quotes -- unescaped, bash strips them and vLLM is handed
+    ``{method: dflash}``, which is not JSON and fails with an error naming
+    neither the cause nor the quoting.
+    """
+
     stop_template: str | None = None
     """How to stop the server, when killing the launched process is not enough.
 
@@ -107,11 +141,43 @@ class LaunchSpec:
     """
 
     def command_for(
-        self, model: str, *, max_model_len: int | None = None, kv_dtype: str = "auto"
+        self,
+        model: str,
+        *,
+        max_model_len: int | None = None,
+        kv_dtype: str = "auto",
+        speculative_config: str | None = None,
+        speculative_tokens: int | None = None,
     ) -> str:
         # kv_dtype is passed as the backend's flag only when it is not the
         # default, so templates stay readable for the common case.
         kv_flag = "" if kv_dtype == "auto" else self.kv_flag_template.format(kv_dtype=kv_dtype)
+
+        util_flag = (
+            ""
+            if self.gpu_memory_utilization is None
+            else f"--gpu-memory-utilization {self.gpu_memory_utilization:.3f}"
+        )
+        seqs_flag = "" if self.max_num_seqs is None else f"--max-num-seqs {self.max_num_seqs}"
+
+        spec_flag = ""
+        if speculative_config:
+            config = (
+                speculative_config.replace('"', '\\"') if self.nested_shell else speculative_config
+            )
+            spec_flag = self.speculative_flag_template.format(config=config)
+
+            # Every sequence reserves one slot per draft token plus one for the
+            # verified token, taken out of the batched-token budget. vLLM refuses
+            # to start when that leaves nothing to schedule -- observed as
+            # "max_num_scheduled_tokens is set to -1536", which is
+            # 512 - (15 + 1) * 128 with its own defaults. Ask for the draft slots
+            # plus a full prefill so the sum cannot go negative.
+            if self.max_num_seqs and speculative_tokens:
+                slots = (speculative_tokens + 1) * self.max_num_seqs
+                budget = slots + (max_model_len or 2048)
+                spec_flag += f" --max-num-batched-tokens {budget}"
+
         if self.path_translator is not None:
             model = self.path_translator(model)
         return self.template.format(
@@ -120,6 +186,9 @@ class LaunchSpec:
             max_model_len=max_model_len or "",
             kv_dtype=kv_dtype,
             kv_flag=kv_flag,
+            spec_flag=spec_flag,
+            util_flag=util_flag,
+            seqs_flag=seqs_flag,
         )
 
 
@@ -289,6 +358,8 @@ def serving(
     *,
     max_model_len: int | None = None,
     kv_dtype: str = "auto",
+    speculative_config: str | None = None,
+    speculative_tokens: int | None = None,
     progress: ProgressFn | None = None,
 ) -> Iterator[str]:
     """Start a server, yield its URL, and always shut it down.
@@ -299,7 +370,13 @@ def serving(
     # Before spending a minute starting something that can never be reached.
     check_port_is_free(spec.url)
 
-    command = spec.command_for(model, max_model_len=max_model_len, kv_dtype=kv_dtype)
+    command = spec.command_for(
+        model,
+        max_model_len=max_model_len,
+        kv_dtype=kv_dtype,
+        speculative_config=speculative_config,
+        speculative_tokens=speculative_tokens,
+    )
     if progress is not None:
         progress(f"starting {model} ({command[:80]}{'...' if len(command) > 80 else ''})")
 

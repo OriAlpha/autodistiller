@@ -63,6 +63,8 @@ class MemoryEstimate:
     kv_cache_bytes: int
     overhead_bytes: int
     budget_bytes: int | None = None
+    draft_bytes: int = 0
+    """Part of ``weights_bytes``, held separately so the report can name it."""
 
     @property
     def total_bytes(self) -> int:
@@ -90,10 +92,12 @@ class MemoryEstimate:
 
     def describe(self) -> str:
         parts = [
-            f"weights {self.weights_bytes / BYTES_PER_GIB:.2f}",
+            f"weights {(self.weights_bytes - self.draft_bytes) / BYTES_PER_GIB:.2f}",
             f"KV {self.kv_cache_bytes / BYTES_PER_GIB:.2f}",
             f"overhead {self.overhead_bytes / BYTES_PER_GIB:.2f}",
         ]
+        if self.draft_bytes:
+            parts.insert(1, f"draft {self.draft_bytes / BYTES_PER_GIB:.2f}")
         text = f"{self.total_gib:.2f} GiB ({', '.join(parts)})"
         if self.budget_bytes:
             text += f" of {self.budget_bytes / BYTES_PER_GIB:.2f} GiB"
@@ -185,9 +189,15 @@ def estimate_memory(
     kv_dtype: str = "auto",
     budget_bytes: int | None = None,
     overhead_fraction: float = RUNTIME_OVERHEAD_FRACTION,
+    draft_bytes: int = 0,
 ) -> MemoryEstimate:
-    """Estimate device memory for one configuration."""
-    weights = weight_bytes(shape, method)
+    """Estimate device memory for one configuration.
+
+    ``draft_bytes`` is a speculative decoding draft model, which sits on the
+    device beside the target for the whole run. It is counted with the weights
+    because that is what it is -- a second set of them.
+    """
+    weights = weight_bytes(shape, method) + draft_bytes
     kv = kv_cache_bytes(
         shape, max_model_len=max_model_len, concurrency=concurrency, kv_dtype=kv_dtype
     )
@@ -202,6 +212,7 @@ def estimate_memory(
         kv_cache_bytes=kv,
         overhead_bytes=overhead,
         budget_bytes=budget_bytes,
+        draft_bytes=draft_bytes,
     )
 
 

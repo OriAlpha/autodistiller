@@ -22,6 +22,7 @@ from ..compression.methods import METHODS, CompressionMethod, check_method, reso
 from ..metadata.profiles import GPUProfile
 from .memory import MemoryEstimate, estimate_memory
 from .shape import ModelShape
+from .speculative import SpeculativeSpec
 
 DEFAULT_CONTEXT_LENGTHS = (2048, 4096, 8192)
 DEFAULT_MAX_CANDIDATES = 25
@@ -39,6 +40,11 @@ class Candidate:
     max_model_len: int
     kv_dtype: str
     estimate: MemoryEstimate
+    speculative: SpeculativeSpec | None = None
+    """A draft model to decode with, or None to decode normally.
+
+    Orthogonal to ``method``: speculation does not change the target's weights,
+    so it composes with every compression method rather than replacing one."""
 
     @property
     def is_baseline(self) -> bool:
@@ -48,7 +54,8 @@ class Candidate:
     def id(self) -> str:
         method = self.method or "baseline"
         kv = "" if self.kv_dtype == "auto" else f"-kv{self.kv_dtype}"
-        return f"{method}-ctx{self.max_model_len}{kv}"
+        spec = f"-{self.speculative.label}" if self.speculative else ""
+        return f"{method}-ctx{self.max_model_len}{kv}{spec}"
 
     def describe(self) -> str:
         return f"{self.id}: {self.estimate.describe()}"
@@ -101,13 +108,14 @@ def _sort_key(candidate: Candidate) -> tuple:
     everything else is measured against it.
     """
     if candidate.method is None:
-        return (0, 0, 0, candidate.max_model_len)
+        return (0, 0, 0, candidate.max_model_len, "")
     method = METHODS[candidate.method]
     return (
         1,
         -method.weight_bits,
         -method.activation_bits,
         candidate.max_model_len,
+        candidate.speculative.label if candidate.speculative else "",
     )
 
 
@@ -128,6 +136,8 @@ def generate_candidates(
     methods: tuple[str, ...] | None = None,
     context_lengths: tuple[int, ...] | None = None,
     kv_dtypes: tuple[str, ...] = KV_DTYPES,
+    speculative: SpeculativeSpec | None = None,
+    supports_speculative: bool = True,
     concurrency: int = 1,
     include_baseline: bool = True,
     max_candidates: int = DEFAULT_MAX_CANDIDATES,
@@ -149,44 +159,60 @@ def generate_candidates(
         concurrency=concurrency,
     )
 
+    # None first: speculation is a second point on the same compression recipe,
+    # and the sort below keeps the pair adjacent so the comparison is readable.
+    speculations: list[SpeculativeSpec | None] = [None]
+    if speculative is not None:
+        speculations.append(speculative)
+
     for method in chosen:
         for max_model_len in _context_lengths(shape, context_lengths):
             for kv_dtype in kv_dtypes:
-                reasons: list[str] = []
+                for spec in speculations:
+                    reasons: list[str] = []
 
-                if method is not None:
-                    availability = check_method(method, profile=profile, backend=backend)
-                    reasons.extend(availability.reasons)
+                    if method is not None:
+                        availability = check_method(method, profile=profile, backend=backend)
+                        reasons.extend(availability.reasons)
 
-                # An FP8 KV cache is its own hardware requirement, independent
-                # of how the weights are stored.
-                if kv_dtype == "fp8" and profile is not None and "fp8" not in profile.capabilities:
-                    reasons.append(f"hardware: {profile.name} has no fp8 for the KV cache")
+                    # An FP8 KV cache is its own hardware requirement, independent
+                    # of how the weights are stored.
+                    if (
+                        kv_dtype == "fp8"
+                        and profile is not None
+                        and "fp8" not in profile.capabilities
+                    ):
+                        reasons.append(f"hardware: {profile.name} has no fp8 for the KV cache")
 
-                estimate = estimate_memory(
-                    shape,
-                    method,
-                    max_model_len=max_model_len,
-                    concurrency=concurrency,
-                    kv_dtype=kv_dtype,
-                    budget_bytes=budget_bytes,
-                )
-                if not estimate.fits:
-                    reasons.append(
-                        f"memory: needs {estimate.total_gib:.2f} GiB of "
-                        f"{(budget_bytes or 0) / (1024**3):.2f} GiB"
+                    if spec is not None and not supports_speculative:
+                        reasons.append(f"backend: {backend} cannot run {spec.method} drafts")
+
+                    estimate = estimate_memory(
+                        shape,
+                        method,
+                        max_model_len=max_model_len,
+                        concurrency=concurrency,
+                        kv_dtype=kv_dtype,
+                        budget_bytes=budget_bytes,
+                        draft_bytes=spec.weights_bytes if spec else 0,
                     )
+                    if not estimate.fits:
+                        reasons.append(
+                            f"memory: needs {estimate.total_gib:.2f} GiB of "
+                            f"{(budget_bytes or 0) / (1024**3):.2f} GiB"
+                        )
 
-                candidate = Candidate(
-                    method=method.name if method else None,
-                    max_model_len=max_model_len,
-                    kv_dtype=kv_dtype,
-                    estimate=estimate,
-                )
-                if reasons:
-                    result.rejected.append(Rejection(candidate, tuple(reasons)))
-                else:
-                    result.accepted.append(candidate)
+                    candidate = Candidate(
+                        method=method.name if method else None,
+                        max_model_len=max_model_len,
+                        kv_dtype=kv_dtype,
+                        estimate=estimate,
+                        speculative=spec,
+                    )
+                    if reasons:
+                        result.rejected.append(Rejection(candidate, tuple(reasons)))
+                    else:
+                        result.accepted.append(candidate)
 
     result.accepted.sort(key=_sort_key)
     if len(result.accepted) > max_candidates:
@@ -200,27 +226,38 @@ def generate_candidates(
 
 
 def _trim(candidates: list[Candidate], limit: int) -> tuple[list[Candidate], list[Candidate]]:
-    """Cut the list to ``limit`` while keeping every method represented.
+    """Cut the list to ``limit`` while keeping every family represented.
 
     Truncating the sorted list would be simpler and wrong: the sort puts the
     least lossy methods first, so the cap would drop the entire 4-bit family --
     exactly the candidates a memory-constrained search is for. Taking one per
-    method in rotation keeps the space broad, then deepens it.
+    family in rotation keeps the space broad, then deepens it.
+
+    A family is a method *and* whether it speculates. Rotating on the method
+    alone has the same failure in the other direction: a speculative candidate
+    shares its method with its plain twin and sorts after it, so one queue per
+    method fills every slot with plain candidates and drops the entire
+    speculative half before anything is measured -- silently, and precisely when
+    the user asked for the comparison by naming a draft.
     """
-    by_method: dict[str | None, list[Candidate]] = {}
+    by_family: dict[tuple[str | None, str | None], list[Candidate]] = {}
     for candidate in candidates:
-        by_method.setdefault(candidate.method, []).append(candidate)
+        family = (
+            candidate.method,
+            candidate.speculative.label if candidate.speculative else None,
+        )
+        by_family.setdefault(family, []).append(candidate)
 
     kept: list[Candidate] = []
-    while len(kept) < limit and any(by_method.values()):
-        for queue in by_method.values():
+    while len(kept) < limit and any(by_family.values()):
+        for queue in by_family.values():
             if not queue:
                 continue
             kept.append(queue.pop(0))
             if len(kept) >= limit:
                 break
 
-    dropped = [c for queue in by_method.values() for c in queue]
+    dropped = [c for queue in by_family.values() for c in queue]
     kept.sort(key=_sort_key)
     return kept, dropped
 

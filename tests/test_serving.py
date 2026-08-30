@@ -837,3 +837,101 @@ def test_a_long_startup_log_is_truncated_to_its_tail():
         assert "final cause" in tail
         assert "line 0" not in tail
         assert tail.count("\n") <= 5
+
+
+def test_prompt_file_replaces_the_filler_and_moves_the_cache_key(tmp_path) -> None:
+    """Acceptance rate is a property of the text, so the prompt is part of the key.
+
+    A default run must keep the key it already has on disk, though: no prompt
+    file means the filler, which is what every cached benchmark was measured
+    with.
+    """
+    from autodistiller.optimize.command import (
+        BENCHMARK_CONCURRENCY,
+        BENCHMARK_MAX_TOKENS,
+        BENCHMARK_PROMPT_TOKENS,
+    )
+    from autodistiller.serving.benchmark import prompt_fingerprint, read_prompt
+
+    path = tmp_path / "traffic.txt"
+    path.write_text("  Summarize the following support ticket:\n\n", encoding="utf-8")
+    assert read_prompt(path) == "Summarize the following support ticket:"
+
+    empty = tmp_path / "empty.txt"
+    empty.write_text("   \n", encoding="utf-8")
+    with pytest.raises(ValueError, match="empty"):
+        read_prompt(empty)
+
+    def settings(prompt: str | None) -> dict:
+        return {
+            "prompt_tokens": BENCHMARK_PROMPT_TOKENS,
+            "max_tokens": BENCHMARK_MAX_TOKENS,
+            "concurrency_levels": list(BENCHMARK_CONCURRENCY),
+            **({"prompt": prompt_fingerprint(prompt)} if prompt else {}),
+        }
+
+    assert settings("ticket text") != settings("code review text")
+    assert "prompt" not in settings(None)
+
+
+def test_speculative_json_survives_a_nested_shell() -> None:
+    """A WSL launch reaches bash as the contents of a double-quoted string.
+
+    Speculative config is JSON, which is nothing but double quotes. Unescaped,
+    bash strips them and vLLM is handed `{method: dflash}` -- not JSON, and it
+    fails with an error naming neither the cause nor the quoting. Verified
+    against the real cmd.exe -> wsl -> bash chain, not reasoned about.
+    """
+    from autodistiller.candidates.speculative import SpeculativeSpec
+    from autodistiller.serving.launcher import LaunchSpec
+
+    spec = SpeculativeSpec(method="dflash", model="z-lab/X-DFlash", n_tokens=15)
+    template = 'wsl -e bash -lc "vllm serve {model} --port {port} {spec_flag}"'
+
+    nested = LaunchSpec(template=template, nested_shell=True)
+    assert '\\"method\\"' in nested.command_for("m", speculative_config=spec.as_config())
+
+    direct = LaunchSpec(template="vllm serve {model} {spec_flag}", nested_shell=False)
+    command = direct.command_for("m", speculative_config=spec.as_config())
+    assert '"method": "dflash"' in command
+    assert "\\" not in command
+
+    # Nothing speculating leaves the command exactly as it was.
+    assert direct.command_for("m").strip() == "vllm serve m"
+
+
+def test_speculative_launch_leaves_room_to_schedule() -> None:
+    """Draft slots come out of the batched-token budget.
+
+    Every sequence reserves one slot per draft token plus one for the verified
+    token. vLLM refuses to start when that leaves nothing to schedule -- observed
+    as "max_num_scheduled_tokens is set to -1536", which is 512 - (15+1)*128
+    under its own defaults.
+    """
+    from autodistiller.candidates.speculative import SpeculativeSpec
+    from autodistiller.serving.launcher import LaunchSpec
+
+    spec = SpeculativeSpec(method="dflash", model="d", n_tokens=15)
+    launch = LaunchSpec(
+        template="vllm serve {model} {seqs_flag} {util_flag} {spec_flag}",
+        max_num_seqs=8,
+        gpu_memory_utilization=0.87,
+    )
+
+    command = launch.command_for(
+        "m", max_model_len=2048, speculative_config=spec.as_config(), speculative_tokens=15
+    )
+    assert "--max-num-seqs 8" in command
+    assert "--gpu-memory-utilization 0.870" in command
+
+    batched = int(command.split("--max-num-batched-tokens ")[1].split()[0])
+    assert batched - (15 + 1) * 8 > 0, "vLLM would refuse to start"
+
+    # Not speculating: no draft budget, and the other flags stand alone.
+    plain = launch.command_for("m", max_model_len=2048)
+    assert "--max-num-batched-tokens" not in plain
+    assert "--max-num-seqs 8" in plain
+
+    # Unset means the runtime keeps its own defaults.
+    bare = LaunchSpec(template="vllm serve {model} {seqs_flag} {util_flag}")
+    assert bare.command_for("m").split() == ["vllm", "serve", "m"]

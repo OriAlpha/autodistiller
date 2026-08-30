@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -43,7 +44,7 @@ from .config import (
 )
 from .evaluation.registry import PRESETS, resolve_tasks
 from .metadata.environment import collect_environment
-from .metadata.hardware import detect_hardware
+from .metadata.hardware import detect_hardware, device_vram_bytes
 from .metadata.profiles import PROFILES, GPUProfile, profile_from_gpu, resolve_profile
 from .regression import DEFAULT_MIN_RETENTION, compare_runs
 from .reporting.console import (
@@ -62,7 +63,7 @@ from .reporting.console import (
 )
 from .results import ModelInfo, RunRecord
 from .runner import RunObserver, preflight, run_evaluation
-from .store import RunStore, make_run_id
+from .store import RunStore
 
 app = typer.Typer(
     name="autodistiller",
@@ -682,11 +683,16 @@ def candidates(
     profile_name: str | None = typer.Option(
         None, "--profile", help="Target a GPU you do not have, e.g. a100-80gb"
     ),
+    speculative: str | None = typer.Option(
+        None, "--speculative", help="A DFlash draft checkpoint trained for this model"
+    ),
+    speculative_tokens: int | None = typer.Option(None, "--speculative-tokens"),
     as_json: bool = typer.Option(False, "--json"),
 ) -> None:
     """Generate the search space: what is worth measuring, and what is not."""
     from .candidates import generate_candidates, load_shape
     from .candidates.memory import parse_size
+    from .candidates.speculative import resolve_speculative
     from .serving.backends import resolve_backend
 
     try:
@@ -718,6 +724,13 @@ def candidates(
         except ValueError as exc:
             raise typer.BadParameter(f"--context must be integers: {exc}") from exc
 
+    draft = None
+    if speculative is not None:
+        try:
+            draft = resolve_speculative(speculative, n_tokens=speculative_tokens)
+        except (OSError, ValueError) as exc:
+            raise typer.BadParameter(f"--speculative: {exc}") from exc
+
     try:
         result = generate_candidates(
             shape,
@@ -728,6 +741,8 @@ def candidates(
             context_lengths=context_lengths,
             # KV cache types are backend-specific; llama.cpp has no fp8.
             kv_dtypes=resolve_backend(backend).kv_dtypes,
+            speculative=draft,
+            supports_speculative=resolve_backend(backend).supports_speculative,
             concurrency=concurrency,
             include_baseline=not no_baseline,
             max_candidates=max_candidates,
@@ -792,6 +807,9 @@ def optimize(
         None, "--min-quality", help="Percent of baseline quality to retain, e.g. 95"
     ),
     max_ttft_ms: float | None = typer.Option(None, "--max-ttft-ms"),
+    max_tpot_ms: float | None = typer.Option(
+        None, "--max-tpot-ms", help="Time per output token after the first, p50"
+    ),
     min_throughput: float | None = typer.Option(
         None, "--min-throughput", help="Tokens per second at peak concurrency"
     ),
@@ -815,6 +833,25 @@ def optimize(
         "--llama-cpp-wsl",
         help="Run the llama.cpp toolchain inside WSL. Required on Windows, where "
         "its binaries are Linux executables.",
+    ),
+    prompt_file: Path | None = typer.Option(
+        None,
+        "--prompt-file",
+        help="Benchmark with this text instead of generated filler. Use it when the "
+        "measurement depends on what the prompt says, not only how long it is.",
+    ),
+    speculative: str | None = typer.Option(
+        None,
+        "--speculative",
+        help="A DFlash draft checkpoint trained for this model, e.g. "
+        "z-lab/Qwen3.6-27B-DFlash. Each candidate is then measured both with and "
+        "without it. Named, never guessed: a draft belongs to one target.",
+    ),
+    speculative_tokens: int | None = typer.Option(
+        None,
+        "--speculative-tokens",
+        help="Tokens the draft proposes per step. Defaults to the checkpoint's own "
+        "block size minus one.",
     ),
     concurrency: int = typer.Option(8, "--concurrency", help="Sequences the KV cache must hold"),
     context: str | None = typer.Option(
@@ -857,6 +894,8 @@ def optimize(
     _configure_logging(verbose)
 
     from .candidates.memory import parse_size
+    from .candidates.speculative import resolve_speculative
+    from .compression.gguf import WSL_COMMAND
     from .optimize.command import (
         NATIVE_LLAMACPP_TEMPLATE,
         NATIVE_VLLM_TEMPLATE,
@@ -867,6 +906,7 @@ def optimize(
     )
     from .optimize.command import optimize as run_optimize
     from .optimize.constraints import Constraints, Objective
+    from .serving.benchmark import read_prompt
     from .serving.launcher import LaunchSpec, wsl_path
 
     try:
@@ -890,6 +930,7 @@ def optimize(
         min_quality_retention=min_quality / 100 if min_quality is not None else None,
         max_vram_bytes=budget,
         max_ttft_s=max_ttft_ms / 1000 if max_ttft_ms is not None else None,
+        max_tpot_s=max_tpot_ms / 1000 if max_tpot_ms is not None else None,
         min_throughput_tokens_per_s=min_throughput,
     )
 
@@ -922,8 +963,19 @@ def optimize(
     # A WSL launch crosses a process boundary, so terminating the launcher does
     # not stop the server; it needs an explicit stop command.
     stops = {WSL_VLLM_TEMPLATE: WSL_VLLM_STOP, WSL_LLAMACPP_TEMPLATE: WSL_LLAMACPP_STOP}
-    is_wsl = template in stops
+    # Matched on how the command starts, not on being one of the presets: a
+    # hand-written `wsl ...` line crosses the same boundary and needs the same
+    # path translation, and a Windows path handed to a Linux server is written
+    # nowhere rather than refused.
+    is_wsl = template is not None and template.lstrip().startswith("wsl ")
     stop = stops.get(template) if template else None
+    if is_wsl and stop is None:
+        # No way to name the process on the far side of a custom launch line.
+        console.print(
+            "[yellow]note:[/yellow] this launch crosses into WSL, and killing wsl.exe does "
+            "not reach the server inside it. Each candidate's server may survive teardown "
+            "and hold the GPU. Use --launch-preset for a launch that stops itself."
+        )
     launch = (
         LaunchSpec(
             template=template,
@@ -932,6 +984,10 @@ def optimize(
             url=f"http://localhost:{port or backend_spec.default_port}",
             # The KV cache flag is not the same word in every runtime.
             kv_flag_template=backend_spec.kv_flag_template,
+            speculative_flag_template=backend_spec.speculative_flag_template,
+            # A WSL launch reaches bash as a double-quoted string, so JSON in the
+            # command has to arrive with its quotes escaped.
+            nested_shell=is_wsl,
             # Artifact paths are local; the server is not.
             path_translator=wsl_path if is_wsl else None,
         )
@@ -951,8 +1007,32 @@ def optimize(
         except ValueError as exc:
             raise typer.BadParameter(f"--context must be integers: {exc}") from exc
 
+    prompt_text = None
+    if prompt_file is not None:
+        try:
+            prompt_text = read_prompt(prompt_file)
+        except (OSError, ValueError) as exc:
+            raise typer.BadParameter(f"--prompt-file: {exc}") from exc
+
+    draft = None
+    if speculative is not None:
+        if not backend_spec.supports_speculative:
+            raise typer.BadParameter(f"--speculative: {backend} cannot serve a draft model")
+        try:
+            draft = resolve_speculative(speculative, n_tokens=speculative_tokens)
+        except (OSError, ValueError) as exc:
+            raise typer.BadParameter(f"--speculative: {exc}") from exc
+        console.print(f"[dim]|[/dim] {draft.describe()}")
+
     hardware = detect_hardware()
     profile = profile_from_gpu(hardware.gpus[0]) if hardware.gpus else None
+
+    if launch is not None:
+        launch = replace(
+            launch,
+            max_num_seqs=concurrency,
+            gpu_memory_utilization=_gpu_utilization(budget, say=console.print),
+        )
 
     try:
         result = run_optimize(
@@ -964,7 +1044,10 @@ def optimize(
             profile=profile,
             calibration=calibration_spec,
             llama_cpp_dir=llama_cpp_dir,
+            llama_cpp_wrapper=WSL_COMMAND if llama_cpp_wsl else None,
             launch=launch,
+            prompt_text=prompt_text,
+            speculative=draft,
             artifacts_root=artifacts_root,
             runs_dir=output_dir,
             methods=tuple(method) if method else None,
@@ -1016,6 +1099,64 @@ def optimize(
     # point it at. `autodistiller export <run-id>` covers the in-place case.
     if export_dir is not None:
         _export_recommendation(result, backend=backend, output_dir=export_dir)
+
+
+CUDA_CONTEXT_RESERVE_BYTES = 1024**3
+"""VRAM the serving process needs before it holds a single weight.
+
+A runtime's own CUDA context, kernels and allocator arena are not free, and they
+are taken *before* it checks whether the memory it was promised is available.
+Measured on this machine: 7.71 GiB free at idle, 6.83 GiB free once vLLM had
+started -- so about 0.88 GiB went to the context, rounded up here.
+
+A fraction of free memory cannot express that. It is a roughly fixed cost, so it
+is subtracted as one, and it is the difference between a server that starts and
+one that exits with "Free memory on device cuda:0 (6.83/7.96 GiB) on startup is
+less than desired GPU memory utilization".
+
+# ponytail: one measured constant, not a probe. Raise it if a runtime with a
+# heavier context refuses to start on a budget that should have fit.
+"""
+
+
+def _gpu_utilization(budget_bytes: int | None, *, say) -> float | None:
+    """The fraction of the device a server may claim, given a VRAM budget.
+
+    Derived from the budget rather than fixed, because a runtime fills to this
+    number whatever the model's size: pinned, it makes measured peak VRAM a
+    readout of the flag and a budget below it unsatisfiable by any candidate.
+
+    Bounded by what is free *after* the runtime's own context, not by what the
+    card has. The total is not the availability -- a running desktop holds some
+    and the server itself takes more -- and asking for the difference is refused
+    at startup rather than trimmed.
+    """
+    reading = device_vram_bytes(0)
+    if reading is None:
+        return None
+
+    free, total = reading
+    headroom = max(free - CUDA_CONTEXT_RESERVE_BYTES, 0)
+    usable = min(budget_bytes, headroom) if budget_bytes else headroom
+
+    if usable <= 0:
+        say(
+            f"[yellow]note:[/yellow] only {free / 1024**3:.2f} GiB is free, which "
+            f"leaves nothing after the runtime's own context. Close what else is "
+            f"on the GPU."
+        )
+        return None
+
+    if budget_bytes and budget_bytes > headroom:
+        say(
+            f"[yellow]note:[/yellow] {free / 1024**3:.2f} GiB of "
+            f"{total / 1024**3:.2f} GiB is free and the serving runtime needs about "
+            f"{CUDA_CONTEXT_RESERVE_BYTES / 1024**3:.2f} GiB for its own context, so "
+            f"the server is capped at {usable / 1024**3:.2f} GiB rather than the "
+            f"{budget_bytes / 1024**3:.2f} GiB budget."
+        )
+
+    return usable / total
 
 
 def _export_recommendation(result, *, backend: str, output_dir: Path | None) -> None:
@@ -1112,6 +1253,12 @@ def benchmark(
         None, "--served-model", help="Defaults to whatever the endpoint reports"
     ),
     prompt_tokens: int = typer.Option(256, help="Approximate prompt length"),
+    prompt_file: Path | None = typer.Option(
+        None,
+        "--prompt-file",
+        help="Send this text instead of generated filler. Use it when the measurement "
+        "depends on what the prompt says, not only how long it is.",
+    ),
     max_tokens: int = typer.Option(128, help="Output tokens per request"),
     concurrency: str = typer.Option("1,4,16", help="Comma-separated concurrency levels"),
     requests: int | None = typer.Option(
@@ -1127,7 +1274,7 @@ def benchmark(
     import asyncio
 
     from .serving.backends import resolve_backend
-    from .serving.benchmark import run_deployment_benchmark
+    from .serving.benchmark import read_prompt, run_deployment_benchmark
 
     try:
         chosen = resolve_backend(backend)
@@ -1141,11 +1288,19 @@ def benchmark(
     if not levels:
         raise typer.BadParameter("--concurrency needs at least one level")
 
+    prompt_text = None
+    if prompt_file is not None:
+        try:
+            prompt_text = read_prompt(prompt_file)
+        except (OSError, ValueError) as exc:
+            raise typer.BadParameter(f"--prompt-file: {exc}") from exc
+
     spec = DeploymentSpec(
         backend=chosen.name,
         endpoint=endpoint,
         served_model=served_model,
         prompt_tokens=prompt_tokens,
+        prompt_file=prompt_file,
         max_tokens=max_tokens,
         concurrency_levels=list(levels),
         requests_per_level=requests,
@@ -1160,6 +1315,7 @@ def benchmark(
                 backend=spec.backend,
                 model=spec.served_model,
                 prompt_tokens=spec.prompt_tokens,
+                prompt_text=prompt_text,
                 max_tokens=spec.max_tokens,
                 concurrency_levels=tuple(spec.concurrency_levels),
                 requests_per_level=spec.requests_per_level,
@@ -1188,8 +1344,12 @@ def benchmark(
         config = RunConfig(
             model=ModelSpec(id=result.served_model), deployment=spec, output_dir=output_dir
         )
+        store = RunStore(output_dir)
         record = RunRecord(
-            run_id=make_run_id(config),
+            # Through the store, which owns the namespace: run ids are stamped to
+            # the second, so two benchmarks of one config in the same second would
+            # otherwise write the second straight over the first.
+            run_id=store.new_run_id(config),
             config=config,
             config_fingerprint=config.fingerprint,
             model=ModelInfo(id=result.served_model),
@@ -1197,7 +1357,7 @@ def benchmark(
             environment=collect_environment(),
             deployment=result,
         )
-        directory = RunStore(output_dir).save(record)
+        directory = store.save(record)
         console.print(f"[dim]|[/dim] Saved run to {directory}")
 
 

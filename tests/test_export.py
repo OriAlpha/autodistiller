@@ -427,3 +427,25 @@ def test_the_readme_reports_a_failed_check(tmp_path):
     directory = _lay_down_artifact(tmp_path / "art", tokenizer=False)
     readme = render_readme(build_manifest(_record(tmp_path, model_id=str(directory))))
     assert "FAIL tokenizer" in readme
+
+
+def test_serve_command_names_the_gguf_file_and_the_context_length(tmp_path) -> None:
+    """llama-server takes the .gguf, not the directory holding it.
+
+    And a serve command without --max-model-len lets the runtime default to the
+    config's advertised context, which is how a bundle that benchmarked inside
+    8 GiB OOMs on the machine it was exported to.
+    """
+    from autodistiller.export import _serve_command
+
+    artifact = tmp_path / "artifact"
+    artifact.mkdir()
+    (artifact / "model.gguf").write_bytes(b"GGUF")
+
+    command = _serve_command("llama.cpp", str(artifact), 4096)
+    assert "model.gguf" in command
+    assert "-c 4096" in command
+
+    # vLLM is pointed at the directory, and still gets the context length.
+    command = _serve_command("vllm", str(artifact), 4096)
+    assert "--max-model-len 4096" in command

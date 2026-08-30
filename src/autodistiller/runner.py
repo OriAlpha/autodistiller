@@ -126,7 +126,7 @@ def run_evaluation(
     # and a cache hit should not need a dataset to be reachable at all.
     hardware = detect_hardware()
     environment = collect_environment()
-    key = experiment_key(config.fingerprint, hardware, environment)
+    key = experiment_key(config.evaluation_fingerprint, hardware, environment)
 
     if reuse and (cached := store.find_experiment(key)) is not None:
         observer.stage(f"Reusing {cached.run_id}: identical config, hardware and stack")

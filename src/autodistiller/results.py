@@ -203,6 +203,8 @@ class DeploymentBenchmark(BaseModel):
     served_model: str
     is_deployment_claim: bool = True
     prompt_tokens_requested: int = 0
+    prompt_fingerprint: str | None = None
+    """Set when a real prompt was used instead of the generated filler."""
     max_tokens: int = 0
     phases: list[ConcurrencyResult] = Field(default_factory=list)
     device_total_vram_bytes: int | None = None

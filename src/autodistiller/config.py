@@ -148,6 +148,13 @@ class DeploymentSpec(StrictModel):
         default=None, description="Defaults to whatever the endpoint reports serving"
     )
     prompt_tokens: int = Field(default=256, ge=1)
+    prompt_file: Path | None = Field(
+        default=None,
+        description=(
+            "Benchmark with this text instead of generated filler. Matters for "
+            "speculative decoding, whose speedup depends on the prompt's content."
+        ),
+    )
     max_tokens: int = Field(default=128, ge=1)
     concurrency_levels: list[int] = Field(default_factory=lambda: [1, 4, 16])
     requests_per_level: int | None = Field(default=None, ge=1)
@@ -245,6 +252,25 @@ class RunConfig(StrictModel):
     @property
     def fingerprint(self) -> str:
         payload = self.model_dump(mode="json", exclude=set(self._HASH_EXCLUDED))
+        return hash_obj(payload)
+
+    @property
+    def evaluation_fingerprint(self) -> str:
+        """Identity of what an evaluation actually measures.
+
+        The two cache keys are only separable if changing one cannot invalidate
+        the other, and a perplexity number does not depend on the concurrency
+        sweep, the endpoint or the request shape. Keying an evaluation on the
+        full config makes a deployment tweak discard measurements it did not
+        touch, which is the thing :mod:`autodistiller.cache` exists to prevent.
+
+        The section is neutralized rather than dropped, so the digest still
+        matches every key already on disk: those were all written from configs
+        that carry no deployment section, and dropping the field outright would
+        change their hash for no reason.
+        """
+        payload = self.model_dump(mode="json", exclude=set(self._HASH_EXCLUDED))
+        payload["deployment"] = None
         return hash_obj(payload)
 
     # Serialization

@@ -49,6 +49,7 @@ from ..results import (
     ModelInfo,
     RunRecord,
 )
+from ..serving.launcher import LaunchSpec
 from ..store import RunStore
 from .constraints import Constraints, Objective, Score, score_candidate, search_order
 from .pareto import ParetoReport
@@ -336,6 +337,8 @@ class Optimizer:
         compress_fn: Callable[[Candidate], CompressionArtifact] | None = None,
         calibration=None,
         llama_cpp_dir: str | None = None,
+        llama_cpp_wrapper: str | None = None,
+        launch: LaunchSpec | None = None,
         stop_early: bool = True,
         store: RunStore | None = None,
         reuse: bool = True,
@@ -352,6 +355,8 @@ class Optimizer:
         self.compress_fn = compress_fn or self._default_compress
         self.calibration = calibration
         self.llama_cpp_dir = llama_cpp_dir
+        self.llama_cpp_wrapper = llama_cpp_wrapper
+        self.launch = launch
         self.stop_early = stop_early
         self.store = store
         self.reuse = reuse
@@ -375,6 +380,7 @@ class Optimizer:
             method=candidate.method,
             calibration=self.calibration,
             llama_cpp_dir=self.llama_cpp_dir,
+            llama_cpp_wrapper=self.llama_cpp_wrapper,
             output_dir=None,
         )
         return run_compression(self.model, spec, output_root=self.artifacts_root, reuse=self.reuse)
@@ -559,6 +565,13 @@ class Optimizer:
         driven. Context length and KV dtype are candidate properties rather than
         benchmark settings, but they are launch flags, so a change to either
         means a different server and a different measurement.
+
+        The same is true of every other flag the launch carries. Memory
+        utilization decides how much device the runtime claims and sequence
+        count decides what it sizes its cache for -- both move the numbers, so
+        both belong here. Leaving them out hands back a measurement taken
+        against a differently configured server, which reads as a cache hit and
+        is really a comparison between two different experiments.
         """
         candidate = outcome.candidate
         return benchmark_key(
@@ -570,6 +583,15 @@ class Optimizer:
                 **self.benchmark_settings,
                 "max_model_len": candidate.max_model_len,
                 "kv_dtype": candidate.kv_dtype,
+                # Only when speculating, so a normal candidate keeps the key it
+                # already has on disk.
+                **(
+                    {"speculative": candidate.speculative.as_config()}
+                    if candidate.speculative
+                    else {}
+                ),
+                **({"gpu_util": self.launch.gpu_memory_utilization} if self.launch else {}),
+                **({"max_num_seqs": self.launch.max_num_seqs} if self.launch else {}),
             },
         )
 

@@ -101,3 +101,28 @@ def test_config_accepts_dataset_ids_it_cannot_load():
     """
     spec = DatasetSpec(source="hub", path="wikitext", name="wikitext-2-raw-v1")
     assert spec.path == "wikitext"
+
+
+def test_evaluation_key_ignores_the_deployment_settings() -> None:
+    """The two cache keys are only separable if one cannot invalidate the other.
+
+    A perplexity number does not depend on the concurrency sweep, so changing
+    it must not discard the measurement.
+    """
+    from autodistiller.config import DeploymentSpec
+
+    def config(levels: list[int] | None) -> RunConfig:
+        return RunConfig(
+            model=ModelSpec(id="dummy/model"),
+            tasks=[PerplexityTask(name="ppl", dataset=DatasetSpec(source="hub", path="wikitext"))],
+            deployment=DeploymentSpec(concurrency_levels=levels) if levels else None,
+        )
+
+    sweep_a, sweep_b, no_deployment = config([1, 4]), config([1, 4, 16]), config(None)
+
+    assert sweep_a.evaluation_fingerprint == sweep_b.evaluation_fingerprint
+    assert sweep_a.fingerprint != sweep_b.fingerprint  # the config itself did change
+
+    # Neutralized, not dropped: keys already on disk came from configs with no
+    # deployment section, and must keep matching.
+    assert no_deployment.evaluation_fingerprint == no_deployment.fingerprint

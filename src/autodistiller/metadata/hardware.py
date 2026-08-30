@@ -156,17 +156,34 @@ _NVML_READY: bool | None = None
 
 
 def _nvml_handle(device_index: int):
-    """Initialize NVML once and return a device handle, or None."""
+    """Initialize NVML once and return a device handle, or None.
+
+    The cached flag records whether *initialization* worked, and nothing else. A
+    failed handle lookup -- a device index that does not exist, a transient
+    driver error -- must not disable NVML for the rest of the process: the
+    fallback below reads only the calling process's own CUDA context, so a
+    poisoned flag turns every later VRAM reading into a number that cannot see
+    the server being benchmarked, which is the whole reason NVML is preferred.
+    """
     global _NVML_READY
     try:
         import pynvml
-
-        if _NVML_READY is None:
-            pynvml.nvmlInit()
-            _NVML_READY = True
-        return pynvml.nvmlDeviceGetHandleByIndex(device_index)
     except Exception:
         _NVML_READY = False
+        return None
+
+    if _NVML_READY is None:
+        try:
+            pynvml.nvmlInit()
+            _NVML_READY = True
+        except Exception:
+            _NVML_READY = False
+    if not _NVML_READY:
+        return None
+
+    try:
+        return pynvml.nvmlDeviceGetHandleByIndex(device_index)
+    except Exception:
         return None
 
 

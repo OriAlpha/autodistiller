@@ -63,9 +63,25 @@ def _encode_pair(
     if len(full_ids) > max_length:
         # Truncate from the left: the answer must survive, the context need not.
         full_ids = full_ids[-max_length:]
-        n_continuation = min(n_continuation, len(full_ids) - 1)
 
-    return full_ids, max(n_continuation, 1)
+    # Scoring P(continuation | context) needs at least one token to condition
+    # on. Truncation is not the only way to lose it: an empty context -- which a
+    # user's own `mc:evals.jsonl` can carry, since only the column's presence is
+    # checked -- leaves the continuation owning the whole sequence. Without the
+    # clamp the scored window starts at index -1 and the gather fails on a shape
+    # mismatch, mid-evaluation, with a message that names neither cause nor row.
+    #
+    # A single token cannot be clamped into scoreability: nothing precedes it.
+    # That is malformed input, and saying so beats scoring it on a fabricated
+    # context or dropping it and moving the denominator underneath the accuracy.
+    if len(full_ids) < 2:
+        raise ValueError(
+            f"cannot score choice {continuation!r} against context {context!r}: the pair "
+            f"tokenizes to {len(full_ids)} token(s), and at least one token of context is "
+            f"needed to predict the answer from. Check the context column of this example."
+        )
+
+    return full_ids, max(1, min(n_continuation, len(full_ids) - 1))
 
 
 @torch.inference_mode()

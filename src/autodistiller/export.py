@@ -311,6 +311,20 @@ class ExportManifest(BaseModel):
         return cls.model_validate_json(Path(path).read_text(encoding="utf-8"))
 
 
+def _serve_command(backend: str, path: str, max_model_len: int | None) -> str:
+    """The command that serves this artifact, as that runtime spells it.
+
+    Two things a raw ``launch_command`` call gets wrong, and both are silent.
+    llama-server takes the ``.gguf`` file, not the directory holding it, which is
+    what ``model_path`` is for. And a serve command without ``--max-model-len``
+    lets the runtime default to the config's advertised context -- 128k on a
+    modern model -- which is how a bundle that benchmarked inside 8 GiB OOMs on
+    the machine it was exported to.
+    """
+    runtime = resolve_backend(backend)
+    return runtime.launch_command(runtime.model_path(path), max_model_len=max_model_len)
+
+
 def _reproduce_commands(record: RunRecord, artifact: CompressionArtifact | None) -> list[str]:
     """The commands that rebuild this result from the source model.
 
@@ -386,7 +400,7 @@ def build_manifest(
         deployment=record.deployment,
         hardware=record.hardware,
         environment=record.environment,
-        serve_command=resolve_backend(backend).launch_command(served, max_model_len=max_model_len),
+        serve_command=_serve_command(backend, served, max_model_len),
         reproduce=_reproduce_commands(record, artifact),
         gguf=gguf_note(
             artifact_format(directory) if directory else None,
@@ -509,7 +523,9 @@ def export(
             # The bundle is now self-contained, so the manifest must describe
             # the copy rather than pointing back at where it came from.
             manifest.artifact_dir = str(destination)
-            manifest.serve_command = resolve_backend(backend).launch_command(str(destination))
+            manifest.serve_command = _serve_command(
+                backend, str(destination), manifest.model.context_length
+            )
 
     manifest.save(destination / MANIFEST_FILENAME)
     (destination / README_FILENAME).write_text(render_readme(manifest), encoding="utf-8")

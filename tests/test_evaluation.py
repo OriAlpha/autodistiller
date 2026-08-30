@@ -340,3 +340,31 @@ def test_preflight_rejects_missing_local_files():
 
 def test_preflight_accepts_existing_local_files(text_corpus_file: Path):
     check_dataset_available(DatasetSpec(source="text", path=str(text_corpus_file)))
+
+
+def test_encode_pair_always_leaves_a_token_of_context() -> None:
+    """An empty context makes the continuation own the whole sequence.
+
+    The scored window then starts at index -1 and the gather fails on a shape
+    mismatch, mid-evaluation. Only the presence of the context column is
+    checked, so a user's own `mc:evals.jsonl` can carry this.
+    """
+    from autodistiller.evaluation.multiple_choice import _encode_pair
+
+    class Tok:
+        def __call__(self, text: str, add_special_tokens: bool = True) -> dict[str, list[int]]:
+            return {"input_ids": [7] * len(text.split())}
+
+    ids, n_continuation = _encode_pair(Tok(), "", " yes it is", 2048)
+    assert len(ids) - n_continuation >= 1
+
+    ids, n_continuation = _encode_pair(Tok(), "Question: why", " because", 2048)
+    assert len(ids) - n_continuation >= 1
+
+    # Truncation must not undo it either.
+    ids, n_continuation = _encode_pair(Tok(), "a " * 50, " b c d", 4)
+    assert len(ids) - n_continuation >= 1
+
+    # A single token has nothing to condition on and is not scoreable at all.
+    with pytest.raises(ValueError, match="at least one token of context"):
+        _encode_pair(Tok(), "", "A", 2048)
