@@ -84,6 +84,25 @@ def _build_modifier(job: dict, ignore: list[str]):
     return QuantizationModifier(targets="Linear", scheme=scheme, ignore=ignore)
 
 
+def _resolve_dtype(job: dict, config) -> str:
+    """What to load the weights as before quantizing them.
+
+    ``auto`` follows the checkpoint, except for a float32 one, which becomes
+    bfloat16. Quantization leaves embeddings and the output head alone, so a
+    float32 source writes those tensors out at 32 bits -- and every serving
+    runtime then downcasts them to 16 at load. Measured on bge-small-en-v1.5:
+    70.7 MB written against 45.1 MB of weights anything would actually hold, and
+    an artifact that disagrees with the memory estimate by 57% for no benefit.
+
+    An explicit dtype is honoured, since asking for one is asking for it.
+    """
+    requested = job.get("dtype", "auto")
+    if requested != "auto":
+        return requested
+    source = str(getattr(config, "dtype", None) or getattr(config, "torch_dtype", None) or "")
+    return "bfloat16" if source.endswith("float32") else "auto"
+
+
 def _load_model(job: dict):
     """Load the weights with the Auto class this architecture needs.
 
@@ -103,13 +122,25 @@ def _load_model(job: dict):
     is_decoder = not names or any(name.endswith(DECODER_SUFFIXES) for name in names)
 
     auto_class = AutoModelForCausalLM if is_decoder else AutoModel
+    dtype = _resolve_dtype(job, config)
     model = auto_class.from_pretrained(
         model_id,
         config=config,
         device_map=job.get("device_map", "auto"),
-        **{_dtype_kwarg(): job.get("dtype", "auto")},
+        **{_dtype_kwarg(): dtype},
         **common,
     )
+
+    # The config still names the checkpoint's dtype, and the save follows the
+    # config rather than the loaded tensors -- so without this the weights are
+    # written back out at the width they were downcast from.
+    if dtype != "auto":
+        import torch
+
+        resolved = getattr(torch, dtype)
+        for field in ("dtype", "torch_dtype"):
+            if getattr(model.config, field, None) is not None:
+                setattr(model.config, field, resolved)
     ignore = list(job.get("ignore") or []) if is_decoder else []
     return model, ignore
 

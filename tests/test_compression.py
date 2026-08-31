@@ -451,3 +451,31 @@ def test_an_encoder_recipe_does_not_claim_to_ignore_an_lm_head():
     assert encoder_job.ignore == ()
     assert encoder_job.recipe().ignore == []
     assert decoder_job.recipe().ignore == ["lm_head"]
+
+
+def test_a_float32_checkpoint_is_compressed_at_sixteen_bits():
+    """Quantization leaves embeddings and the output head alone.
+
+    So a float32 source writes those tensors back out at 32 bits, and every
+    serving runtime then downcasts them at load. Measured on bge-small-en-v1.5:
+    70.7 MB written against the 45.1 MB anything would actually hold, an
+    artifact 57% larger than the memory estimate for no benefit. Loading at
+    bfloat16 brought it to 46.4 MB with the STS-B score unmoved.
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "_ad_runner", "src/autodistiller/compression/_runner.py"
+    )
+    runner = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(runner)
+
+    class Config:
+        def __init__(self, dtype):
+            self.dtype = dtype
+
+    assert runner._resolve_dtype({"dtype": "auto"}, Config("torch.float32")) == "bfloat16"
+    # A checkpoint already at 16 bits is followed, not re-specified.
+    assert runner._resolve_dtype({"dtype": "auto"}, Config("torch.bfloat16")) == "auto"
+    # And asking for one is asking for it.
+    assert runner._resolve_dtype({"dtype": "float32"}, Config("torch.float32")) == "float32"
