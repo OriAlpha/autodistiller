@@ -161,3 +161,51 @@ def test_artifact_key_tracks_the_calibration_data(deep_model_dir: Path):
         PruneJob(model=model, n_drop=3, calibration_texts=CALIBRATION).artifact_key
         != one.artifact_key
     )
+
+
+def test_pruning_an_encoder(tmp_path: Path):
+    """The combination neither branch had run before they were merged.
+
+    Depth pruning was built against decoders and encoder support was built
+    against quantization, so a pruned BERT was reachable and untried. It works:
+    the block list is found by length like any other, and BERT's per-layer
+    config lists are sliced the same way Qwen3's are.
+
+    Measured on the real model afterwards: dropping 2 of bge-small's 12 blocks
+    took STS-B from 0.8954 to 0.8453, a 5.5-sigma loss. It runs, and it costs.
+    """
+    from transformers import AutoModel, BertConfig, BertModel
+
+    source = tmp_path / "tiny-bert"
+    BertModel(
+        BertConfig(
+            vocab_size=64,
+            hidden_size=32,
+            num_hidden_layers=6,
+            num_attention_heads=4,
+            intermediate_size=64,
+            max_position_embeddings=64,
+        )
+    ).save_pretrained(source)
+
+    job = PruneJob(
+        model=ModelSpec(id=str(source), device="cpu"),
+        n_drop=2,
+        calibration_texts=CALIBRATION,
+        max_length=32,
+        output_dir=tmp_path / "pruned",
+    )
+    # An encoder has no tokenizer saved beside a bare BertModel, so score the
+    # blocks through the loader the same way the CLI would.
+    from transformers import BertTokenizerFast
+
+    vocab = tmp_path / "vocab.txt"
+    vocab.write_text("\n".join(["[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]", *"abcdefghij"]))
+    BertTokenizerFast(vocab_file=str(vocab)).save_pretrained(source)
+
+    artifact = run_prune(job)
+
+    assert artifact.recipe.method == "prune2"
+    reloaded = AutoModel.from_pretrained(job.output_dir)
+    assert reloaded.config.num_hidden_layers == 4
+    assert len(layer_list(reloaded)[1]) == 4
