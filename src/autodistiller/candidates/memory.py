@@ -16,7 +16,8 @@ Three terms:
   alone.
 * **KV cache.** Two tensors per layer per KV head per token. Under continuous
   batching this scales with concurrency, and on long contexts it overtakes the
-  weights entirely.
+  weights entirely. An encoder has none, and pays for activations instead --
+  which is a different shape, quadratic in sequence length rather than linear.
 * **Overhead.** Activations, CUDA graphs, allocator fragmentation. A fraction
   rather than a model, because it is not worth more precision than that.
 
@@ -54,6 +55,30 @@ overhead produces candidates that OOM at serve time.
 
 DTYPE_BYTES = {"float32": 4, "float16": 2, "bfloat16": 2, "fp8": 1, "auto": 2}
 
+ENCODER_OVERHEAD_FLOOR_BYTES = int(0.15 * BYTES_PER_GIB)
+"""Fixed device cost of serving an encoder, whatever the card.
+
+Measured against vLLM 0.27's pooling server on bge-small-en-v1.5: weights took
+0.04 GiB, CUDA graph capture took 0.10 GiB, and there was no KV cache line at
+all. Nothing here scales with the device, so the decoder's "fraction of the
+budget" does not describe it -- on an 8 GiB card that rule claimed 0.75 GiB for
+a model whose weights are 0.04, which is twelve times the model and enough to
+make every encoder configuration report the same total.
+
+0.15 rather than the measured 0.10, because under-estimating overhead produces
+candidates that OOM at serve time and over-estimating only costs a candidate
+that would have fit.
+"""
+
+ACTIVATION_BLOCK_COPIES = 2
+"""Live copies of a block's widened activations during one forward pass.
+
+Roughly what goes in and what comes out. Inference keeps no autograd graph, so
+only one block's tensors are live at a time -- this does not multiply by layer
+count, which is the difference between an estimate near the truth and one that
+is a factor of twelve out.
+"""
+
 
 @dataclass(frozen=True)
 class MemoryEstimate:
@@ -65,6 +90,15 @@ class MemoryEstimate:
     budget_bytes: int | None = None
     draft_bytes: int = 0
     """Part of ``weights_bytes``, held separately so the report can name it."""
+
+    dynamic_label: str = "KV"
+    """What ``kv_cache_bytes`` actually holds for this model.
+
+    The field is one slot -- memory that grows with the workload rather than
+    with the weights -- but it is a KV cache for a decoder and activations for
+    an encoder. Reporting an encoder's activations under "KV cache" would name a
+    thing the model does not have.
+    """
 
     @property
     def total_bytes(self) -> int:
@@ -93,7 +127,7 @@ class MemoryEstimate:
     def describe(self) -> str:
         parts = [
             f"weights {(self.weights_bytes - self.draft_bytes) / BYTES_PER_GIB:.2f}",
-            f"KV {self.kv_cache_bytes / BYTES_PER_GIB:.2f}",
+            f"{self.dynamic_label} {self.kv_cache_bytes / BYTES_PER_GIB:.2f}",
             f"overhead {self.overhead_bytes / BYTES_PER_GIB:.2f}",
         ]
         if self.draft_bytes:
@@ -161,6 +195,25 @@ def weight_bytes(shape: ModelShape, method: CompressionMethod | None) -> int:
     return quantized + shape.embedding_params * 2
 
 
+def activation_bytes(shape: ModelShape, *, seq_len: int, batch: int) -> int:
+    """Peak activation memory for one encoder forward pass, at 16-bit.
+
+    Two terms carry it. The linear one is the residual stream and the widened
+    feed-forward, and it grows with tokens. The attention score matrix is
+    ``batch x heads x seq x seq``, and it grows with the *square* of sequence
+    length -- which is why a batch that fits at 128 tokens can fail at 512, and
+    why an encoder's memory question is a different question rather than the
+    same one with the cache removed.
+
+    # ponytail: two terms, not a per-op accounting. It is a screen, and the
+    # quadratic one dominates well before anything else would matter.
+    """
+    tokens = batch * seq_len
+    linear = tokens * (shape.hidden_size + shape.intermediate_size) * 2 * ACTIVATION_BLOCK_COPIES
+    scores = batch * shape.n_attention_heads * seq_len * seq_len * 2
+    return linear + scores
+
+
 def kv_cache_bytes(
     shape: ModelShape,
     *,
@@ -198,16 +251,32 @@ def estimate_memory(
     because that is what it is -- a second set of them.
     """
     weights = weight_bytes(shape, method) + draft_bytes
-    kv = kv_cache_bytes(
-        shape, max_model_len=max_model_len, concurrency=concurrency, kv_dtype=kv_dtype
+    # The same two numbers mean different things for an encoder: max_model_len
+    # is the sequence it encodes rather than a context it grows into, and
+    # concurrency is the batch encoded at once rather than sequences held open.
+    # Both still decide whether it fits, so the caller passes the same pair and
+    # the arithmetic is picked here.
+    kv = (
+        activation_bytes(shape, seq_len=max_model_len, batch=concurrency)
+        if shape.is_encoder
+        else kv_cache_bytes(
+            shape, max_model_len=max_model_len, concurrency=concurrency, kv_dtype=kv_dtype
+        )
     )
 
-    # Overhead scales with the device when there is a budget, since CUDA graphs
-    # and the allocator grow into what is available.
-    basis = budget_bytes if budget_bytes else weights + kv
-    overhead = int(basis * overhead_fraction)
+    if shape.is_encoder:
+        # An encoder's runtime cost does not grow into the card: there is no
+        # cache to size and no context to reserve for, so the floor is what a
+        # pooling server actually holds.
+        overhead = max(int((weights + kv) * overhead_fraction), ENCODER_OVERHEAD_FLOOR_BYTES)
+    else:
+        # Overhead scales with the device when there is a budget, since CUDA
+        # graphs and the allocator grow into what is available.
+        basis = budget_bytes if budget_bytes else weights + kv
+        overhead = int(basis * overhead_fraction)
 
     return MemoryEstimate(
+        dynamic_label="activations" if shape.is_encoder else "KV",
         weights_bytes=weights,
         kv_cache_bytes=kv,
         overhead_bytes=overhead,

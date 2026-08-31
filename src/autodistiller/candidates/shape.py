@@ -17,7 +17,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from ..architecture import DECODER_SUFFIXES
+from ..architecture import DECODER, ENCODER, model_kind
 
 
 @dataclass(frozen=True)
@@ -36,6 +36,15 @@ class ModelShape:
     tie_word_embeddings: bool = False
     architecture: str | None = None
 
+    kind: str = DECODER
+    """``decoder`` or ``encoder``. Three formulas below turn on it.
+
+    A decoder block has a gated MLP of three matrices and a KV cache; an encoder
+    block has a two-matrix MLP and no cache at all. Both configs spell their
+    dimensions with the same field names, which is why this has to be carried
+    rather than inferred from the numbers.
+    """
+
     n_experts: int = 0
     """Routed experts per MoE layer. Zero for a dense model."""
 
@@ -49,9 +58,20 @@ class ModelShape:
     """Leading layers that are dense despite the model being MoE (DeepSeek)."""
 
     @property
+    def is_encoder(self) -> bool:
+        return self.kind == ENCODER
+
+    @property
     def embedding_params(self) -> int:
-        """Input embeddings, plus the output head when it is not tied."""
+        """Input embeddings, plus the output head when there is one.
+
+        An encoder has no output head to tie or untie -- what it has instead is
+        a learned position table, where a modern decoder uses rotary embeddings
+        and stores nothing.
+        """
         table = self.vocab_size * self.hidden_size
+        if self.is_encoder:
+            return table + self.max_position_embeddings * self.hidden_size
         return table if self.tie_word_embeddings else table * 2
 
     @property
@@ -67,8 +87,11 @@ class ModelShape:
 
     @property
     def dense_mlp_params_per_layer(self) -> int:
-        # Gated MLP: gate and up projections in, down projection out.
-        return 3 * self.hidden_size * self.intermediate_size
+        # Gated MLP: gate and up projections in, down projection out. An encoder
+        # predates the gate and has two matrices, so counting it as three
+        # overstates a BERT block's feed-forward by half.
+        matrices = 2 if self.is_encoder else 3
+        return matrices * self.hidden_size * self.intermediate_size
 
     @property
     def moe_mlp_params_per_layer(self) -> int:
@@ -123,9 +146,19 @@ class ModelShape:
         attention makes ``n_kv_heads`` much smaller than the attention head
         count, which is why it dominates long-context serving cost.
         """
+        if self.is_encoder:
+            # Nothing is cached between tokens: an encoder sees the whole
+            # sequence at once and keeps nothing afterwards. This is the term
+            # that dominates LLM serving and simply does not exist here.
+            return 0
         return 2 * self.n_layers * self.n_kv_heads * self.head_dim * 2
 
     def describe(self) -> str:
+        if self.is_encoder:
+            return (
+                f"{self.n_parameters / 1e6:.0f}M params, {self.n_layers} layers, "
+                f"hidden {self.hidden_size}, no KV cache"
+            )
         moe = f", {self.n_experts} experts" if self.is_moe else ""
         return (
             f"{self.n_parameters / 1e9:.2f}B params, {self.n_layers} layers, "
@@ -197,28 +230,31 @@ def text_config_of(config: Any) -> Any:
     return nested if _find_int(nested, "hidden_size", "n_embd", "d_model") else config
 
 
-def _reject_if_not_decoder(architectures: Any) -> None:
-    """Refuse to describe a model this arithmetic does not fit.
+def _kind_or_reject(architectures: Any) -> str:
+    """Which arithmetic describes this model, or refuse to guess.
 
-    Every formula below assumes a decoder-only transformer: a gated MLP of three
-    matrices, and a KV cache of two tensors per layer per token. An encoder --
-    BERT, ViT, a reranker -- has a two-matrix MLP and no KV cache at all, but
-    its config carries the same field names, so the arithmetic runs and returns
-    a confident wrong answer instead of failing. A wrong memory estimate is
-    worse than none: it is what a candidate is screened against.
+    Two shapes are described here: a decoder's gated MLP and KV cache, and an
+    encoder's two-matrix MLP and no cache. Both configs carry the same field
+    names, so getting this wrong does not fail -- it returns a confident wrong
+    answer, and a wrong memory estimate is worse than none because it is what a
+    candidate is screened against.
 
-    A config with no ``architectures`` is left alone. That is a local or
+    A config with no ``architectures`` is read as a decoder. That is a local or
     hand-built config where we cannot tell, and guessing wrong in the
     restrictive direction would block a model that works.
+
+    A name matching neither shape is refused rather than assumed into one. A
+    speculative draft proves the point: it is a decoder block whose name ends in
+    neither suffix, and reading it as an encoder would apply a two-matrix MLP
+    and a zero KV cache to a model with neither.
     """
+    if (kind := model_kind(architectures)) is not None:
+        return kind
     names = [str(name) for name in (architectures or ())]
-    if not names or any(name.endswith(DECODER_SUFFIXES) for name in names):
-        return
     raise ValueError(
-        f"{names[0]} is not a decoder-only language model. AutoDistiller's memory "
-        f"arithmetic (gated MLP, KV cache) does not describe it, and the estimate "
-        f"would be wrong rather than missing. Only causal LMs and vision-language "
-        f"models are supported."
+        f"{names[0]} is not a decoder-only language model, and not a recognised "
+        f"encoder either. AutoDistiller's memory arithmetic does not describe it, "
+        f"and the estimate would be wrong rather than missing."
     )
 
 
@@ -234,7 +270,7 @@ def shape_from_config(model_id: str, config: Any) -> ModelShape:
             f"{model_id} is an encoder-decoder model. Its encoder has no KV cache and "
             f"is not counted here, so the estimate would be wrong rather than missing."
         )
-    _reject_if_not_decoder(architectures)
+    kind = _kind_or_reject(architectures)
 
     hidden = _first_int(config, "hidden_size", "n_embd", "d_model")
     n_heads = _first_int(config, "num_attention_heads", "n_head", "num_heads")
@@ -262,6 +298,7 @@ def shape_from_config(model_id: str, config: Any) -> ModelShape:
         ),
         tie_word_embeddings=bool(getattr(config, "tie_word_embeddings", False)),
         architecture=architectures[0] if architectures else None,
+        kind=kind,
     )
 
 

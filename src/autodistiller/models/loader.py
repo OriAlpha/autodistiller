@@ -18,7 +18,7 @@ import torch
 import transformers
 from transformers import AutoConfig, AutoModel, AutoModelForCausalLM, AutoTokenizer
 
-from ..architecture import DECODER, kind_of_config
+from ..architecture import ENCODER, kind_of_config
 from ..metadata.hashing import hash_obj
 from ..results import ModelInfo
 
@@ -159,8 +159,12 @@ def auto_class_for(config: Any) -> Any:
     is the hidden states underneath one -- so ``AutoModel`` is both correct and
     smaller. Guessing wrong is not subtle: ``AutoModelForCausalLM`` on a BERT
     checkpoint either refuses or silently attaches a randomly initialised head.
+
+    An architecture matching neither shape keeps the causal LM. Loading is not
+    the memory screen: getting it wrong raises immediately and loudly, so the
+    default that has always worked is the right one to fall back to.
     """
-    return AutoModelForCausalLM if kind_of_config(config) == DECODER else AutoModel
+    return AutoModel if kind_of_config(config) == ENCODER else AutoModelForCausalLM
 
 
 def load_model(spec: Any) -> LoadedModel:

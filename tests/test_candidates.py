@@ -450,11 +450,13 @@ def test_an_empty_text_config_falls_back_to_the_top_level():
     assert shape.hidden_size == 768 and shape.n_layers == 12
 
 
-def test_rejects_models_the_arithmetic_does_not_describe() -> None:
-    """An encoder has the same config field names and no KV cache.
+def test_an_encoder_is_described_by_its_own_arithmetic() -> None:
+    """Same config field names, a different model underneath.
 
-    Without a guard the formulas run and return a confident wrong estimate,
-    which is worse than none: it is what candidates are screened against.
+    A BERT block has a two-matrix MLP where a decoder has a gated three, and no
+    KV cache at all. Running the decoder formulas over it returns a confident
+    wrong estimate, which is worse than none: it is what candidates are screened
+    against.
     """
 
     class Encoder:
@@ -466,17 +468,41 @@ def test_rejects_models_the_arithmetic_does_not_describe() -> None:
         vocab_size = 30522
         max_position_embeddings = 512
 
-    with pytest.raises(ValueError, match="not a decoder-only"):
-        shape_from_config("bert-base-uncased", Encoder())
+    shape = shape_from_config("bert-base-uncased", Encoder())
 
-    class EncoderDecoder(Encoder):
+    assert shape.is_encoder
+    assert shape.kv_bytes_per_token == 0
+    # bert-base is 109.5M parameters; the gap is layernorms, biases and pooler.
+    assert shape.n_parameters == pytest.approx(109.5e6, rel=0.02)
+    # The gated-MLP formula would have claimed half again as much feed-forward.
+    assert shape.dense_mlp_params_per_layer == 2 * 768 * 3072
+
+
+def test_rejects_models_the_arithmetic_does_not_describe() -> None:
+    """Neither shape, so neither formula. Refused, not guessed into one."""
+
+    class Unknown:
+        architectures: ClassVar[list[str]] = ["SomeNovelModel"]
+        num_hidden_layers = 12
+        hidden_size = 768
+        num_attention_heads = 12
+        intermediate_size = 3072
+        vocab_size = 30522
+        max_position_embeddings = 512
+
+    with pytest.raises(ValueError, match="not a decoder-only"):
+        shape_from_config("someone/novel", Unknown())
+
+    # Its name says decoder, but its encoder half has no KV cache, so the
+    # decoder arithmetic does not describe it either.
+    class EncoderDecoder(Unknown):
         architectures: ClassVar[list[str]] = ["WhisperForConditionalGeneration"]
         is_encoder_decoder = True
 
     with pytest.raises(ValueError, match="encoder-decoder"):
         shape_from_config("openai/whisper-small", EncoderDecoder())
 
-    class Decoder(Encoder):
+    class Decoder(Unknown):
         architectures: ClassVar[list[str]] = ["Qwen3ForCausalLM"]
         num_key_value_heads = 4
 
@@ -688,3 +714,129 @@ def test_trim_keeps_both_halves_of_a_speculative_search() -> None:
     # to compare rather than a half-answered question.
     plain_methods = {c.method for c in result.accepted if not c.speculative}
     assert {c.method for c in speculative} == plain_methods
+
+
+# --- encoders -----------------------------------------------------------
+
+
+def bge_small() -> ModelShape:
+    """BAAI/bge-small-en-v1.5, the encoder measured against here."""
+    from autodistiller.architecture import ENCODER
+
+    return ModelShape(
+        model_id="BAAI/bge-small-en-v1.5",
+        n_layers=12,
+        hidden_size=384,
+        intermediate_size=1536,
+        n_attention_heads=12,
+        n_kv_heads=12,
+        head_dim=32,
+        vocab_size=30522,
+        max_position_embeddings=512,
+        kind=ENCODER,
+    )
+
+
+def test_encoder_parameter_count_matches_the_real_checkpoint():
+    """33.4M on the hub. The gap is layernorms, biases and the pooler."""
+    assert bge_small().n_parameters == pytest.approx(33.4e6, rel=0.02)
+
+
+def test_an_encoder_has_no_kv_cache_at_any_length():
+    shape = bge_small()
+
+    assert shape.kv_bytes_per_token == 0
+    assert kv_cache_bytes(shape, max_model_len=512, concurrency=32) == 0
+
+
+def test_encoder_activations_grow_quadratically_with_sequence_length():
+    """The attention score matrix is what decides whether a batch fits.
+
+    Doubling the sequence more than doubles the memory, which is why an
+    encoder's search runs over sequence length at all rather than pinning it.
+    """
+    from autodistiller.candidates.memory import activation_bytes
+
+    shape = bge_small()
+    short = activation_bytes(shape, seq_len=128, batch=32)
+    long = activation_bytes(shape, seq_len=512, batch=32)
+
+    assert long > 4 * short
+    # Linear in batch, at a fixed length.
+    assert activation_bytes(shape, seq_len=128, batch=64) == pytest.approx(2 * short)
+
+
+def test_encoder_estimate_uses_activations_and_says_so():
+    """Reporting activations under "KV cache" names a thing the model lacks."""
+    estimate = estimate_memory(bge_small(), None, max_model_len=512, concurrency=32)
+
+    assert estimate.dynamic_label == "activations"
+    assert estimate.kv_cache_bytes > 0
+    assert "activations" in estimate.describe()
+
+    decoder = estimate_memory(qwen3_06b(), None, max_model_len=2048)
+    assert decoder.dynamic_label == "KV"
+
+
+def test_encoder_search_drops_the_dimensions_it_does_not_have():
+    """No cache means no KV dtype to vary, and no methods that need a decoder."""
+    result = generate_candidates(bge_small(), profile=SMALL, backend="vllm")
+
+    assert {c.kv_dtype for c in result.accepted} == {"auto"}
+    assert {c.max_model_len for c in result.accepted} <= {128, 256, 512}
+    assert "int4-awq" not in {c.method for c in result.accepted}
+    assert not any(c.method and c.method.startswith("gguf") for c in result.accepted)
+    # What is left is what a real compression run produced on this model.
+    assert {c.method for c in result.accepted if c.method} == {
+        "int8",
+        "int8-weight-only",
+        "int4-gptq",
+        "fp8",
+        "fp8-static",
+    }
+
+
+def test_encoder_overhead_does_not_grow_into_the_card():
+    """Measured against vLLM's pooling server, not inherited from the LLM path.
+
+    The decoder rule is a fraction of the budget, because CUDA graphs and the
+    allocator size themselves against what is available. A pooling server has
+    no cache to size and no context to reserve, so on an 8 GiB card that rule
+    claimed 0.75 GiB for a model whose weights are 0.04 -- and every
+    configuration then reported the same total, which is a screen that screens
+    nothing.
+    """
+    from autodistiller.candidates.memory import ENCODER_OVERHEAD_FLOOR_BYTES
+
+    shape = bge_small()
+    small_card = estimate_memory(
+        shape, None, max_model_len=128, concurrency=8, budget_bytes=8 * BYTES_PER_GIB
+    )
+    big_card = estimate_memory(
+        shape, None, max_model_len=128, concurrency=8, budget_bytes=80 * BYTES_PER_GIB
+    )
+
+    assert small_card.overhead_bytes == big_card.overhead_bytes
+    assert small_card.overhead_bytes == ENCODER_OVERHEAD_FLOOR_BYTES
+
+    # A decoder still scales with the device, which is what was measured for it.
+    decoder = estimate_memory(qwen3_06b(), None, max_model_len=2048, budget_bytes=8 * BYTES_PER_GIB)
+    bigger = estimate_memory(qwen3_06b(), None, max_model_len=2048, budget_bytes=80 * BYTES_PER_GIB)
+    assert bigger.overhead_bytes > decoder.overhead_bytes
+
+
+def test_encoder_estimate_tracks_what_vllm_reported():
+    """vLLM loaded the int8 artifact and reported 0.04 GiB of weights.
+
+    The weights term is the one the screen can be held to exactly, so it is
+    checked against the number the server printed rather than against itself.
+    """
+    shape = bge_small()
+    estimate = estimate_memory(
+        shape, resolve_method("int8-weight-only"), max_model_len=512, concurrency=32
+    )
+
+    assert estimate.weights_bytes / BYTES_PER_GIB == pytest.approx(0.04, abs=0.01)
+    # And the total is now within a plausible distance of a real server, where
+    # before the overhead rule alone put it above 1 GiB.
+    assert estimate.total_gib < 0.6

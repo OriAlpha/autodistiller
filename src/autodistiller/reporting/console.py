@@ -251,7 +251,10 @@ def render_candidates(candidate_set, *, show_rejected: bool = True) -> Table:
     table.add_column("Context", justify="right")
     table.add_column("KV", justify="right")
     table.add_column("Weights", justify="right")
-    table.add_column("KV cache", justify="right")
+    # An encoder has no cache; what grows with the workload is its activations.
+    table.add_column(
+        "Activations" if candidate_set.shape.is_encoder else "KV cache", justify="right"
+    )
     table.add_column("Est. total", justify="right")
     table.add_column("Status")
 

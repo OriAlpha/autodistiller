@@ -25,6 +25,15 @@ from .shape import ModelShape
 from .speculative import SpeculativeSpec
 
 DEFAULT_CONTEXT_LENGTHS = (2048, 4096, 8192)
+
+ENCODER_SEQUENCE_LENGTHS = (128, 256, 512)
+"""What an encoder is searched over instead.
+
+The axis is the same field and a different question. A decoder's context is
+how much history it can hold; an encoder's is how long a document it embeds,
+and the answer is short -- a passage, not a conversation. Searching 2048 upward
+would also miss the range where the quadratic attention term is decided.
+"""
 DEFAULT_MAX_CANDIDATES = 25
 
 KV_DTYPES = ("auto", "fp8")
@@ -120,7 +129,8 @@ def _sort_key(candidate: Candidate) -> tuple:
 
 
 def _context_lengths(shape: ModelShape, requested: tuple[int, ...] | None) -> list[int]:
-    lengths = requested or DEFAULT_CONTEXT_LENGTHS
+    default = ENCODER_SEQUENCE_LENGTHS if shape.is_encoder else DEFAULT_CONTEXT_LENGTHS
+    lengths = requested or default
     # A context longer than the model's positional range is not a candidate,
     # it is a misconfiguration.
     usable = [n for n in lengths if n <= shape.max_position_embeddings]
@@ -145,6 +155,11 @@ def generate_candidates(
     """Enumerate and filter the search space for one model."""
     if budget_bytes is None and profile is not None:
         budget_bytes = profile.vram_bytes
+
+    # An FP8 KV cache is not a dimension when there is no cache to hold. Left as
+    # one, every encoder candidate would be enumerated twice, identically.
+    if shape.is_encoder:
+        kv_dtypes = ("auto",)
 
     chosen: list[CompressionMethod | None] = [None] if include_baseline else []
     names = methods or tuple(METHODS)
@@ -172,7 +187,9 @@ def generate_candidates(
                     reasons: list[str] = []
 
                     if method is not None:
-                        availability = check_method(method, profile=profile, backend=backend)
+                        availability = check_method(
+                            method, profile=profile, backend=backend, model_kind=shape.kind
+                        )
                         reasons.extend(availability.reasons)
 
                     # An FP8 KV cache is its own hardware requirement, independent
