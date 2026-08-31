@@ -32,6 +32,16 @@ class RequestMetrics:
     n_output_tokens: int = 0
     error: str | None = None
 
+    n_items: int = 1
+    """Units of work this request carried.
+
+    One for a generation request. For an embeddings request it is the number of
+    texts in the batch, and without it throughput is not comparable across batch
+    sizes: a batch of 32 does thirty-two times the work of a batch of 1, so
+    counting requests alone ranks the smallest batch highest while it is doing
+    the least.
+    """
+
     @property
     def decode_s(self) -> float | None:
         """Seconds spent generating after the first token arrived."""
@@ -177,6 +187,8 @@ async def embed_request(
         # Token counts come from the server rather than from re-tokenizing here,
         # the same way the streaming path takes them from the usage chunk.
         n_prompt_tokens=int(usage.get("prompt_tokens", 0)),
+        # Vectors returned, not texts asked for: what the server actually did.
+        n_items=len(vectors),
     )
 
 

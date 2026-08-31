@@ -583,6 +583,9 @@ class Optimizer:
                 **self.benchmark_settings,
                 "max_model_len": candidate.max_model_len,
                 "kv_dtype": candidate.kv_dtype,
+                # Only when batching, so a normal candidate keeps the key it
+                # already has on disk.
+                **({"batch_size": candidate.batch_size} if candidate.batch_size > 1 else {}),
                 # Only when speculating, so a normal candidate keeps the key it
                 # already has on disk.
                 **(

@@ -26,6 +26,16 @@ from .speculative import SpeculativeSpec
 
 DEFAULT_CONTEXT_LENGTHS = (2048, 4096, 8192)
 
+ENCODER_BATCH_SIZES = (1, 8, 32)
+"""Texts per request, searched for an encoder and fixed at one otherwise.
+
+The dimension that actually moves an embedding server's throughput. A generation
+request carries one prompt and is batched by the runtime's scheduler; an
+embeddings request carries a list, and how long that list is changes requests
+per second by far more than any bit width does. Searching quantization while
+pinning this would vary the thing that barely matters.
+"""
+
 ENCODER_SEQUENCE_LENGTHS = (128, 256, 512)
 """What an encoder is searched over instead.
 
@@ -55,6 +65,14 @@ class Candidate:
     Orthogonal to ``method``: speculation does not change the target's weights,
     so it composes with every compression method rather than replacing one."""
 
+    batch_size: int = 1
+    """Texts per request.
+
+    A deployment choice rather than a property of the weights, which is what
+    makes it a candidate dimension: the same artifact served at batch 1 and
+    batch 32 is two different operating points, and for an encoder they are
+    further apart than any two compression methods. See ENCODER_BATCH_SIZES."""
+
     @property
     def is_baseline(self) -> bool:
         return self.method is None
@@ -64,7 +82,8 @@ class Candidate:
         method = self.method or "baseline"
         kv = "" if self.kv_dtype == "auto" else f"-kv{self.kv_dtype}"
         spec = f"-{self.speculative.label}" if self.speculative else ""
-        return f"{method}-ctx{self.max_model_len}{kv}{spec}"
+        batch = f"-b{self.batch_size}" if self.batch_size > 1 else ""
+        return f"{method}-ctx{self.max_model_len}{batch}{kv}{spec}"
 
     def describe(self) -> str:
         return f"{self.id}: {self.estimate.describe()}"
@@ -180,10 +199,15 @@ def generate_candidates(
     if speculative is not None:
         speculations.append(speculative)
 
+    # Only an encoder searches it. A generation request carries one prompt and
+    # is batched by the runtime's own scheduler, so offering the dimension there
+    # would enumerate identical candidates.
+    batch_sizes = ENCODER_BATCH_SIZES if shape.is_encoder else (1,)
+
     for method in chosen:
         for max_model_len in _context_lengths(shape, context_lengths):
             for kv_dtype in kv_dtypes:
-                for spec in speculations:
+                for spec, batch_size in ((s, b) for s in speculations for b in batch_sizes):
                     reasons: list[str] = []
 
                     if method is not None:
@@ -208,7 +232,10 @@ def generate_candidates(
                         shape,
                         method,
                         max_model_len=max_model_len,
-                        concurrency=concurrency,
+                        # Texts being encoded at once is requests in flight
+                        # times texts per request, and that product is what the
+                        # activation arithmetic is a function of.
+                        concurrency=concurrency * batch_size,
                         kv_dtype=kv_dtype,
                         budget_bytes=budget_bytes,
                         draft_bytes=spec.weights_bytes if spec else 0,
@@ -225,6 +252,7 @@ def generate_candidates(
                         kv_dtype=kv_dtype,
                         estimate=estimate,
                         speculative=spec,
+                        batch_size=batch_size,
                     )
                     if reasons:
                         result.rejected.append(Rejection(candidate, tuple(reasons)))
@@ -257,11 +285,12 @@ def _trim(candidates: list[Candidate], limit: int) -> tuple[list[Candidate], lis
     speculative half before anything is measured -- silently, and precisely when
     the user asked for the comparison by naming a draft.
     """
-    by_family: dict[tuple[str | None, str | None], list[Candidate]] = {}
+    by_family: dict[tuple[str | None, str | None, int], list[Candidate]] = {}
     for candidate in candidates:
         family = (
             candidate.method,
             candidate.speculative.label if candidate.speculative else None,
+            candidate.batch_size,
         )
         by_family.setdefault(family, []).append(candidate)
 

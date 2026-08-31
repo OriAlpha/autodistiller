@@ -263,6 +263,10 @@ def render_candidates(candidate_set, *, show_rejected: bool = True) -> Table:
         # the same method, context and KV as its plain twin, differing only in a
         # weights figure the reader has no reason to connect to a draft model.
         base = candidate.method or "baseline"
+        # Without it three rows read identically and differ only in a memory
+        # figure the reader has no reason to connect to a batch size.
+        if candidate.batch_size > 1:
+            base += f" x{candidate.batch_size}"
         return f"{base} +{candidate.speculative.label}" if candidate.speculative else base
 
     for index, candidate in enumerate(candidate_set.accepted, start=1):

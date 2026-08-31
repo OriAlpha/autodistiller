@@ -1041,3 +1041,124 @@ def test_pooling_runner_flag_is_only_emitted_when_asked_for():
 
     assert "--runner" not in plain.command_for("m")
     assert "--runner pooling" in pooling.command_for("m")
+
+
+def test_repeated_phases_carry_a_spread():
+    """A single reading cannot tell 62.6 from 62.1, and says nothing about it.
+
+    Without a spread the frontier reads every gap as real, and on a small model
+    nearly every gap is smaller than run-to-run variation.
+    """
+    from autodistiller.serving.benchmark import run_deployment_benchmark
+
+    benchmark = asyncio.run(
+        run_deployment_benchmark(
+            url="http://fake",
+            backend="vllm",
+            concurrency_levels=(1,),
+            requests_per_level=4,
+            warmup_requests=0,
+            repeats=3,
+            embed=True,
+            transport=fake_embedding_server(),
+        )
+    )
+
+    phase = benchmark.phases[0]
+    assert phase.n_repeats == 3
+    assert phase.throughput_stderr is not None and phase.throughput_stderr >= 0
+    assert phase.latency_stderr is not None
+
+
+def test_a_single_measurement_reports_no_spread_rather_than_zero():
+    """Unmeasured spread is unknown, not absent.
+
+    Reported as zero it would make every gap infinitely significant, which is
+    the opposite of what measuring once tells you.
+    """
+    from autodistiller.serving.benchmark import run_deployment_benchmark
+
+    benchmark = asyncio.run(
+        run_deployment_benchmark(
+            url="http://fake",
+            backend="vllm",
+            concurrency_levels=(1,),
+            requests_per_level=4,
+            warmup_requests=0,
+            repeats=1,
+            embed=True,
+            transport=fake_embedding_server(),
+        )
+    )
+
+    phase = benchmark.phases[0]
+    assert phase.n_repeats == 1
+    assert phase.throughput_stderr is None
+    assert phase.latency_stderr is None
+
+
+def test_batch_size_sends_that_many_texts_per_request():
+    """The dimension that actually moves an embedding server's throughput."""
+    seen: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/models":
+            return httpx.Response(200, json={"data": [{"id": MODEL}]})
+        body = json.loads(request.content)
+        seen.append(len(body["input"]))
+        return httpx.Response(
+            200,
+            json={
+                "data": [{"embedding": [0.1] * 8, "index": i} for i in range(len(body["input"]))],
+                "usage": {"prompt_tokens": 4},
+            },
+        )
+
+    from autodistiller.serving.benchmark import run_deployment_benchmark
+
+    asyncio.run(
+        run_deployment_benchmark(
+            url="http://fake",
+            backend="vllm",
+            concurrency_levels=(1,),
+            requests_per_level=2,
+            warmup_requests=0,
+            embed=True,
+            batch_size=32,
+            transport=httpx.MockTransport(handler),
+        )
+    )
+
+    assert seen and set(seen) == {32}
+
+
+def test_throughput_counts_work_not_requests():
+    """A batch of 32 does thirty-two times the work of a batch of 1.
+
+    Counting requests alone ranks the smallest batch highest while it is doing
+    the least -- measured on a real server, 112 requests per second at batch 1
+    against 88 at batch 32, which is 112 texts against 2816.
+    """
+    from autodistiller.results import ConcurrencyResult
+
+    small = ConcurrencyResult(
+        concurrency=1, n_requests=8, duration_s=1.0, requests_per_s=112.0, items_per_s=112.0
+    )
+    batched = ConcurrencyResult(
+        concurrency=1, n_requests=8, duration_s=1.0, requests_per_s=88.0, items_per_s=2816.0
+    )
+
+    assert batched.throughput > small.throughput
+    assert batched.throughput_unit == "texts/s"
+
+    # A generation phase is unaffected: it still ranks and reports in tokens.
+    generating = ConcurrencyResult(
+        concurrency=1,
+        n_requests=8,
+        duration_s=1.0,
+        output_tokens_per_s=640.0,
+        requests_per_s=5.0,
+        items_per_s=5.0,
+    )
+    assert generating.throughput == 640.0
+    assert generating.throughput_unit == "tok/s"

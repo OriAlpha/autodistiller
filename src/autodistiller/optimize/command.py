@@ -45,6 +45,14 @@ and requests per second are.
 BENCHMARK_PROMPT_TOKENS = 256
 BENCHMARK_MAX_TOKENS = 128
 BENCHMARK_CONCURRENCY = (1, 8)
+BENCHMARK_REPEATS = 3
+"""Times each concurrency rung is measured.
+
+Enough for a standard error, few enough to keep the stage in minutes. Without a
+spread the frontier reads every gap as real, and on a small model nearly every
+gap is smaller than run-to-run variation: bge-small measured 62.6 against 62.1
+requests per second, and a single reading calls that a winner.
+"""
 """The request shape the optimizer benchmarks candidates with.
 
 Defined once because two things need to agree on it: the benchmarker that
@@ -159,6 +167,7 @@ def build_benchmarker(
     max_tokens: int = BENCHMARK_MAX_TOKENS,
     concurrency_levels: tuple[int, ...] = BENCHMARK_CONCURRENCY,
     embed: bool = False,
+    repeats: int = BENCHMARK_REPEATS,
     progress: ProgressFn | None = None,
 ) -> Callable[[CandidateOutcome], DeploymentBenchmark]:
     """Start a server for the candidate, measure it, and shut it down.
@@ -197,6 +206,8 @@ def build_benchmarker(
                     concurrency_levels=concurrency_levels,
                     ignore_eos=backend_spec.supports_ignore_eos,
                     embed=embed,
+                    batch_size=candidate.batch_size,
+                    repeats=repeats,
                     progress=progress,
                 )
             )
@@ -301,6 +312,7 @@ def optimize(
             "prompt_tokens": BENCHMARK_PROMPT_TOKENS,
             "max_tokens": BENCHMARK_MAX_TOKENS,
             "concurrency_levels": list(BENCHMARK_CONCURRENCY),
+            "repeats": BENCHMARK_REPEATS,
             # Only when there is one, so a default run keeps the key it already
             # has on disk: no prompt file means the filler, which is what every
             # cached benchmark was measured with.

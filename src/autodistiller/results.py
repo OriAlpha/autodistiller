@@ -177,6 +177,10 @@ class ConcurrencyResult(BaseModel):
     total_output_tokens: int = 0
     output_tokens_per_s: float = 0.0
     requests_per_s: float = 0.0
+    items_per_s: float = 0.0
+    """Units of work per second: texts embedded, or requests for a generation
+    workload where each request is one unit. The rate that stays comparable when
+    batch size changes."""
     mean_prompt_tokens: float = 0.0
     peak_vram_bytes: int | None = None
     throughput_efficiency: float | None = Field(
@@ -189,6 +193,21 @@ class ConcurrencyResult(BaseModel):
     warnings: list[str] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
 
+    n_repeats: int = 1
+    """How many times this rung was measured. One means no spread to report."""
+
+    throughput_stderr: float | None = Field(
+        default=None,
+        description=(
+            "Standard error of the throughput across repeats. None when the rung "
+            "was measured once, which is not the same as zero: unmeasured spread "
+            "is unknown, not absent."
+        ),
+    )
+    latency_stderr: float | None = Field(
+        default=None, description="Standard error of the p50 request latency across repeats"
+    )
+
     @property
     def throughput(self) -> float:
         """The rate this phase measured, whichever one it was.
@@ -198,11 +217,13 @@ class ConcurrencyResult(BaseModel):
         does produce is answers, and requests per second is then the rate that
         tells two configurations apart.
         """
-        return self.output_tokens_per_s or self.requests_per_s
+        return self.output_tokens_per_s or self.items_per_s or self.requests_per_s
 
     @property
     def throughput_unit(self) -> str:
-        return "tok/s" if self.output_tokens_per_s else "req/s"
+        if self.output_tokens_per_s:
+            return "tok/s"
+        return "texts/s" if self.items_per_s else "req/s"
 
     @property
     def latency_p50(self) -> float | None:
@@ -245,18 +266,13 @@ class DeploymentBenchmark(BaseModel):
     def best_throughput(self) -> ConcurrencyResult | None:
         """The rung that served the most, by whichever rate was measured.
 
-        Tokens per second first, because that is what a generation benchmark is
-        ranked on. An endpoint that answers in a single response produces no
-        output tokens at all, so every rung ties at zero and the tuple falls
-        through to requests per second -- without which this returns the first
-        rung, which is the *slowest*, and a throughput floor gets checked
-        against the wrong measurement.
+        Ranked on whichever rate the phase actually measured. An endpoint that
+        answers in a single response produces no output tokens at all, so
+        ranking on tokens alone ties every rung at zero and returns the first --
+        which is the *slowest*, and a throughput floor then gets checked against
+        the wrong measurement.
         """
-        return max(
-            self.phases,
-            key=lambda p: (p.output_tokens_per_s, p.requests_per_s),
-            default=None,
-        )
+        return max(self.phases, key=lambda p: p.throughput, default=None)
 
     @property
     def single_stream(self) -> ConcurrencyResult | None:

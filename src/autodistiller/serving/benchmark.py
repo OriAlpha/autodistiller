@@ -14,6 +14,7 @@ turns on.
 from __future__ import annotations
 
 import asyncio
+import math
 import statistics
 import time
 from collections.abc import Callable
@@ -190,6 +191,7 @@ async def _run_phase(
     use_chat: bool,
     ignore_eos: bool,
     embed: bool = False,
+    batch_size: int = 1,
 ) -> tuple[list[RequestMetrics], float]:
     """Fire ``n_requests`` with at most ``concurrency`` in flight."""
     limiter = asyncio.Semaphore(concurrency)
@@ -197,7 +199,9 @@ async def _run_phase(
     async def one() -> RequestMetrics:
         async with limiter:
             if embed:
-                return await embed_request(client, url=url, model=model, inputs=[prompt])
+                return await embed_request(
+                    client, url=url, model=model, inputs=[prompt] * batch_size
+                )
             return await stream_request(
                 client,
                 url=url,
@@ -211,6 +215,33 @@ async def _run_phase(
     started = time.perf_counter()
     results = await asyncio.gather(*(one() for _ in range(n_requests)))
     return list(results), time.perf_counter() - started
+
+
+def _with_spread(repeats: list[ConcurrencyResult]) -> ConcurrencyResult:
+    """One rung's result from several measurements of it.
+
+    The median run is reported rather than the mean, because a single stalled
+    repeat moves a mean and does not move a median -- and a stall is the failure
+    this is guarding against. The spread it carries is the standard error across
+    repeats, which is what makes "62.6 against 62.1" answerable: without it the
+    frontier reads a 0.8% gap as a real difference, and on small models nearly
+    every gap is that size.
+    """
+    chosen = sorted(repeats, key=lambda p: p.throughput)[len(repeats) // 2]
+    if len(repeats) < 2:
+        return chosen
+
+    def stderr(values: list[float]) -> float | None:
+        return statistics.stdev(values) / math.sqrt(len(values)) if len(values) > 1 else None
+
+    chosen.n_repeats = len(repeats)
+    chosen.throughput_stderr = stderr([p.throughput for p in repeats])
+    latencies = [p.request_latency.p50 for p in repeats if p.request_latency is not None]
+    chosen.latency_stderr = stderr(latencies) if len(latencies) > 1 else None
+    # The peak is the peak across every repeat, not the chosen one's.
+    peaks = [p.peak_vram_bytes for p in repeats if p.peak_vram_bytes]
+    chosen.peak_vram_bytes = max(peaks) if peaks else chosen.peak_vram_bytes
+    return chosen
 
 
 async def _warm_until_stable(
@@ -316,6 +347,7 @@ def _aggregate(
         total_output_tokens=total_output_tokens,
         output_tokens_per_s=total_output_tokens / duration_s if duration_s > 0 else 0.0,
         requests_per_s=len(ok) / duration_s if duration_s > 0 else 0.0,
+        items_per_s=(sum(r.n_items for r in ok) / duration_s if duration_s > 0 else 0.0),
         mean_prompt_tokens=(statistics.fmean([r.n_prompt_tokens for r in ok]) if ok else 0.0),
         errors=sorted({r.error for r in failed if r.error})[:5],
     )
@@ -350,9 +382,11 @@ async def run_deployment_benchmark(
     requests_per_level: int | None = None,
     warmup_requests: int = 2,
     warmup_max_requests: int = WARMUP_MAX_REQUESTS,
+    repeats: int = 1,
     use_chat: bool = False,
     ignore_eos: bool = True,
     embed: bool = False,
+    batch_size: int = 1,
     device_index: int = 0,
     progress: ProgressFn | None = None,
     runtime_version: str | None = None,
@@ -409,22 +443,30 @@ async def run_deployment_benchmark(
             for concurrency in concurrency_levels:
                 n_requests = requests_per_level or max(concurrency * 4, 8)
                 say(f"concurrency {concurrency}: {n_requests} requests")
-                results, duration = await _run_phase(
-                    client,
-                    url=url,
-                    model=served_model,
-                    prompt=prompt,
-                    max_tokens=max_tokens,
-                    concurrency=concurrency,
-                    n_requests=n_requests,
-                    use_chat=use_chat,
-                    ignore_eos=ignore_eos,
-                    embed=embed,
-                )
-                phase = _aggregate(results, duration, concurrency)
-                phase.peak_vram_bytes = vram.peak_used
+                measured: list[ConcurrencyResult] = []
+                for _ in range(max(repeats, 1)):
+                    results, duration = await _run_phase(
+                        client,
+                        url=url,
+                        model=served_model,
+                        prompt=prompt,
+                        max_tokens=max_tokens,
+                        concurrency=concurrency,
+                        n_requests=n_requests,
+                        use_chat=use_chat,
+                        ignore_eos=ignore_eos,
+                        embed=embed,
+                        batch_size=batch_size,
+                    )
+                    repeat = _aggregate(results, duration, concurrency)
+                    repeat.peak_vram_bytes = vram.peak_used
+                    measured.append(repeat)
+
+                phase = _with_spread(measured)
                 phases.append(phase)
-                summary = f"  {phase.output_tokens_per_s:.1f} tok/s"
+                summary = f"  {phase.throughput:.1f} {phase.throughput_unit}"
+                if phase.throughput_stderr is not None:
+                    summary += f" +/- {phase.throughput_stderr:.1f}"
                 if phase.ttft is not None:
                     summary += f" | TTFT p50 {phase.ttft.p50 * 1000:.0f}ms"
                 if phase.n_failed:

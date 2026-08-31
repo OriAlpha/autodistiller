@@ -66,10 +66,17 @@ class Axis:
     uncertainty: Callable[[CandidateOutcome], float | None] | None = None
     """How much this axis's value could move if the measurement were repeated.
 
-    Only quality has one: accuracy on a few hundred questions carries a standard
-    error, and a gap smaller than that error is not a difference. Throughput and
-    VRAM are single readings with no error bar to offer, so they have none and
-    every gap on them is taken at face value.
+    Quality always has one: accuracy on a few hundred questions carries a
+    standard error, and a gap smaller than that error is not a difference.
+    Throughput and latency have one when the benchmark measured each rung more
+    than once, and none when it did not -- unmeasured spread is unknown, not
+    zero, and claiming zero would make every gap significant.
+
+    That distinction earns its keep on small models. A 33M encoder measured at
+    62.6 against 62.1 requests per second is a 0.8% gap that a single reading
+    cannot resolve; without an error bar the frontier calls one Pareto-optimal
+    and the other dominated on it. VRAM is still a single reading with nothing
+    to offer, so gaps on it are taken at face value.
     """
 
     def error(self, outcome: CandidateOutcome) -> float | None:
@@ -112,6 +119,18 @@ def _throughput(outcome: CandidateOutcome) -> float | None:
     benchmark = outcome.benchmark
     best = benchmark.best_throughput if benchmark else None
     return best.throughput if best is not None else None
+
+
+def _throughput_error(outcome: CandidateOutcome) -> float | None:
+    benchmark = outcome.benchmark
+    best = benchmark.best_throughput if benchmark else None
+    return best.throughput_stderr if best is not None else None
+
+
+def _latency_error(outcome: CandidateOutcome) -> float | None:
+    benchmark = outcome.benchmark
+    single = benchmark.single_stream if benchmark else None
+    return single.latency_stderr if single is not None else None
 
 
 def _throughput_unit(outcomes) -> str:
@@ -206,6 +225,7 @@ TTFT = Axis(
     higher_is_better=False,
     extract=_ttft,
     render=lambda v: f"{v * 1000:.0f}ms",
+    uncertainty=_latency_error,
 )
 
 THROUGHPUT = Axis(
@@ -214,6 +234,7 @@ THROUGHPUT = Axis(
     higher_is_better=True,
     extract=_throughput,
     render=lambda v: f"{v:.0f} tok/s",
+    uncertainty=_throughput_error,
 )
 
 SIZE = Axis(
@@ -417,10 +438,12 @@ class ParetoReport:
             TTFT if streaming else replace(TTFT, key="latency", label="Request latency p50")
         )
         unit = _throughput_unit(self.outcomes)
+
+        def render_throughput(value: float) -> str:
+            return f"{value:.1f} {unit}"
+
         throughput_axis = (
-            THROUGHPUT
-            if unit == "tok/s"
-            else replace(THROUGHPUT, render=lambda v: f"{v:.1f} req/s")
+            THROUGHPUT if unit == "tok/s" else replace(THROUGHPUT, render=render_throughput)
         )
 
         candidates = (quality, self.vram_axis, latency_axis, throughput_axis)

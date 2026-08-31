@@ -840,3 +840,35 @@ def test_encoder_estimate_tracks_what_vllm_reported():
     # And the total is now within a plausible distance of a real server, where
     # before the overhead rule alone put it above 1 GiB.
     assert estimate.total_gib < 0.6
+
+
+def test_batch_size_is_searched_only_for_encoders():
+    """It is what actually moves an embedding server's throughput.
+
+    A generation request carries one prompt and is batched by the runtime's own
+    scheduler, so offering the dimension there enumerates identical candidates.
+    """
+    encoder = generate_candidates(bge_small(), profile=SMALL, methods=("int8-weight-only",))
+    decoder = generate_candidates(qwen3_06b(), profile=SMALL, methods=("int8-weight-only",))
+
+    assert {c.batch_size for c in encoder.accepted} == {1, 8, 32}
+    assert {c.batch_size for c in decoder.accepted} == {1}
+
+
+def test_batching_scales_the_activation_estimate():
+    """Texts in flight is requests times texts per request, and that product is
+    what the memory is a function of."""
+    result = generate_candidates(
+        bge_small(),
+        profile=SMALL,
+        methods=(),
+        context_lengths=(512,),
+        concurrency=8,
+    )
+    by_batch = {c.batch_size: c for c in result.accepted if c.method is None}
+
+    assert by_batch[8].estimate.kv_cache_bytes > by_batch[1].estimate.kv_cache_bytes
+    assert by_batch[32].estimate.kv_cache_bytes > by_batch[8].estimate.kv_cache_bytes
+    # And the id says which is which, or three rows read identically.
+    assert by_batch[32].id.endswith("-b32")
+    assert "-b" not in by_batch[1].id
