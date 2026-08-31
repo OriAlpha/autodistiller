@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 
 from ..candidates.generator import Candidate, generate_candidates
@@ -28,6 +29,19 @@ from .pipeline import CandidateOutcome, OptimizationResult, Optimizer
 
 ProgressFn = Callable[[str], None]
 
+ENCODER_GPU_UTILIZATION = 0.30
+"""What an encoder's server is allowed to claim.
+
+vLLM fills to its default 0.90 whatever the model's size, and on an 8 GiB card
+that meant demanding 7.3 GiB for a 70 MB encoder and refusing to start when
+anything else held a gigabyte. Measured: 0.30 starts and serves.
+
+Setting it does mean peak VRAM becomes a readout of this flag rather than of the
+candidate. For an encoder that costs nothing worth having -- every candidate
+fits many times over, so VRAM was never the axis that separates them. Latency
+and requests per second are.
+"""
+
 BENCHMARK_PROMPT_TOKENS = 256
 BENCHMARK_MAX_TOKENS = 128
 BENCHMARK_CONCURRENCY = (1, 8)
@@ -45,7 +59,7 @@ WSL_VLLM_TEMPLATE = (
     "LIBRARY_PATH=$HOME/cudalibs:$CU/lib:/usr/lib/wsl/lib "
     "PATH=$HOME/vllm-env/bin:$CU/bin:$PATH "
     "$HOME/vllm-env/bin/vllm serve {model} --port {port} "
-    '--max-model-len {max_model_len} {kv_flag} {util_flag} {seqs_flag} {spec_flag}"'
+    '--max-model-len {max_model_len} {runner_flag} {kv_flag} {util_flag} {seqs_flag} {spec_flag}"'
 )
 """Launching vLLM from Windows means going through WSL, with the environment
 Phase 2 had to discover. See docs/vllm-on-wsl.md.
@@ -58,7 +72,7 @@ the command exits 127.
 
 NATIVE_VLLM_TEMPLATE = (
     "vllm serve {model} --port {port} --max-model-len {max_model_len} "
-    "{kv_flag} {util_flag} {seqs_flag} {spec_flag}"
+    "{runner_flag} {kv_flag} {util_flag} {seqs_flag} {spec_flag}"
 )
 
 NATIVE_LLAMACPP_TEMPLATE = (
@@ -144,9 +158,14 @@ def build_benchmarker(
     prompt_text: str | None = None,
     max_tokens: int = BENCHMARK_MAX_TOKENS,
     concurrency_levels: tuple[int, ...] = BENCHMARK_CONCURRENCY,
+    embed: bool = False,
     progress: ProgressFn | None = None,
 ) -> Callable[[CandidateOutcome], DeploymentBenchmark]:
-    """Start a server for the candidate, measure it, and shut it down."""
+    """Start a server for the candidate, measure it, and shut it down.
+
+    ``embed`` measures ``/v1/embeddings`` rather than generation, which is what
+    the server this launches is actually for when the model is an encoder.
+    """
     backend_spec = resolve_backend(backend)
 
     def benchmark(outcome: CandidateOutcome) -> DeploymentBenchmark:
@@ -177,6 +196,7 @@ def build_benchmarker(
                     max_tokens=max_tokens,
                     concurrency_levels=concurrency_levels,
                     ignore_eos=backend_spec.supports_ignore_eos,
+                    embed=embed,
                     progress=progress,
                 )
             )
@@ -241,11 +261,25 @@ def optimize(
 
     benchmark_fn = None
     if launch is not None and not skip_benchmark:
+        if shape.is_encoder:
+            # Told, not inferred: vLLM decides between generating and pooling
+            # from the checkpoint and gets it wrong for one that could be
+            # either. And its default memory claim does not start at all here.
+            launch = replace(
+                launch,
+                runner="pooling",
+                gpu_memory_utilization=(
+                    launch.gpu_memory_utilization
+                    if launch.gpu_memory_utilization is not None
+                    else ENCODER_GPU_UTILIZATION
+                ),
+            )
         benchmark_fn = build_benchmarker(
             launch,
             base_model=model,
             backend=backend,
             prompt_text=prompt_text,
+            embed=shape.is_encoder,
             progress=progress,
         )
 

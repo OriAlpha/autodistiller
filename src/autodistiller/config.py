@@ -123,12 +123,14 @@ class EmbeddingTask(StrictModel):
     max_length: int | None = Field(
         default=None, description="Encoder window; defaults to the model's own"
     )
-    pooling: Literal["mean", "cls"] = Field(
-        default="mean",
+    pooling: Literal["mean", "cls"] | None = Field(
+        default=None,
         description=(
-            "How token vectors become one sentence vector. Mean over unmasked "
-            "positions is what sentence-transformers models are trained with; "
-            "cls takes the first token, which BERT classifiers use."
+            "How token vectors become one sentence vector. Left unset, it is "
+            "read from the model's own sentence-transformers config, because a "
+            "screen that pools differently from the server is not measuring the "
+            "thing that gets deployed. Mean averages unmasked positions; cls "
+            "takes the first token, which is what BGE and vLLM both use."
         ),
     )
     text_a_column: str = "sentence1"

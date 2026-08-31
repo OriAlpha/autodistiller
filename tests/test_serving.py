@@ -935,3 +935,109 @@ def test_speculative_launch_leaves_room_to_schedule() -> None:
     # Unset means the runtime keeps its own defaults.
     bare = LaunchSpec(template="vllm serve {model} {seqs_flag} {util_flag}")
     assert bare.command_for("m").split() == ["vllm", "serve", "m"]
+
+
+# --- embeddings ---------------------------------------------------------
+
+
+def fake_embedding_server(
+    *, dim: int = 384, prompt_tokens: int = 11, status: int = 200, empty: bool = False
+) -> httpx.MockTransport:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/models":
+            return httpx.Response(200, json={"data": [{"id": MODEL}]})
+        if status != 200:
+            return httpx.Response(status, text="upstream exploded")
+        body = json.loads(request.content)
+        n = len(body["input"])
+        data = [] if empty else [{"embedding": [0.1] * dim, "index": i} for i in range(n)]
+        return httpx.Response(200, json={"data": data, "usage": {"prompt_tokens": prompt_tokens}})
+
+    return httpx.MockTransport(handler)
+
+
+def _embed(transport: httpx.MockTransport, **kwargs):
+    from autodistiller.serving.client import embed_request
+
+    async def go():
+        async with httpx.AsyncClient(transport=transport) as client:
+            return await embed_request(
+                client, url="http://fake", model=MODEL, inputs=["hello"], **kwargs
+            )
+
+    return asyncio.run(go())
+
+
+def test_embed_request_reports_latency_and_no_token_timings():
+    """There is no stream, so TTFT and TPOT are absent rather than zero.
+
+    Zero would read as instantaneous and would be aggregated into a percentile;
+    absent is the truth and drops out of the statistics.
+    """
+    result = _embed(fake_embedding_server())
+
+    assert result.ok
+    assert result.total_s > 0
+    assert result.ttft_s is None
+    assert result.tpot_s is None
+    assert result.n_output_tokens == 0
+    assert result.n_prompt_tokens == 11
+
+
+def test_embed_request_records_an_http_failure():
+    result = _embed(fake_embedding_server(status=503))
+
+    assert not result.ok
+    assert result.error is not None and "503" in result.error
+
+
+def test_embed_request_rejects_a_response_with_no_vectors():
+    """A 200 carrying nothing is a failure, not a fast success.
+
+    Counted as ok it would be the fastest request in the phase and would drag
+    the latency percentiles down while measuring nothing.
+    """
+    result = _embed(fake_embedding_server(empty=True))
+
+    assert not result.ok
+    assert result.error is not None and "embedding" in result.error
+
+
+def test_embedding_benchmark_measures_requests_not_tokens():
+    from autodistiller.serving.benchmark import run_deployment_benchmark
+
+    benchmark = asyncio.run(
+        run_deployment_benchmark(
+            url="http://fake",
+            backend="vllm",
+            concurrency_levels=(1, 4),
+            requests_per_level=4,
+            warmup_requests=1,
+            warmup_max_requests=1,
+            embed=True,
+            transport=fake_embedding_server(),
+        )
+    )
+
+    phase = benchmark.phases[0]
+    assert phase.request_latency is not None and phase.request_latency.p99 > 0
+    assert phase.requests_per_s > 0
+    # The token-shaped figures have nothing to report and say so.
+    assert phase.ttft is None
+    assert phase.tpot is None
+    assert phase.total_output_tokens == 0
+    # And no stall warning fires off a throughput that was never measured.
+    assert phase.warnings == []
+
+
+def test_pooling_runner_flag_is_only_emitted_when_asked_for():
+    """vLLM decides between generating and pooling from the checkpoint, and gets
+    it wrong for one that could be either."""
+    from autodistiller.serving.launcher import LaunchSpec
+
+    template = "serve {model} --port {port} {runner_flag}"
+    plain = LaunchSpec(template=template, port=8000)
+    pooling = LaunchSpec(template=template, port=8000, runner="pooling")
+
+    assert "--runner" not in plain.command_for("m")
+    assert "--runner pooling" in pooling.command_for("m")

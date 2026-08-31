@@ -185,7 +185,7 @@ def render_deployment(benchmark) -> Table:
             f"{phase.ttft.p50 * 1000:.0f}ms" if phase.ttft else "-",
             f"{phase.ttft.p99 * 1000:.0f}ms" if phase.ttft else "-",
             f"{phase.tpot.p50 * 1000:.1f}ms" if phase.tpot else "-",
-            f"{phase.output_tokens_per_s:.1f} tok/s",
+            f"{phase.throughput:.1f} {phase.throughput_unit}",
             f"{phase.requests_per_s:.2f}",
             _gib(phase.peak_vram_bytes),
             Text(str(phase.n_failed), style="red") if phase.n_failed else "0",
@@ -360,7 +360,7 @@ def render_optimization(result) -> Table:
             outcome.stage,
             _quality_cell(outcome),
             _gib(outcome.weights_bytes),
-            f"{peak.output_tokens_per_s:.0f} tok/s" if peak else "-",
+            f"{peak.throughput:.0f} {peak.throughput_unit}" if peak else "-",
             f"{single.ttft.p50 * 1000:.0f}ms" if single and single.ttft else "-",
             # Which stages this candidate did not have to pay for again.
             Text(",".join(s[:4] for s in outcome.reused), style="cyan") if outcome.reused else "-",

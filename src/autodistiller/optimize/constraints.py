@@ -50,12 +50,31 @@ class Constraints:
     max_tpot_s: float | None = None
     min_throughput_tokens_per_s: float | None = None
 
+    max_request_latency_s: float | None = None
+    """p99 end-to-end latency of one request.
+
+    The generation constraints above are token-shaped, and a model that answers
+    once has neither a first token nor a rate between tokens. What an embedding
+    or reranking workload is held to is how long the whole call takes, at the
+    tail rather than the median -- a p50 that clears the budget while p99 does
+    not is a service that misses its budget on every hundredth request.
+    """
+
+    min_requests_per_s: float | None = None
+    """Throughput in requests rather than tokens, for the same reason."""
+
     @property
     def needs_benchmark(self) -> bool:
         """Whether any constraint can only be settled by a deployment run."""
         return any(
             v is not None
-            for v in (self.max_ttft_s, self.max_tpot_s, self.min_throughput_tokens_per_s)
+            for v in (
+                self.max_ttft_s,
+                self.max_tpot_s,
+                self.min_throughput_tokens_per_s,
+                self.max_request_latency_s,
+                self.min_requests_per_s,
+            )
         )
 
     def describe(self) -> str:
@@ -70,6 +89,10 @@ class Constraints:
             parts.append(f"TPOT <= {self.max_tpot_s * 1000:.1f}ms")
         if self.min_throughput_tokens_per_s is not None:
             parts.append(f"throughput >= {self.min_throughput_tokens_per_s:.0f} tok/s")
+        if self.max_request_latency_s is not None:
+            parts.append(f"latency p99 <= {self.max_request_latency_s * 1000:.0f}ms")
+        if self.min_requests_per_s is not None:
+            parts.append(f"throughput >= {self.min_requests_per_s:.1f} req/s")
         return ", ".join(parts) or "none"
 
     # -- checks, applied as evidence arrives -----------------------------
@@ -179,6 +202,29 @@ class Constraints:
                 f"{self.min_throughput_tokens_per_s:.0f} tok/s"
             )
 
+        # Measured for every backend, and the only latency figure a
+        # non-streaming endpoint produces at all.
+        has_latency = single is not None and single.request_latency is not None
+        if (
+            self.max_request_latency_s is not None
+            and has_latency
+            and single.request_latency.p99 > self.max_request_latency_s
+        ):
+            violations.append(
+                f"request latency p99 {single.request_latency.p99 * 1000:.0f}ms exceeds "
+                f"{self.max_request_latency_s * 1000:.0f}ms"
+            )
+
+        if (
+            self.min_requests_per_s is not None
+            and best is not None
+            and best.requests_per_s < self.min_requests_per_s
+        ):
+            violations.append(
+                f"peak throughput {best.requests_per_s:.2f} req/s is below "
+                f"{self.min_requests_per_s:.2f} req/s"
+            )
+
         # Measured VRAM supersedes the estimate once it exists.
         if (
             self.max_vram_bytes is not None
@@ -254,29 +300,33 @@ def score_candidate(outcome, objective: Objective) -> Score:
 
     if objective is Objective.THROUGHPUT:
         best = benchmark.best_throughput
-        value = best.output_tokens_per_s if best else 0.0
-        return Score(value=value, basis="peak throughput", detail=f"{value:.0f} tok/s")
+        value = best.throughput if best else 0.0
+        unit = best.throughput_unit if best else "tok/s"
+        return Score(value=value, basis="peak throughput", detail=f"{value:.0f} {unit}")
 
     if objective is Objective.LATENCY:
         single = benchmark.single_stream
-        if single is None or single.ttft is None:
+        latency = single.latency_p50 if single is not None else None
+        if latency is None:
             return Score(value=0.0, basis="latency", detail="not measured")
+        basis = "single-stream TTFT" if single.ttft is not None else "single-stream latency"
         return Score(
-            value=1.0 / max(single.ttft.p50, 1e-6),
-            basis="single-stream TTFT",
-            detail=f"{single.ttft.p50 * 1000:.0f}ms",
+            value=1.0 / max(latency, 1e-6),
+            basis=basis,
+            detail=f"{latency * 1000:.0f}ms",
         )
 
     # Balanced: quality retention against normalized throughput. Deliberately
     # simple -- Phase 7's Pareto view is the honest way to show a trade-off, and
     # a single blended number is only a tie-breaker.
     best = benchmark.best_throughput
-    throughput = best.output_tokens_per_s if best else 0.0
+    throughput = best.throughput if best else 0.0
+    unit = best.throughput_unit if best else "tok/s"
     quality = retention if retention is not None else 0.0
     return Score(
         value=quality * throughput,
         basis="quality x throughput",
-        detail=f"{quality * 100:.1f}% x {throughput:.0f} tok/s",
+        detail=f"{quality * 100:.1f}% x {throughput:.0f} {unit}",
     )
 
 

@@ -189,6 +189,33 @@ class ConcurrencyResult(BaseModel):
     warnings: list[str] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
 
+    @property
+    def throughput(self) -> float:
+        """The rate this phase measured, whichever one it was.
+
+        An endpoint that answers in a single response emits no output tokens, so
+        tokens per second is zero on every rung and separates nothing. What it
+        does produce is answers, and requests per second is then the rate that
+        tells two configurations apart.
+        """
+        return self.output_tokens_per_s or self.requests_per_s
+
+    @property
+    def throughput_unit(self) -> str:
+        return "tok/s" if self.output_tokens_per_s else "req/s"
+
+    @property
+    def latency_p50(self) -> float | None:
+        """What one user waits for an answer.
+
+        Time to first token when there is a stream, and end-to-end latency when
+        there is not -- the same question, asked of a protocol that answers all
+        at once.
+        """
+        if self.ttft is not None:
+            return self.ttft.p50
+        return self.request_latency.p50 if self.request_latency is not None else None
+
 
 class DeploymentBenchmark(BaseModel):
     """Performance measured inside a real serving runtime.
@@ -216,7 +243,20 @@ class DeploymentBenchmark(BaseModel):
 
     @property
     def best_throughput(self) -> ConcurrencyResult | None:
-        return max(self.phases, key=lambda p: p.output_tokens_per_s, default=None)
+        """The rung that served the most, by whichever rate was measured.
+
+        Tokens per second first, because that is what a generation benchmark is
+        ranked on. An endpoint that answers in a single response produces no
+        output tokens at all, so every rung ties at zero and the tuple falls
+        through to requests per second -- without which this returns the first
+        rung, which is the *slowest*, and a throughput floor gets checked
+        against the wrong measurement.
+        """
+        return max(
+            self.phases,
+            key=lambda p: (p.output_tokens_per_s, p.requests_per_s),
+            default=None,
+        )
 
     @property
     def single_stream(self) -> ConcurrencyResult | None:

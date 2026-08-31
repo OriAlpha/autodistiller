@@ -21,8 +21,11 @@ embedding literature quotes both.
 
 from __future__ import annotations
 
+import json
+import logging
 import math
 import time
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -31,7 +34,53 @@ from ..config import EmbeddingTask
 from ..results import MetricValue, TaskResult
 from .datasets import SentencePairSet, load_sentence_pairs
 
-ProgressFn = None
+logger = logging.getLogger(__name__)
+
+DEFAULT_POOLING = "mean"
+
+POOLING_CONFIG = "1_Pooling/config.json"
+"""Where a sentence-transformers model records how it was trained to pool.
+
+Worth reading rather than defaulting, because the serving runtime reads it too:
+vLLM's pooling server reported ``seq_pooling_type='CLS'`` for bge-small while
+this defaulted to mean. The gap measured within noise on that model -- 0.8954
+against 0.8893 on STS-B, against a combined standard error of 0.0074 -- but a
+screening number and a deployment that pool differently are not describing the
+same model, and there is no reason to leave that to luck.
+"""
+
+
+def detect_pooling(model_id: str) -> str:
+    """How this model was trained to pool, or the default when it does not say.
+
+    Checks a local directory first, then the hub. Any failure is an absent
+    answer rather than an error: an unreachable hub should not stop an
+    evaluation that can proceed on the conventional default.
+    """
+    local = Path(model_id) / POOLING_CONFIG
+    payload: dict | None = None
+
+    if local.is_file():
+        try:
+            payload = json.loads(local.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            payload = None
+    else:
+        try:
+            from huggingface_hub import hf_hub_download
+
+            downloaded = hf_hub_download(model_id, POOLING_CONFIG)
+            payload = json.loads(Path(downloaded).read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.debug("no pooling config for %s: %s", model_id, exc)
+
+    if not payload:
+        return DEFAULT_POOLING
+    if payload.get("pooling_mode_cls_token"):
+        return "cls"
+    if payload.get("pooling_mode_mean_tokens"):
+        return "mean"
+    return DEFAULT_POOLING
 
 
 def _average_ranks(values: np.ndarray) -> np.ndarray:
@@ -154,6 +203,9 @@ def evaluate_embedding(
     )
 
     max_length = task.max_length or handle.context_length
+    # Unset means "whatever this model was trained for", which is also what the
+    # serving runtime will do with it.
+    pooling = task.pooling or detect_pooling(handle.info.id)
     examples = dataset.examples
 
     # Both sides in one pass so every sentence meets the same batching, and so
@@ -164,7 +216,7 @@ def evaluate_embedding(
         texts,
         batch_size=task.batch_size,
         max_length=max_length,
-        pooling=task.pooling,
+        pooling=pooling,
     )
     if progress is not None:
         progress(len(examples), len(examples))
@@ -202,7 +254,7 @@ def evaluate_embedding(
         dataset_fingerprint=dataset.fingerprint,
         details={
             "source": dataset.source,
-            "pooling": task.pooling,
+            "pooling": pooling,
             "max_length": max_length,
             "mean_cosine": float(cosines.mean()),
             "embedding_dim": int(vectors.shape[-1]),
@@ -211,7 +263,9 @@ def evaluate_embedding(
 
 
 __all__ = [
+    "DEFAULT_POOLING",
     "correlation_stderr",
+    "detect_pooling",
     "encode",
     "evaluate_embedding",
     "pool",

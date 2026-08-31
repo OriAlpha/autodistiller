@@ -24,7 +24,7 @@ import httpx
 from ..metadata.hardware import device_vram_bytes
 from ..metadata.hashing import hash_text_stream
 from ..results import ConcurrencyResult, DeploymentBenchmark, LatencyStats
-from .client import RequestMetrics, probe_endpoint, stream_request
+from .client import RequestMetrics, embed_request, probe_endpoint, stream_request
 
 VRAM_POLL_INTERVAL_S = 0.25
 
@@ -189,12 +189,15 @@ async def _run_phase(
     n_requests: int,
     use_chat: bool,
     ignore_eos: bool,
+    embed: bool = False,
 ) -> tuple[list[RequestMetrics], float]:
     """Fire ``n_requests`` with at most ``concurrency`` in flight."""
     limiter = asyncio.Semaphore(concurrency)
 
     async def one() -> RequestMetrics:
         async with limiter:
+            if embed:
+                return await embed_request(client, url=url, model=model, inputs=[prompt])
             return await stream_request(
                 client,
                 url=url,
@@ -221,6 +224,7 @@ async def _warm_until_stable(
     ignore_eos: bool,
     minimum: int,
     maximum: int,
+    embed: bool = False,
 ) -> tuple[bool, list[float]]:
     """Send single requests until the server settles. Returns (settled, latencies).
 
@@ -233,14 +237,18 @@ async def _warm_until_stable(
     latencies: list[float] = []
 
     for _ in range(max(maximum, minimum)):
-        result = await stream_request(
-            client,
-            url=url,
-            model=model,
-            prompt=prompt,
-            max_tokens=max_tokens,
-            use_chat=use_chat,
-            ignore_eos=ignore_eos,
+        result = (
+            await embed_request(client, url=url, model=model, inputs=[prompt])
+            if embed
+            else await stream_request(
+                client,
+                url=url,
+                model=model,
+                prompt=prompt,
+                max_tokens=max_tokens,
+                use_chat=use_chat,
+                ignore_eos=ignore_eos,
+            )
         )
         if not result.ok:
             # A failing warmup is the server's problem to report; the phases
@@ -344,12 +352,19 @@ async def run_deployment_benchmark(
     warmup_max_requests: int = WARMUP_MAX_REQUESTS,
     use_chat: bool = False,
     ignore_eos: bool = True,
+    embed: bool = False,
     device_index: int = 0,
     progress: ProgressFn | None = None,
     runtime_version: str | None = None,
     transport: httpx.AsyncBaseTransport | None = None,
 ) -> DeploymentBenchmark:
-    """Benchmark a running endpoint across a concurrency sweep."""
+    """Benchmark a running endpoint across a concurrency sweep.
+
+    ``embed`` measures ``/v1/embeddings`` instead of generation. The sweep, the
+    warmup, the VRAM sampling and the aggregation are all the same -- what
+    changes is that there is no stream, so TTFT and TPOT come back absent and
+    the phase is described by request latency and requests per second.
+    """
 
     def say(message: str) -> None:
         if progress is not None:
@@ -382,6 +397,7 @@ async def run_deployment_benchmark(
                 ignore_eos=ignore_eos,
                 minimum=warmup_requests,
                 maximum=warmup_max_requests,
+                embed=embed,
             )
             if latencies:
                 detail = f"  warm after {len(latencies)} requests, {latencies[-1]:.2f}s"
@@ -403,6 +419,7 @@ async def run_deployment_benchmark(
                     n_requests=n_requests,
                     use_chat=use_chat,
                     ignore_eos=ignore_eos,
+                    embed=embed,
                 )
                 phase = _aggregate(results, duration, concurrency)
                 phase.peak_vram_bytes = vram.peak_used

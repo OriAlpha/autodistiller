@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
 from ..regression import SIGNIFICANCE_SIGMA
@@ -105,13 +105,27 @@ def _estimated_vram(outcome: CandidateOutcome) -> float | None:
 def _ttft(outcome: CandidateOutcome) -> float | None:
     benchmark = outcome.benchmark
     single = benchmark.single_stream if benchmark else None
-    return single.ttft.p50 if single is not None and single.ttft is not None else None
+    return single.latency_p50 if single is not None else None
 
 
 def _throughput(outcome: CandidateOutcome) -> float | None:
     benchmark = outcome.benchmark
     best = benchmark.best_throughput if benchmark else None
-    return best.output_tokens_per_s if best is not None else None
+    return best.throughput if best is not None else None
+
+
+def _throughput_unit(outcomes) -> str:
+    """The unit every outcome in this report was measured in.
+
+    A search is all generation or all embedding, never a mix, so one unit
+    describes the column. Rendering "tok/s" over an embedding benchmark would
+    label a real number with the wrong thing it counts.
+    """
+    for outcome in outcomes:
+        best = outcome.benchmark.best_throughput if outcome.benchmark else None
+        if best is not None and best.throughput:
+            return best.throughput_unit
+    return "tok/s"
 
 
 QUALITY = Axis(
@@ -390,7 +404,27 @@ class ParetoReport:
             quality = measured_quality_axis(self.outcomes) or QUALITY
         self.quality_axis = quality
 
-        candidates = (quality, self.vram_axis, TTFT, THROUGHPUT)
+        # Both performance axes are labelled by what was actually measured. A
+        # non-streaming endpoint has no first token and emits no output tokens,
+        # so "TTFT p50" and "tok/s" would name the wrong quantities over real
+        # numbers -- which is worse than reporting nothing.
+        streaming = any(
+            (o.benchmark.single_stream.ttft is not None)
+            for o in self.outcomes
+            if o.benchmark is not None and o.benchmark.single_stream is not None
+        )
+        latency_axis = (
+            TTFT if streaming else replace(TTFT, key="latency", label="Request latency p50")
+        )
+        unit = _throughput_unit(self.outcomes)
+        throughput_axis = (
+            THROUGHPUT
+            if unit == "tok/s"
+            else replace(THROUGHPUT, render=lambda v: f"{v:.1f} req/s")
+        )
+
+        candidates = (quality, self.vram_axis, latency_axis, throughput_axis)
+        self.throughput_axis = throughput_axis
         self.axes: tuple[Axis, ...] = tuple(
             axis
             for axis in candidates
@@ -403,7 +437,7 @@ class ParetoReport:
         return [
             pareto_frontier(self.outcomes, (self.quality_axis, self.vram_axis)),
             pareto_frontier(self.outcomes, (self.quality_axis, TTFT)),
-            pareto_frontier(self.outcomes, (self.quality_axis, THROUGHPUT)),
+            pareto_frontier(self.outcomes, (self.quality_axis, self.throughput_axis)),
         ]
 
     @property

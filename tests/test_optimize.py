@@ -900,3 +900,52 @@ def test_optimizer_passes_the_llama_cpp_wrapper_to_compression() -> None:
 
     assert seen["wrapper"] == WSL_COMMAND
     assert seen["dir"] == "/home/u/llama.cpp"
+
+
+def test_latency_and_request_rate_constrain_a_non_streaming_endpoint():
+    """A model that answers once has no first token and no rate between tokens.
+
+    What it is held to is how long the whole call takes and how many of them a
+    second, which is what an embedding or reranking service is actually sized
+    against.
+    """
+    from autodistiller.results import ConcurrencyResult, DeploymentBenchmark, LatencyStats
+
+    def latency(p99: float) -> LatencyStats:
+        return LatencyStats(mean=p99 / 2, p50=p99 / 2, p90=p99, p99=p99, min=0.001, max=p99)
+
+    benchmark = DeploymentBenchmark(
+        backend="vllm",
+        endpoint="http://fake",
+        served_model="an-encoder",
+        phases=[
+            ConcurrencyResult(
+                concurrency=1,
+                n_requests=8,
+                duration_s=1.0,
+                request_latency=latency(0.080),
+                requests_per_s=12.0,
+            ),
+            ConcurrencyResult(
+                concurrency=8,
+                n_requests=8,
+                duration_s=1.0,
+                request_latency=latency(0.300),
+                requests_per_s=40.0,
+            ),
+        ],
+    )
+
+    assert Constraints(max_request_latency_s=0.100).check_benchmark(benchmark) == []
+    assert Constraints(min_requests_per_s=30.0).check_benchmark(benchmark) == []
+
+    too_slow = Constraints(max_request_latency_s=0.050).check_benchmark(benchmark)
+    assert len(too_slow) == 1 and "p99" in too_slow[0]
+
+    too_few = Constraints(min_requests_per_s=100.0).check_benchmark(benchmark)
+    assert len(too_few) == 1 and "req/s" in too_few[0]
+
+    # And both are benchmark-only questions, so asking either forces the stage.
+    assert Constraints(max_request_latency_s=0.1).needs_benchmark
+    assert Constraints(min_requests_per_s=1.0).needs_benchmark
+    assert not Constraints(max_vram_bytes=GIB).needs_benchmark

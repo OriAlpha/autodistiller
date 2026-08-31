@@ -122,6 +122,64 @@ def _chunk_text(chunk: dict) -> str:
     return (choice.get("delta") or {}).get("content") or ""  # /v1/chat/completions
 
 
+async def embed_request(
+    client: httpx.AsyncClient,
+    *,
+    url: str,
+    model: str,
+    inputs: list[str],
+    timeout: float = 300.0,
+) -> RequestMetrics:
+    """Issue one embeddings request and time it.
+
+    Not streamed, because there is nothing to stream: an embedding server
+    answers once with the whole vector. So there is no time to first token and
+    no time per output token -- the measurement is end-to-end latency and how
+    many of these a server sustains, which is what an embedding workload is
+    actually rate-limited by.
+
+    Those two are already what :class:`ConcurrencyResult` records, so the
+    aggregation and the constraints work on this unchanged. ``ttft`` and
+    ``tpot`` come back empty rather than zero: absent is true, zero would read
+    as instantaneous.
+    """
+    started = time.perf_counter()
+
+    try:
+        response = await client.post(
+            f"{url.rstrip('/')}/v1/embeddings",
+            json={"model": model, "input": inputs},
+            timeout=timeout,
+        )
+        if response.status_code != 200:
+            return RequestMetrics(
+                ok=False,
+                total_s=time.perf_counter() - started,
+                error=f"HTTP {response.status_code}: {response.text[:200]}",
+            )
+        payload = response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        return RequestMetrics(
+            ok=False,
+            total_s=time.perf_counter() - started,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+
+    total_s = time.perf_counter() - started
+    vectors = payload.get("data") or []
+    if not vectors:
+        return RequestMetrics(ok=False, total_s=total_s, error="response carried no embeddings")
+
+    usage = payload.get("usage") or {}
+    return RequestMetrics(
+        ok=True,
+        total_s=total_s,
+        # Token counts come from the server rather than from re-tokenizing here,
+        # the same way the streaming path takes them from the usage chunk.
+        n_prompt_tokens=int(usage.get("prompt_tokens", 0)),
+    )
+
+
 async def stream_request(
     client: httpx.AsyncClient,
     *,
@@ -216,4 +274,10 @@ async def stream_request(
     )
 
 
-__all__ = ["EndpointInfo", "RequestMetrics", "probe_endpoint", "stream_request"]
+__all__ = [
+    "EndpointInfo",
+    "RequestMetrics",
+    "embed_request",
+    "probe_endpoint",
+    "stream_request",
+]

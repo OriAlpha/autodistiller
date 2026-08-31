@@ -813,6 +813,15 @@ def optimize(
     min_throughput: float | None = typer.Option(
         None, "--min-throughput", help="Tokens per second at peak concurrency"
     ),
+    max_latency_ms: float | None = typer.Option(
+        None,
+        "--max-latency-ms",
+        help="End-to-end request latency, p99. The one latency budget that "
+        "applies to a model answering in a single response rather than a stream.",
+    ),
+    min_request_rate: float | None = typer.Option(
+        None, "--min-request-rate", help="Requests per second at peak concurrency"
+    ),
     task: list[str] | None = typer.Option(
         None, "--task", "-t", help="Quality screening tasks (default wikitext2)"
     ),
@@ -932,6 +941,8 @@ def optimize(
         max_ttft_s=max_ttft_ms / 1000 if max_ttft_ms is not None else None,
         max_tpot_s=max_tpot_ms / 1000 if max_tpot_ms is not None else None,
         min_throughput_tokens_per_s=min_throughput,
+        max_request_latency_s=max_latency_ms / 1000 if max_latency_ms is not None else None,
+        min_requests_per_s=min_request_rate,
     )
 
     try:

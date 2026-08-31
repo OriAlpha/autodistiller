@@ -150,3 +150,49 @@ def test_encoders_load_without_a_causal_head():
     # silence as "encoder" would change how every such checkpoint has loaded
     # since before embeddings existed, so the causal LM stays the default.
     assert auto_class_for(Unlabelled()) is AutoModelForCausalLM
+
+
+def test_pooling_is_read_from_the_model_not_defaulted(tmp_path: Path):
+    """The server reads this file; the screen has to read the same one.
+
+    vLLM's pooling server reported CLS for bge-small while this defaulted to
+    mean. That measured within noise on that model, but a screening number and
+    a deployment that pool differently are not describing the same model.
+    """
+    import json
+
+    from autodistiller.evaluation.embedding import DEFAULT_POOLING, detect_pooling
+
+    cls_model = tmp_path / "cls-model"
+    (cls_model / "1_Pooling").mkdir(parents=True)
+    (cls_model / "1_Pooling" / "config.json").write_text(
+        json.dumps({"pooling_mode_cls_token": True, "pooling_mode_mean_tokens": False})
+    )
+
+    mean_model = tmp_path / "mean-model"
+    (mean_model / "1_Pooling").mkdir(parents=True)
+    (mean_model / "1_Pooling" / "config.json").write_text(
+        json.dumps({"pooling_mode_cls_token": False, "pooling_mode_mean_tokens": True})
+    )
+
+    assert detect_pooling(str(cls_model)) == "cls"
+    assert detect_pooling(str(mean_model)) == "mean"
+    # A model that says nothing gets the convention, not an error.
+    assert detect_pooling(str(tmp_path / "nothing-here")) == DEFAULT_POOLING
+
+
+def test_the_resolved_pooling_is_recorded(tiny_model_dir: Path):
+    """An explicit choice overrides detection, and the record says which was used."""
+    from autodistiller.models.loader import loaded_model
+
+    task = EmbeddingTask(
+        name="pairs",
+        dataset={"source": "jsonl", "path": "unused"},
+        batch_size=2,
+        pooling="cls",
+    )
+
+    with loaded_model(ModelSpec(id=str(tiny_model_dir), device="cpu")) as handle:
+        result = evaluate_embedding(handle, task, dataset=_pair_set())
+
+    assert result.details["pooling"] == "cls"

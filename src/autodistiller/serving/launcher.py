@@ -111,6 +111,14 @@ class LaunchSpec:
     tighter than the flag can never be satisfied by any candidate.
     """
 
+    runner: str | None = None
+    """The runtime's model-role flag, when it needs one.
+
+    vLLM decides between generating and pooling from the checkpoint, and gets it
+    wrong for a model that could be either -- a BERT checkpoint has to be told
+    ``--runner pooling`` or it is loaded as something that cannot embed.
+    """
+
     max_num_seqs: int | None = None
     """Sequences the server is sized for.
 
@@ -159,6 +167,7 @@ class LaunchSpec:
             else f"--gpu-memory-utilization {self.gpu_memory_utilization:.3f}"
         )
         seqs_flag = "" if self.max_num_seqs is None else f"--max-num-seqs {self.max_num_seqs}"
+        runner_flag = "" if self.runner is None else f"--runner {self.runner}"
 
         spec_flag = ""
         if speculative_config:
@@ -189,6 +198,7 @@ class LaunchSpec:
             spec_flag=spec_flag,
             util_flag=util_flag,
             seqs_flag=seqs_flag,
+            runner_flag=runner_flag,
         )
 
 
