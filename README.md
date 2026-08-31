@@ -216,6 +216,10 @@ whose KV cache dominates memory. The vision encoder is not counted.
 **Gated models** (Llama, Gemma) need Hugging Face access: run `hf auth login`,
 then request access on the model page and wait for approval.
 
+Vision transformers load through `AutoModelForImageClassification` and are
+evaluated on top-1: `google/vit-base-patch16-224` and
+`facebook/deit-base-patch16-224` were both measured on an 8 GiB card.
+
 **Not supported:** encoder-decoder models (T5, BART), because loading goes
 through `AutoModelForCausalLM`. Non-NVIDIA accelerators are also out of scope —
 the capability rules are keyed on CUDA compute capability.
@@ -233,7 +237,8 @@ the capability rules are keyed on CUDA compute capability.
 | `gguf-q8-0` … `gguf-q3-k-m` | 8 → 3 bit | no | llama.cpp | any, CPU included |
 
 Methods marked **yes** need `--calibration wikitext2` (or your own corpus) and
-fail immediately with a clear message otherwise. `autodistiller methods` prints
+fail immediately with a clear message otherwise — and are refused outright on a
+vision model, which has no tokenizer to push calibration text through. `autodistiller methods` prints
 this for your actual GPU, marking what it can and cannot run.
 
 ---
@@ -261,20 +266,32 @@ this for your actual GPU, marking what it can and cannot run.
 
 Decoder-only LLMs throughout — Llama, Qwen, Mistral, Phi and friends, plus the
 language half of a VLM. **Encoder / embedding models** (BERT, BGE, E5, GTE,
-MiniLM, RoBERTa) work end to end as well, with a smaller method list:
+MiniLM, RoBERTa) work end to end as well. **Vision transformers** (ViT, DeiT)
+go as far as there is a runtime to take them:
 
-| | LLMs | Embedding models |
-|---|---|---|
-| Methods | 11 (6 vLLM + 5 GGUF) | 5 — `int8`, `int8-weight-only`, `int4-gptq`, `fp8`, `fp8-static` |
-| Tasks | perplexity, multiple choice | `stsb` (similarity), `scifact` (retrieval, nDCG@10) |
-| Serving | vLLM, llama.cpp | vLLM `--runner pooling` |
-| Searched over | context length × KV dtype | sequence length × **batch size** |
-| Ranked on | tokens/s, TTFT | texts/s, request latency |
+| | LLMs | Embedding models | Vision (ViT) |
+|---|---|---|---|
+| Methods | 11 (6 vLLM + 5 GGUF) | 5 — `int8`, `int8-weight-only`, `int4-gptq`, `fp8`, `fp8-static` | 2 — `int8-weight-only`, `fp8` |
+| Tasks | perplexity, multiple choice | `stsb` (similarity), `scifact` (retrieval, nDCG@10) | `imagenet`, `imagenet-original` (top-1 / top-5) |
+| Serving | vLLM, llama.cpp | vLLM `--runner pooling` | **none** |
+| Searched over | context length × KV dtype | sequence length × **batch size** | batch size |
+| Ranked on | tokens/s, TTFT | texts/s, request latency | quality and size only |
 
 `int4-awq` is decoder-only: AWQ smooths activations through per-architecture
 mappings and llmcompressor registers none for encoders. GGUF on an encoder is
 untested, so it is not offered. MoE and encoder-decoder models (Whisper) are
 refused rather than mis-estimated.
+
+For a ViT the three refusals are: **calibrated methods**, because calibration
+means pushing sample text through a tokenizer and a vision tower has neither;
+**depth pruning**, for the same reason — block influence is scored against
+text; and **serving**, because vLLM 0.27's registry has no
+`ForImageClassification` entry at all (its one image tower is
+`PrithviGeoSpatialMAE`, routed out to terratorch). So `candidates` and
+`optimize` say there is nothing to search rather than printing a launch command
+that cannot work, while `evaluate`, `compress` and `compare` work end to end.
+Staged and convolutional backbones (Swin, ConvNeXt) are refused: their width
+changes every stage, so one `hidden_size` does not describe them.
 
 Measured on an RTX 5070, `bge-small-en-v1.5` against a real vLLM pooling server:
 
@@ -290,6 +307,50 @@ not from quantization, which bought about one percent. And the retrieval task
 earns its place: `int4-gptq` holds 99.5% of STS-B similarity but only **96.8%**
 of nDCG@10, so a model that looks lossless on the cheap screen measurably
 changes which documents it returns.
+
+`google/vit-base-patch16-224` on the same card, 2048 ImageNet validation
+images:
+
+```
+| Candidate          | Top-1  | Top-5  | Retention | Weights   |
+| baseline (bf16)    | 78.03% | 94.73% |   100.00% | 165.1 MiB |
+| int8-weight-only   | 78.03% | 94.78% |   100.00% |  84.7 MiB |
+| fp8                | 78.37% | 94.58% |   100.44% |  83.6 MiB |
+```
+
+Half the weights for no measurable accuracy, which is the answer you would
+hope for and not one you can assume.
+
+### Two ImageNet presets, and why
+
+`imagenet` is 870 MB and `imagenet-original` is 6.7 GB, and the difference is
+not only download size. The cheap one holds the same photographs resized to a
+256-pixel short side and re-encoded as JPEG at around quality 75, and **that
+costs real accuracy**: the same checkpoint through the same processor scores
+78.0% on it against 79.8% on the originals.
+
+The absolute number is worth pinning down, because it is the check that the
+implementation is right rather than merely self-consistent:
+
+| ViT-B/16, 2048 images | Top-1 |
+|---|---|
+| `imagenet` (re-encoded, 870 MB) | 78.03% |
+| `imagenet-original` (6.7 GB) | 79.83% |
+| `imagenet-original`, timm eval transform | **81.40%** |
+| published | 81.4 – 81.8% |
+
+The last 1.4 points are the *preprocessing recipe*, not the model: published
+ViT numbers are measured with timm's transform (resize the short side to 248,
+bicubic, then centre-crop 224), while AutoDistiller uses **the checkpoint's own
+image processor**, which squashes the whole image to 224×224 bilinear. Using
+the checkpoint's own processor is the right default for a deployment tool — it
+is what a server would do — but it is worth knowing that it is not the recipe a
+paper's number came from. Reproduced on DeiT-B/16 too: 79.3% with its own
+processor, 81.1% with timm's, against a published 81.8%.
+
+Retention is unaffected either way, which is what the cheap preset is for: a
+baseline and a candidate see byte-identical inputs. Comparing *across* the two
+presets is refused outright — `compare` checks the dataset fingerprint.
 
 ---
 
