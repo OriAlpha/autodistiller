@@ -72,6 +72,10 @@ that would have fit.
 Confirmed not to scale with the model: bert-base-uncased is three times
 bge-small and its graph capture cost the same 0.10 GiB. A fraction of either the
 model or the device would have been wrong in both directions.
+
+# ponytail: reused unmeasured for a vision tower, which has the same no-cache
+# shape but no serving runtime here yet to measure a floor against. It is a
+# floor in the conservative direction, so it costs a candidate at worst.
 """
 
 ACTIVATION_RESIDENT_TOKEN_BUDGET = 32768
@@ -286,16 +290,17 @@ def estimate_memory(
     # is the sequence it encodes rather than a context it grows into, and
     # concurrency is the batch encoded at once rather than sequences held open.
     # Both still decide whether it fits, so the caller passes the same pair and
-    # the arithmetic is picked here.
+    # the arithmetic is picked here. A vision tower is the same case with the
+    # sequence length fixed by its patch grid rather than chosen.
     kv = (
-        activation_bytes(shape, seq_len=max_model_len, batch=concurrency)
-        if shape.is_encoder
-        else kv_cache_bytes(
+        kv_cache_bytes(
             shape, max_model_len=max_model_len, concurrency=concurrency, kv_dtype=kv_dtype
         )
+        if shape.has_kv_cache
+        else activation_bytes(shape, seq_len=max_model_len, batch=concurrency)
     )
 
-    if shape.is_encoder:
+    if not shape.has_kv_cache:
         # An encoder's runtime cost does not grow into the card: there is no
         # cache to size and no context to reserve for, so the floor is what a
         # pooling server actually holds.
@@ -307,7 +312,7 @@ def estimate_memory(
         overhead = int(basis * overhead_fraction)
 
     return MemoryEstimate(
-        dynamic_label="activations" if shape.is_encoder else "KV",
+        dynamic_label="KV" if shape.has_kv_cache else "activations",
         weights_bytes=weights,
         kv_cache_bytes=kv,
         overhead_bytes=overhead,

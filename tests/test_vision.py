@@ -17,6 +17,10 @@ import torch
 from PIL import Image
 
 from autodistiller.architecture import DECODER, ENCODER, VISION, model_kind
+from autodistiller.candidates.generator import generate_candidates
+from autodistiller.candidates.memory import estimate_memory, weight_bytes
+from autodistiller.candidates.shape import shape_from_config
+from autodistiller.compression.methods import METHODS
 from autodistiller.config import ImageClassificationTask
 from autodistiller.evaluation.datasets import _evenly_spaced, load_image_classification
 from autodistiller.evaluation.image_classification import evaluate_image_classification
@@ -62,6 +66,71 @@ def test_vision_loads_with_its_classifier():
     from transformers import AutoModelForImageClassification
 
     assert auto_class_for(_vit_config()) is AutoModelForImageClassification
+
+
+# --- the shape arithmetic -----------------------------------------------
+
+
+def test_vit_parameter_count_matches_the_real_checkpoint():
+    """86,567,656 is what ViT-B/16 actually loads with."""
+    shape = shape_from_config("google/vit-base-patch16-224", _vit_config())
+    assert shape.kind == VISION
+    assert shape.n_image_tokens == 197  # 14x14 patches plus the class token
+    assert shape.n_parameters == pytest.approx(86_567_656, rel=0.005)
+
+
+def test_a_vision_tower_has_no_kv_cache():
+    shape = shape_from_config("vit", _vit_config())
+    assert shape.has_kv_cache is False
+    assert shape.kv_bytes_per_token == 0
+
+
+def test_vit_blocks_have_a_two_matrix_mlp():
+    """Counting the decoder's gate would overstate the feed-forward by half."""
+    shape = shape_from_config("vit", _vit_config())
+    assert shape.dense_mlp_params_per_layer == 2 * 768 * 3072
+
+
+def test_a_staged_backbone_is_refused_rather_than_measured():
+    """Swin doubles its width every stage; one hidden_size does not describe it."""
+    config = _Config(
+        architectures=["SwinForImageClassification"],
+        image_size=224,
+        patch_size=4,
+        hidden_size=768,
+        depths=[2, 2, 18, 2],
+    )
+    with pytest.raises(ValueError, match="not a plain vision transformer"):
+        shape_from_config("microsoft/swin-tiny", config)
+
+
+# --- memory --------------------------------------------------------------
+
+
+def test_vision_memory_is_activations_not_cache():
+    shape = shape_from_config("vit", _vit_config())
+    estimate = estimate_memory(shape, None, max_model_len=197, concurrency=8)
+    assert estimate.dynamic_label == "activations"
+    assert estimate.kv_cache_bytes > 0  # activations, which do grow with batch
+
+
+def test_int8_halves_a_vit():
+    """Measured: 84.7 MiB of safetensors against 165.1 MiB at 16-bit."""
+    shape = shape_from_config("vit", _vit_config())
+    baseline = weight_bytes(shape, None)
+    quantized = weight_bytes(shape, METHODS["int8-weight-only"])
+    assert quantized / baseline == pytest.approx(0.51, abs=0.03)
+
+
+# --- the search space ----------------------------------------------------
+
+
+def test_sequence_length_is_not_a_search_axis_for_a_vit():
+    """197 tokens is what the patch grid gives; every other value is fiction."""
+    shape = shape_from_config("vit", _vit_config())
+    result = generate_candidates(shape, backend="vllm", context_lengths=(128, 512, 2048))
+    lengths = {c.max_model_len for c in result.accepted + [r.candidate for r in result.rejected]}
+    assert lengths == {197}
 
 
 # --- the subset ----------------------------------------------------------

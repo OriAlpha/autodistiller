@@ -27,7 +27,7 @@ from .speculative import SpeculativeSpec
 DEFAULT_CONTEXT_LENGTHS = (2048, 4096, 8192)
 
 ENCODER_BATCH_SIZES = (1, 8, 32)
-"""Texts per request, searched for an encoder and fixed at one otherwise.
+"""Texts (or images) per request, searched for an encoder and fixed at one otherwise.
 
 The dimension that actually moves an embedding server's throughput. A generation
 request carries one prompt and is batched by the runtime's scheduler; an
@@ -175,6 +175,12 @@ def _sort_key(candidate: Candidate) -> tuple:
 
 
 def _context_lengths(shape: ModelShape, requested: tuple[int, ...] | None) -> list[int]:
+    if shape.is_vision:
+        # Not an axis at all. A vision tower's sequence is its patch grid plus
+        # the class token, decided when the checkpoint was trained; any other
+        # value describes a model that does not exist, so searching over it
+        # would enumerate configurations nothing can serve.
+        return [shape.n_image_tokens]
     default = ENCODER_SEQUENCE_LENGTHS if shape.is_encoder else DEFAULT_CONTEXT_LENGTHS
     lengths = requested or default
     # A context longer than the model's positional range is not a candidate,
@@ -205,7 +211,7 @@ def generate_candidates(
 
     # An FP8 KV cache is not a dimension when there is no cache to hold. Left as
     # one, every encoder candidate would be enumerated twice, identically.
-    if shape.is_encoder:
+    if not shape.has_kv_cache:
         kv_dtypes = ("auto",)
 
     chosen: list[CompressionMethod | None] = [None] if include_baseline else []
@@ -227,10 +233,11 @@ def generate_candidates(
     if speculative is not None:
         speculations.append(speculative)
 
-    # Only an encoder searches it. A generation request carries one prompt and
-    # is batched by the runtime's own scheduler, so offering the dimension there
-    # would enumerate identical candidates.
-    batch_sizes = ENCODER_BATCH_SIZES if shape.is_encoder else (1,)
+    # Only an encoder searches it -- of either kind, texts per request or images
+    # per request. A generation request carries one prompt and is batched by the
+    # runtime's own scheduler, so offering the dimension there would enumerate
+    # identical candidates.
+    batch_sizes = (1,) if shape.has_kv_cache else ENCODER_BATCH_SIZES
 
     # Zero always, for the same reason: a depth is only worth searching against
     # the same recipe at full depth, or there is nothing to read the cost off.

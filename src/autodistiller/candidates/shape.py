@@ -17,7 +17,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from ..architecture import DECODER, ENCODER, model_kind
+from ..architecture import DECODER, ENCODER, VISION, model_kind
 
 
 @dataclass(frozen=True)
@@ -37,13 +37,34 @@ class ModelShape:
     architecture: str | None = None
 
     kind: str = DECODER
-    """``decoder`` or ``encoder``. Three formulas below turn on it.
+    """``decoder``, ``encoder`` or ``vision``. Three formulas below turn on it.
 
     A decoder block has a gated MLP of three matrices and a KV cache; an encoder
     block has a two-matrix MLP and no cache at all. Both configs spell their
     dimensions with the same field names, which is why this has to be carried
     rather than inferred from the numbers.
+
+    A vision tower is an encoder that reads pixels: same block, but its
+    sequence length is decided by the image and the patch grid rather than by a
+    tokenizer, and what it embeds is a patch projection rather than a
+    vocabulary.
     """
+
+    patch_size: int = 0
+    """Side of one square image patch. Vision only; zero elsewhere."""
+
+    image_size: int = 0
+    """Side of the input image the checkpoint was trained at. Vision only.
+
+    Not a free parameter the way a decoder's context is: the position table has
+    one row per patch, so a different resolution is a different checkpoint.
+    """
+
+    n_channels: int = 3
+    """Image channels the patch projection reads. Three, except when it isn't."""
+
+    n_labels: int = 0
+    """Classes the head predicts. Vision only; part of the weights, so counted."""
 
     n_experts: int = 0
     """Routed experts per MoE layer. Zero for a dense model."""
@@ -62,13 +83,48 @@ class ModelShape:
         return self.kind == ENCODER
 
     @property
+    def is_vision(self) -> bool:
+        return self.kind == VISION
+
+    @property
+    def has_kv_cache(self) -> bool:
+        """Whether anything is kept between forward passes.
+
+        Only a decoder does. Both encoder kinds see their whole input at once
+        and keep nothing, so they pay for activations instead -- a different
+        shape, quadratic in sequence length rather than linear in it.
+        """
+        return self.kind == DECODER
+
+    @property
+    def n_image_tokens(self) -> int:
+        """Patches plus the class token: the sequence a vision tower encodes.
+
+        Fixed by the checkpoint. This is why sequence length is a search axis
+        for a text encoder and not for this one -- there is exactly one value,
+        and asking for another describes a model that does not exist.
+        """
+        if not self.is_vision or not self.patch_size:
+            return 0
+        return (self.image_size // self.patch_size) ** 2 + 1
+
+    @property
     def embedding_params(self) -> int:
         """Input embeddings, plus the output head when there is one.
 
         An encoder has no output head to tie or untie -- what it has instead is
         a learned position table, where a modern decoder uses rotary embeddings
-        and stores nothing.
+        and stores nothing. A vision tower has neither a vocabulary nor a tied
+        head: it projects patches in and reads labels out.
         """
+        if self.is_vision:
+            # No vocabulary at all: what turns input into hidden states is one
+            # convolution over each patch. Everything outside the blocks, in
+            # one place -- patch projection, class token, position table, and
+            # the classifier that makes it a classifier.
+            patch = self.patch_size * self.patch_size * self.n_channels * self.hidden_size
+            table = self.n_image_tokens * self.hidden_size
+            return patch + self.hidden_size + table + self.hidden_size * self.n_labels
         table = self.vocab_size * self.hidden_size
         if self.is_encoder:
             return table + self.max_position_embeddings * self.hidden_size
@@ -89,8 +145,9 @@ class ModelShape:
     def dense_mlp_params_per_layer(self) -> int:
         # Gated MLP: gate and up projections in, down projection out. An encoder
         # predates the gate and has two matrices, so counting it as three
-        # overstates a BERT block's feed-forward by half.
-        matrices = 2 if self.is_encoder else 3
+        # overstates a BERT block's feed-forward by half. A ViT block is the
+        # same two.
+        matrices = 3 if self.kind == DECODER else 2
         return matrices * self.hidden_size * self.intermediate_size
 
     @property
@@ -146,7 +203,7 @@ class ModelShape:
         attention makes ``n_kv_heads`` much smaller than the attention head
         count, which is why it dominates long-context serving cost.
         """
-        if self.is_encoder:
+        if not self.has_kv_cache:
             # Nothing is cached between tokens: an encoder sees the whole
             # sequence at once and keeps nothing afterwards. This is the term
             # that dominates LLM serving and simply does not exist here.
@@ -154,6 +211,12 @@ class ModelShape:
         return 2 * self.n_layers * self.n_kv_heads * self.head_dim * 2
 
     def describe(self) -> str:
+        if self.is_vision:
+            return (
+                f"{self.n_parameters / 1e6:.0f}M params, {self.n_layers} layers, "
+                f"{self.image_size}px / {self.patch_size}px patches "
+                f"= {self.n_image_tokens} tokens, {self.n_labels} classes"
+            )
         if self.is_encoder:
             return (
                 f"{self.n_parameters / 1e6:.0f}M params, {self.n_layers} layers, "
@@ -233,11 +296,12 @@ def text_config_of(config: Any) -> Any:
 def _kind_or_reject(architectures: Any) -> str:
     """Which arithmetic describes this model, or refuse to guess.
 
-    Two shapes are described here: a decoder's gated MLP and KV cache, and an
-    encoder's two-matrix MLP and no cache. Both configs carry the same field
-    names, so getting this wrong does not fail -- it returns a confident wrong
-    answer, and a wrong memory estimate is worse than none because it is what a
-    candidate is screened against.
+    Three shapes are described here: a decoder's gated MLP and KV cache, an
+    encoder's two-matrix MLP and no cache, and a vision tower's patch grid.
+    The first two configs carry the same field names, so getting that wrong
+    does not fail -- it returns a confident wrong answer, and a wrong memory
+    estimate is worse than none because it is what a candidate is screened
+    against.
 
     A config with no ``architectures`` is read as a decoder. That is a local or
     hand-built config where we cannot tell, and guessing wrong in the
@@ -253,8 +317,59 @@ def _kind_or_reject(architectures: Any) -> str:
     names = [str(name) for name in (architectures or ())]
     raise ValueError(
         f"{names[0]} is not a decoder-only language model, and not a recognised "
-        f"encoder either. AutoDistiller's memory arithmetic does not describe it, "
-        f"and the estimate would be wrong rather than missing."
+        f"encoder or image classifier either. AutoDistiller's memory arithmetic "
+        f"does not describe it, and the estimate would be wrong rather than missing."
+    )
+
+
+def _vision_shape(model_id: str, config: Any, architecture: str | None) -> ModelShape:
+    """Dimensions of a plain vision transformer.
+
+    Plain meaning uniform: one hidden size, one block repeated, one patch grid.
+    That describes ViT and DeiT and stops there. Swin re-partitions and doubles
+    its width every stage, ConvNeXt has no attention at all, and both spell
+    their dimensions as lists -- so neither is measured with this arithmetic,
+    and neither is quietly read as if it were.
+    """
+    missing = [
+        name
+        for name in ("image_size", "patch_size", "num_hidden_layers", "num_attention_heads")
+        if _find_int(config, name) is None
+    ]
+    if missing:
+        raise ValueError(
+            f"{model_id} ({architecture}) classifies images but is not a plain vision "
+            f"transformer: its config has no {', '.join(missing)}. A staged or "
+            f"convolutional backbone (Swin, ConvNeXt) has a different width in every "
+            f"stage, so this arithmetic would be wrong rather than missing."
+        )
+
+    hidden = _first_int(config, "hidden_size")
+    n_heads = _first_int(config, "num_attention_heads")
+    patch = _first_int(config, "patch_size")
+    image = _first_int(config, "image_size")
+    n_tokens = (image // patch) ** 2 + 1
+
+    return ModelShape(
+        model_id=model_id,
+        n_layers=_first_int(config, "num_hidden_layers"),
+        hidden_size=hidden,
+        intermediate_size=_first_int(config, "intermediate_size", default=4 * hidden),
+        n_attention_heads=n_heads,
+        n_kv_heads=n_heads,
+        head_dim=_first_int(config, "head_dim", default=hidden // n_heads),
+        # No tokenizer, so no vocabulary. The position table is one row per
+        # patch, which is what max_position_embeddings holds for every other
+        # kind -- so the field keeps its meaning and the number comes from the
+        # patch grid instead of from a config field.
+        vocab_size=0,
+        max_position_embeddings=n_tokens,
+        patch_size=patch,
+        image_size=image,
+        n_channels=_first_int(config, "num_channels", default=3),
+        n_labels=len(getattr(config, "id2label", None) or ()) or 0,
+        architecture=architecture,
+        kind=VISION,
     )
 
 
@@ -271,6 +386,10 @@ def shape_from_config(model_id: str, config: Any) -> ModelShape:
             f"is not counted here, so the estimate would be wrong rather than missing."
         )
     kind = _kind_or_reject(architectures)
+    architecture = architectures[0] if architectures else None
+
+    if kind == VISION:
+        return _vision_shape(model_id, config, architecture)
 
     hidden = _first_int(config, "hidden_size", "n_embd", "d_model")
     n_heads = _first_int(config, "num_attention_heads", "n_head", "num_heads")
@@ -297,7 +416,7 @@ def shape_from_config(model_id: str, config: Any) -> ModelShape:
             config, "max_position_embeddings", "n_positions", default=4096
         ),
         tie_word_embeddings=bool(getattr(config, "tie_word_embeddings", False)),
-        architecture=architectures[0] if architectures else None,
+        architecture=architecture,
         kind=kind,
     )
 
