@@ -185,6 +185,9 @@ arithmetic. You would not guess that; you have to measure it, which is the point
 
 ## Which models work
 
+Full list, with what was measured and what is refused:
+**[docs/supported-models.md](docs/supported-models.md)**. In short:
+
 Any Hugging Face causal LM. There is no supported-model list in the code and no
 per-architecture handling — dimensions come from `config.json` and loading goes
 through `AutoModelForCausalLM`. Every one of these was checked on an 8 GiB card:
