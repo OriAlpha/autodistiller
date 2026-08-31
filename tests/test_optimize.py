@@ -1030,3 +1030,70 @@ def test_an_axis_that_separates_nothing_is_dropped():
 
     spread = ParetoReport([outcome(GIB, 1.0), outcome(4 * GIB, 0.98)])
     assert "vram" in {axis.key for axis in spread.axes}
+
+
+def test_a_search_where_nothing_helps_says_so():
+    """The recommender must name a winner, so on a model where nothing helps it
+    names whichever candidate the rounding favoured.
+
+    "Deploy it as it is" is a legitimate answer to "what should I deploy", and
+    the honest one when every gap is inside the measurement error.
+    """
+    from autodistiller.optimize.pareto import ParetoReport
+    from autodistiller.results import ConcurrencyResult, DeploymentBenchmark
+
+    def outcome(*, baseline: bool, throughput: float, quality: float) -> CandidateOutcome:
+        candidates = generate_candidates(qwen3_06b(), profile=BLACKWELL).accepted
+        candidate = next(c for c in candidates if c.is_baseline == baseline)
+        return CandidateOutcome(
+            candidate=candidate,
+            stage="benchmarked",
+            quality_retention=quality,
+            quality_stderr=0.05,
+            benchmark=DeploymentBenchmark(
+                backend="vllm",
+                endpoint="http://fake",
+                served_model="m",
+                phases=[
+                    ConcurrencyResult(
+                        concurrency=1,
+                        n_requests=8,
+                        duration_s=1.0,
+                        output_tokens_per_s=throughput,
+                        n_repeats=3,
+                        throughput_stderr=20.0,
+                        # Measured VRAM takes precedence over the estimate, and
+                        # equal readings make that axis flat -- which is the
+                        # encoder case, where the server fills to its own flag.
+                        peak_vram_bytes=4 * GIB,
+                    )
+                ],
+            ),
+        )
+
+    # Eight tokens per second apart, measured to plus or minus twenty.
+    flat = ParetoReport(
+        [
+            outcome(baseline=True, throughput=112.0, quality=1.0),
+            outcome(baseline=False, throughput=104.0, quality=0.999),
+        ]
+    )
+    assert flat.nothing_measurably_better
+    # It still names options; the verdict is what qualifies them.
+    assert flat.recommendations
+
+    real = ParetoReport(
+        [
+            outcome(baseline=True, throughput=112.0, quality=1.0),
+            outcome(baseline=False, throughput=900.0, quality=0.999),
+        ]
+    )
+    assert not real.nothing_measurably_better
+
+
+def test_not_knowing_is_not_the_same_as_nothing_helping():
+    """With no baseline there is nothing to be no better than."""
+    from autodistiller.optimize.pareto import ParetoReport
+
+    assert not ParetoReport([]).nothing_measurably_better
+    assert not ParetoReport([_outcome(quality_retention=1.0)]).nothing_measurably_better

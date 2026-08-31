@@ -548,6 +548,17 @@ def render_recommendations(report) -> Table:
             recommendation.trade_off or Text("nothing", style="dim"),
         )
 
+    # The recommender has to name a winner per objective, so it always will.
+    # When nothing beat the baseline by more than the measurement error, saying
+    # so is the answer -- the rows above are then a ranking of rounding.
+    if report.nothing_measurably_better:
+        table.caption = (
+            "No candidate is measurably better than the baseline on any axis. "
+            "Deploying the model as it is a defensible choice; the options above "
+            "differ by less than the measurements can resolve."
+        )
+        table.caption_style = "yellow"
+
     return table
 
 

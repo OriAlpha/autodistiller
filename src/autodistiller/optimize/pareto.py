@@ -502,6 +502,40 @@ class ParetoReport:
         return pareto_frontier(self.outcomes, self.axes)
 
     @property
+    def nothing_measurably_better(self) -> bool:
+        """Whether the search found any real improvement on the baseline.
+
+        The recommender must name a winner per objective, so it will always
+        produce one -- and on a model where nothing helps, that winner is
+        whichever candidate the rounding favoured. "Deploy it as it is" is a
+        legitimate answer to "what should I deploy", and it is the honest one
+        when every gap is inside the measurement error.
+
+        False when nothing can be judged: no baseline, or no candidate measured
+        alongside it. Not knowing is not the same as knowing nothing helped.
+        """
+        baseline = next((o for o in self.outcomes if o.candidate.is_baseline), None)
+        others = [o for o in self.outcomes if o is not baseline]
+        if baseline is None or not others:
+            return False
+
+        judged = False
+        for axis in self.axes:
+            reference = axis.value(baseline)
+            if reference is None:
+                continue
+            for other in others:
+                value = axis.value(other)
+                if value is None:
+                    continue
+                judged = True
+                if axis.better(value, reference) and not _within_noise(
+                    other, [baseline], axis, value, reference
+                ):
+                    return False
+        return judged
+
+    @property
     def recommendations(self) -> list[Recommendation]:
         """Best-quality, fastest, smallest and balanced, each with its cost.
 
