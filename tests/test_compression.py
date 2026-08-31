@@ -477,5 +477,10 @@ def test_a_float32_checkpoint_is_compressed_at_sixteen_bits():
     assert runner._resolve_dtype({"dtype": "auto"}, Config("torch.float32")) == "bfloat16"
     # A checkpoint already at 16 bits is followed, not re-specified.
     assert runner._resolve_dtype({"dtype": "auto"}, Config("torch.bfloat16")) == "auto"
+    assert runner._resolve_dtype({"dtype": "auto"}, Config("torch.float16")) == "auto"
+    # Declaring nothing is not "leave it alone": Transformers loads float32 when
+    # nobody says otherwise, which is how bert-base-uncased -- and every
+    # checkpoint of its era -- kept writing 32-bit tensors.
+    assert runner._resolve_dtype({"dtype": "auto"}, Config(None)) == "bfloat16"
     # And asking for one is asking for it.
     assert runner._resolve_dtype({"dtype": "float32"}, Config("torch.float32")) == "float32"

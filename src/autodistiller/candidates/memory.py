@@ -68,6 +68,10 @@ make every encoder configuration report the same total.
 0.15 rather than the measured 0.10, because under-estimating overhead produces
 candidates that OOM at serve time and over-estimating only costs a candidate
 that would have fit.
+
+Confirmed not to scale with the model: bert-base-uncased is three times
+bge-small and its graph capture cost the same 0.10 GiB. A fraction of either the
+model or the device would have been wrong in both directions.
 """
 
 ACTIVATION_RESIDENT_TOKEN_BUDGET = 32768
@@ -80,9 +84,14 @@ function of the client's concurrency, which the server does not honour:
 0.77 GiB including weights and CUDA graphs, so it rejected configurations that
 run comfortably.
 
-# ponytail: one budget, calibrated against one measured vLLM pooling run rather
-# than read out of its scheduler config, which is version-dependent. Revisit if
-# a runtime lands far from it.
+Checked at 3x the size: bert-base-uncased (109M) estimates 1.20 GiB at the
+budget against a server whose whole-device peak was 1.00 GiB, of which roughly
+1.00 is the runtime context the launcher accounts for separately. Conservative
+at both sizes, which is the direction a screen should err in.
+
+# ponytail: one budget for every runtime, calibrated against vLLM pooling rather
+# than read out of a scheduler config, which is version-dependent. Revisit if a
+# runtime lands far from it.
 """
 
 ACTIVATION_BLOCK_COPIES = 2

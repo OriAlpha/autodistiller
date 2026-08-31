@@ -87,12 +87,18 @@ def _build_modifier(job: dict, ignore: list[str]):
 def _resolve_dtype(job: dict, config) -> str:
     """What to load the weights as before quantizing them.
 
-    ``auto`` follows the checkpoint, except for a float32 one, which becomes
-    bfloat16. Quantization leaves embeddings and the output head alone, so a
-    float32 source writes those tensors out at 32 bits -- and every serving
-    runtime then downcasts them to 16 at load. Measured on bge-small-en-v1.5:
-    70.7 MB written against 45.1 MB of weights anything would actually hold, and
-    an artifact that disagrees with the memory estimate by 57% for no benefit.
+    ``auto`` means 16-bit unless the checkpoint declares something narrower.
+    Quantization leaves embeddings and the output head alone, so a 32-bit source
+    writes those tensors out at 32 bits -- and every serving runtime then
+    downcasts them at load. Measured on bge-small-en-v1.5: 70.7 MB written
+    against the 45.1 MB anything would actually hold, an artifact 57% larger
+    than the memory estimate for no benefit.
+
+    A config that declares *nothing* counts as 32-bit, because that is what
+    Transformers loads when nobody says otherwise. Reading the silence as "leave
+    it alone" is what let bert-base-uncased -- which states no dtype at all,
+    like every checkpoint of its era -- keep writing float32 after this function
+    already existed.
 
     An explicit dtype is honoured, since asking for one is asking for it.
     """
@@ -100,7 +106,7 @@ def _resolve_dtype(job: dict, config) -> str:
     if requested != "auto":
         return requested
     source = str(getattr(config, "dtype", None) or getattr(config, "torch_dtype", None) or "")
-    return "bfloat16" if source.endswith("float32") else "auto"
+    return "auto" if source.endswith(("float16", "bfloat16")) else "bfloat16"
 
 
 def _load_model(job: dict):
