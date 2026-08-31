@@ -9,6 +9,87 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Embedding models are supported end to end.** BERT-family encoders -- BGE,
+  E5, GTE, MiniLM, RoBERTa -- go through the same spine as an LLM: evaluate,
+  compress, screen, benchmark, rank, export. The measurement machinery turned
+  out to be model-agnostic; only the loader, the memory arithmetic, the tasks
+  and the serving flags needed a second implementation.
+
+  Five of the eleven methods apply (`int8`, `int8-weight-only`, `int4-gptq`,
+  `fp8`, `fp8-static`). `int4-awq` is refused with a reason: AWQ smooths
+  activations through per-architecture mappings and llmcompressor registers 31
+  of them, every one a decoder, so on an encoder it matches nothing and divides
+  by zero. GGUF is not offered on encoders because it has not been tried.
+
+  Measured on `bge-small-en-v1.5` against a real vLLM pooling server:
+  `int8-weight-only` holds 100.3% of STS-B at 47% smaller, and batch 8 serves
+  1126 texts/s against batch 1's 112 for two milliseconds more latency.
+
+- **Two evaluation tasks for embedding models.** `stsb` scores sentence
+  similarity as a rank correlation; `scifact` scores retrieval as nDCG@10 over
+  a real corpus. The second earns its place -- `int4-gptq` holds 99.5% of
+  similarity and only 96.8% of retrieval, so a model that looks lossless on the
+  cheap screen measurably changes which documents it returns.
+
+- **Depth pruning**, searched as a candidate dimension alongside quantization.
+  Blocks are chosen by how little they move the residual stream, in one forward
+  pass with no training, and the two compose: prune first, then quantize what
+  is left. It usually loses on small models and says so -- dropping 4 of
+  Qwen3-0.6B's 28 blocks took wikitext-2 perplexity from 17.0 to 29.0, reported
+  as dominated rather than recommended.
+
+- **Batch size is searched for encoders**, and it is the dimension that moves
+  an embedding server: ten times the throughput where quantization bought one
+  percent.
+
+- **Latency and request-rate constraints** (`--max-latency-ms`,
+  `--min-request-rate`), for endpoints that answer in a single response and so
+  have neither a first token nor a rate between tokens.
+
+- **Error bars on throughput and latency.** Each concurrency rung is measured
+  three times by default (`--benchmark-repeats`) and reports the median with the
+  spread, so the frontier can call a gap noise the way it already could for
+  quality. Without it, 62.6 against 62.1 requests per second read as a real
+  difference.
+
+- **A verdict for when nothing helped.** The recommender must name a winner per
+  objective, so on a model where no candidate beats the baseline it named
+  whichever the rounding favoured. When every gap is inside the measurement
+  error the report now says so.
+
+- `autodistiller prune`, `autodistiller methods --model`, and a support matrix
+  in the README.
+
+### Fixed
+
+- **Artifacts from a float32 checkpoint were up to 57% larger than they needed
+  to be.** Quantization leaves embeddings and the output head alone, so a
+  32-bit source wrote those back out at 32 bits and every serving runtime then
+  downcast them at load. `bge-small-en-v1.5` produced 70.7 MB against the 45.1
+  MB anything would hold. A checkpoint that declares no dtype at all --
+  `bert-base-uncased`, and every checkpoint of its era -- counts as 32-bit,
+  since that is what Transformers loads when nobody says otherwise.
+
+- **The peak-throughput rung was the slowest one for a non-streaming
+  endpoint.** It ranked phases by output tokens per second, which is zero on
+  every rung of an embedding sweep, so a throughput floor was checked against
+  the wrong measurement.
+
+- **Requests per second is not comparable across batch sizes.** A batch of 32
+  does thirty-two times the work of a batch of 1, so ranking on requests alone
+  put the smallest batch first while it was doing the least. Throughput now
+  counts units of work.
+
+- **An axis that separates nothing no longer ranks candidates.** vLLM fills to
+  its memory-utilization flag whatever the model's size, so every encoder
+  candidate came back within a few hundredths of a GiB of every other and the
+  frontier called one dominated because a constant wobbled.
+
+- The compression recipe claimed to have left `lm_head` alone on models that
+  have none, which described a step that never happened -- and since the recipe
+  is part of an artifact's identity, two different models keyed to the same
+  shape.
+
 - README shows a complete `optimize` run end to end -- the command, the tables
   it prints, and what the numbers mean -- using measured output from Qwen3-4B on
   an 8 GiB card, where bf16 does not fit and quantizing is the only way to run
