@@ -302,3 +302,75 @@ baseline was measured against. So both run in their own environments: vLLM over 
 as a subprocess. A useful side effect is that llama.cpp needs no new benchmark client in Phase 9,
 because it speaks the same OpenAI API.
 
+
+---
+
+## A second model family
+
+The tool was built for decoder-only LLMs and now measures BERT-family encoders too. The
+interesting result is how little had to change: the spine — the experiment cache, the
+significance test, the Pareto frontier, the objectives, export — never had to know. What needed a
+second implementation was five slots.
+
+| | LLM | Encoder |
+|---|---|---|
+| Loader | `AutoModelForCausalLM` | `AutoModel` |
+| Cost model | KV cache dominates | activations, quadratic in sequence length |
+| Quality metric | perplexity, accuracy | Spearman, nDCG@10 |
+| Compressor | llmcompressor, llama.cpp | llmcompressor |
+| Runtime | vLLM, llama.cpp | vLLM `--runner pooling` |
+
+No `Domain` abstraction was introduced. The optimizer already injected `evaluate_fn`,
+`benchmark_fn` and `compress_fn`, which is the seam; the rest is a kind read off the architecture
+name. Extracting an interface from one example produces the wrong interface, and two examples was
+the point at which it became worth not doing.
+
+**The premise shifts.** For an LLM the question is *"will it fit?"* — that is why memory screening
+comes first and costs nothing. For an encoder nothing else is true: a 33M model fits an 8 GiB card
+a hundred times over, so VRAM stops being the axis that separates candidates and latency and
+throughput take over. The Pareto machinery handled that unchanged, but the constraint vocabulary
+had to grow, and an axis whose values are all but identical is now dropped rather than allowed to
+manufacture a verdict.
+
+**What the runtime does, not what the format allows.** 2:4 sparsity was the obvious first move —
+llmcompressor produces it and `sparse-24-bitmask` is still in the compressed-tensors format enum.
+vLLM 0.27 has removed sparsity support entirely: no schemes, no kernels, and a hard error on any
+model carrying a `sparsity_config`. Depth pruning was built instead, because a pruned model is an
+ordinary dense checkpoint that every runtime serves with no special kernel. Checking the runtime
+before building for the format is the general lesson, and it recurred: AWQ turned out to be
+decoder-only for a structural reason (its mapping registry holds 31 architectures, every one a
+decoder), and vLLM refused to start on a 70 MB encoder because it wanted 92% of the card.
+
+## Measuring one thing and ranking on another
+
+Three bugs in this project have had the same shape, and none of them failed loudly.
+
+`best_throughput` ranked concurrency rungs by output tokens per second. An embedding endpoint emits
+no output tokens, so every rung tied at zero and it returned the *first* — the slowest — and a
+throughput floor was then checked against it. Then the frontier printed `0 tok/s` across an
+embedding search and scored `quality × throughput` as `100% × 0`: the benchmark had measured the
+right things, but the objective, the axes and the console all still asked for tokens. Then batch
+size arrived and requests per second stopped being comparable, because a batch of 32 does
+thirty-two times the work of a batch of 1 — so the search ranked batch 1 first while it was doing
+the least.
+
+The fix in each case was the same: one place decides which rate a phase actually measured, and
+every label, axis and objective follows it. A number with the wrong unit attached is worse than a
+missing number, because nothing about it looks wrong.
+
+## Error bars on the performance axes
+
+Quality has carried a standard error since Phase 1, and the frontier has always been able to call a
+gap noise. Throughput and latency were single readings with nothing to offer, which was tolerable
+while candidates differed by 40%, as LLM candidates do. On a small encoder they differ by less than
+one percent, and the frontier was calling one candidate Pareto-optimal and another dominated on
+0.8%.
+
+Each rung is now measured three times and reports the median with the spread across repeats — the
+median because a single stalled repeat moves a mean and not a median, and a stall is the thing
+being guarded against. A rung measured once reports *no* spread rather than zero: unmeasured spread
+is unknown, and zero would make every gap infinitely significant.
+
+The same reasoning produced a verdict the tool did not previously have. The recommender must name a
+winner per objective, so on a model where nothing helps it names whichever candidate the rounding
+favoured. When every gap is inside the measurement error, saying so is the answer.
