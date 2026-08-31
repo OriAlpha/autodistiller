@@ -675,13 +675,23 @@ def compress(
     # The runtime that serves this format, not whichever one happens to be
     # first: a GGUF handed to `vllm serve` is a command that cannot work.
     from .compression.methods import resolve_method
+    from .compression.pipeline import model_kind_of
     from .serving.backends import resolve_backend
 
     runtime = resolve_backend(resolve_method(method).backends[0])
-    console.print(
-        f"[dim]Serve it with:[/dim] "
-        f"{runtime.launch_command(runtime.model_path(artifact.output_dir), max_model_len=4096)}"
-    )
+    kind = model_kind_of(ModelSpec(id=model, trust_remote_code=trust_remote_code))
+    if runtime.serves(kind):
+        console.print(
+            f"[dim]Serve it with:[/dim] "
+            f"{runtime.launch_command(runtime.model_path(artifact.output_dir), max_model_len=4096)}"
+        )
+    else:
+        # The artifact is real and measurable; what is missing is a runtime.
+        console.print(
+            f"[dim]No serving backend here runs a {kind} model, so there is no launch "
+            f"command to give. The artifact evaluates like any other:[/dim]\n"
+            f"  autodistiller evaluate --model {artifact.output_dir} --task imagenet"
+        )
 
 
 @app.command()
@@ -876,6 +886,14 @@ def candidates(
 
     console.print(f"[dim]|[/dim] {shape.describe()}")
     console.print()
+    if (blocking := result.blocking_reason) is not None:
+        console.print(f"[yellow]No candidates: {blocking}.[/yellow]")
+        console.print(
+            f"[dim]All {result.n_considered} configurations were rejected for the same "
+            f"reason, so there is nothing to compare. Evaluation and compression still "
+            f"work on this model.[/dim]"
+        )
+        return
     console.print(render_candidates(result, show_rejected=not hide_rejected))
     console.print()
     console.print(

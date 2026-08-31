@@ -30,6 +30,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from .architecture import model_kind
 from .compression.pipeline import ARTIFACT_SIDECAR
 from .compression.prune import PRUNE_SCHEME
 from .metadata.environment import EnvironmentInfo
@@ -327,7 +328,9 @@ class ExportManifest(BaseModel):
         return cls.model_validate_json(Path(path).read_text(encoding="utf-8"))
 
 
-def _serve_command(backend: str, path: str, max_model_len: int | None) -> str:
+def _serve_command(
+    backend: str, path: str, max_model_len: int | None, model_kind: str | None = None
+) -> str:
     """The command that serves this artifact, as that runtime spells it.
 
     Two things a raw ``launch_command`` call gets wrong, and both are silent.
@@ -338,6 +341,13 @@ def _serve_command(backend: str, path: str, max_model_len: int | None) -> str:
     the machine it was exported to.
     """
     runtime = resolve_backend(backend)
+    if not runtime.serves(model_kind):
+        # There is no command. Saying so is the honest export; printing one that
+        # cannot work makes the bundle look deployable when it is not.
+        return (
+            f"# no serving backend here runs a {model_kind} model. "
+            f"The weights and the recipe are complete; the runtime is what is missing."
+        )
     return runtime.launch_command(runtime.model_path(path), max_model_len=max_model_len)
 
 
@@ -441,7 +451,16 @@ def build_manifest(
         deployment=record.deployment,
         hardware=record.hardware,
         environment=record.environment,
-        serve_command=_serve_command(backend, served, max_model_len),
+        serve_command=_serve_command(
+            backend,
+            served,
+            max_model_len,
+            # A list, because the record stores one architecture name and
+            # `model_kind` takes the config's list of them. Handed the bare
+            # string it iterates characters, matches no suffix, and answers
+            # "unknown" -- which reads as servable.
+            model_kind=model_kind([record.model.architecture]),
+        ),
         reproduce=_reproduce_commands(record, artifact),
         gguf=gguf_note(
             artifact_format(directory) if directory else None,

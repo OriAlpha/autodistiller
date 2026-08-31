@@ -19,12 +19,13 @@ from PIL import Image
 from autodistiller.architecture import DECODER, ENCODER, VISION, model_kind
 from autodistiller.candidates.generator import generate_candidates
 from autodistiller.candidates.memory import estimate_memory, weight_bytes
-from autodistiller.candidates.shape import shape_from_config
+from autodistiller.candidates.shape import ModelShape, shape_from_config
 from autodistiller.compression.methods import METHODS, check_method
 from autodistiller.config import ImageClassificationTask
 from autodistiller.evaluation.datasets import _evenly_spaced, load_image_classification
 from autodistiller.evaluation.image_classification import evaluate_image_classification
 from autodistiller.models.loader import LoadedModel, auto_class_for
+from autodistiller.serving.backends import resolve_backend
 
 
 class _Config:
@@ -133,12 +134,46 @@ def test_sequence_length_is_not_a_search_axis_for_a_vit():
     assert lengths == {197}
 
 
+def test_no_backend_here_serves_a_vision_tower():
+    shape = shape_from_config("vit", _vit_config())
+    result = generate_candidates(shape, backend="vllm")
+    assert result.accepted == []
+    assert result.blocking_reason is not None
+    assert "vision" in result.blocking_reason
+
+
+def test_a_shared_reason_only_blocks_when_it_is_shared():
+    """A decoder's rejections disagree, so no single reason explains them."""
+    shape = ModelShape(
+        model_id="tiny",
+        n_layers=2,
+        hidden_size=64,
+        intermediate_size=128,
+        n_attention_heads=4,
+        n_kv_heads=4,
+        head_dim=16,
+        vocab_size=1000,
+        max_position_embeddings=2048,
+    )
+    result = generate_candidates(shape, backend="vllm")
+    assert result.accepted  # a decoder still generates candidates
+    assert result.blocking_reason is None
+
+
 def test_calibrated_methods_do_not_apply_to_a_vision_model():
     """Calibration pushes text through a tokenizer, and a ViT has neither."""
     for name in ("int8", "int4-gptq", "int4-awq", "fp8-static"):
         assert not check_method(METHODS[name], model_kind=VISION).available
     for name in ("int8-weight-only", "fp8"):
         assert check_method(METHODS[name], model_kind=VISION).available
+
+
+def test_backends_serve_text_models_only():
+    assert resolve_backend("vllm").serves(DECODER)
+    assert resolve_backend("vllm").serves(ENCODER)
+    assert not resolve_backend("vllm").serves(VISION)
+    # An unreadable config gives no kind, which is not evidence of anything.
+    assert resolve_backend("vllm").serves(None)
 
 
 # --- the subset ----------------------------------------------------------
@@ -286,3 +321,15 @@ def test_an_image_processor_counts_as_a_preprocessor(tmp_path):
     checks = {c.name: c for c in inspect_artifact(directory)}
     assert checks["processor"].ok
     assert "tokenizer" not in checks
+
+
+def test_export_gives_no_launch_command_for_a_vision_model():
+    """A command that cannot work makes an undeployable bundle look deployable."""
+    from autodistiller.export import _serve_command
+
+    text = _serve_command("vllm", "artifacts/x", 2048, model_kind=DECODER)
+    assert text.startswith("vllm serve")
+
+    vision = _serve_command("vllm", "artifacts/x", 197, model_kind=VISION)
+    assert "vllm serve" not in vision
+    assert "no serving backend" in vision

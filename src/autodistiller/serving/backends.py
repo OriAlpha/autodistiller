@@ -20,6 +20,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..architecture import DECODER, ENCODER
+
 DEFAULT_PORT = 8000
 
 
@@ -37,6 +39,18 @@ class Backend:
     """What this runtime is pointed at: a Hugging Face ``directory``, or a
     single GGUF ``file``."""
 
+    model_kinds: tuple[str, ...] = (DECODER, ENCODER)
+    """Kinds of model this runtime has a server for.
+
+    Not the same question as whether the weights are valid or whether the
+    quantization format has kernels: a runtime serves the architectures in its
+    registry and nothing else. Checked rather than assumed -- vLLM 0.27's
+    registry holds one image tower, `PrithviGeoSpatialMAE`, routed out to
+    terratorch, and no `ForImageClassification` entry at all. So a ViT
+    artifact is real, loadable and measurable, and there is nothing here to
+    serve it with; saying so beats printing a command that cannot work.
+    """
+
     kv_dtypes: tuple[str, ...] = ("auto", "fp8")
     """KV cache types worth searching over. Backend-specific: llama.cpp has its
     own quantized cache vocabulary and no fp8, so offering fp8 there would
@@ -53,6 +67,14 @@ class Backend:
     passes it through as one argument."""
 
     notes: str = ""
+
+    def serves(self, model_kind: str | None) -> bool:
+        """Whether this runtime has a server for that kind of model.
+
+        Unknown counts as servable: the kind is read from an architecture name
+        and a config that cannot be read is not evidence of anything.
+        """
+        return model_kind is None or model_kind in self.model_kinds
 
     def model_path(self, artifact_dir: str) -> str:
         """The path to hand this runtime for an artifact AutoDistiller produced.

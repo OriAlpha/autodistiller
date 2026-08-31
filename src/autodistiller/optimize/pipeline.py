@@ -141,6 +141,15 @@ class OptimizationResult:
     stopped_early: bool = False
     duration_s: float = 0.0
 
+    blocking_reason: str | None = None
+    """Why the search space was empty, when one reason emptied all of it.
+
+    Without it an empty search reports "no candidate satisfied VRAM <= 8 GiB",
+    which names the constraint the user happened to pass rather than the reason
+    -- and for a model no runtime here can serve, memory had nothing to do
+    with it.
+    """
+
     @property
     def qualified(self) -> list[CandidateOutcome]:
         return [o for o in self.outcomes if o.qualified]
@@ -192,6 +201,8 @@ class OptimizationResult:
         """Why the recommendation qualifies, in the roadmap's words."""
         best = self.recommended
         if best is None or best.score is None:
+            if self.blocking_reason:
+                return f"Nothing to search: {self.blocking_reason}."
             return (
                 f"No candidate satisfied {self.constraints.describe()}. "
                 f"{len(self.outcomes)} configurations were evaluated."
@@ -426,6 +437,7 @@ class Optimizer:
             objective=self.objective,
             constraints=self.constraints,
             backend=self.backend,
+            blocking_reason=candidate_set.blocking_reason,
         )
 
         ordered = search_order(candidate_set.accepted, self.objective)
