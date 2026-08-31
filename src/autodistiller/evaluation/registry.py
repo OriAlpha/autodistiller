@@ -9,6 +9,7 @@ deployment than any public benchmark:
 ``ppl:data/domain.txt``      perplexity over a local text file
 ``ppl:data/docs.jsonl``      perplexity over a local JSONL corpus
 ``mc:data/my_evals.jsonl``   multiple choice over a local JSONL file
+``img:data/photos.jsonl``    image classification over a local JSONL file
 ===========================  =================================================
 """
 
@@ -21,6 +22,7 @@ from typing import Literal
 from ..config import (
     DatasetSpec,
     EmbeddingTask,
+    ImageClassificationTask,
     MultipleChoiceTask,
     PerplexityTask,
     RetrievalTask,
@@ -35,6 +37,78 @@ DEFAULT_SCREENING_LIMIT = 256
 Phase 1 is a screening stage. A full wikitext-2 pass is minutes of GPU time that
 buys very little extra signal about whether a baseline is sane.
 """
+
+
+IMAGENET_SCREENING_LIMIT = 2048
+"""Images used for the ImageNet presets when no limit is given.
+
+Larger than the text screening default because the metric is coarser. Top-1
+over 1000 classes is a binomial, so its standard error is +/-2.4% at 256 images
+and +/-0.9% at 2048 -- and the differences worth catching between a baseline
+and a quantized candidate are around one percent. A screen whose error bar is
+wider than the effect is not a screen.
+
+The subset is taken evenly across the split rather than from the front, because
+an ImageNet validation split arrives sorted by class.
+"""
+
+
+def _imagenet(limit: int | None) -> TaskSpec:
+    """ImageNet-1k validation, re-encoded small. The cheap screen.
+
+    870 MB rather than 6.7 GB, because every image has been resized to a
+    256-pixel short side and re-encoded as JPEG at around quality 75. That is
+    not free: measured against the same photographs at original quality, the
+    same checkpoint and the same processor, this costs **4.2 points of top-1**
+    (80.5% against 84.7% on ImageNet classes 0-133, ViT-B/16). So a number from
+    this preset is a screen, not a figure to compare against a paper -- use
+    ``imagenet-original`` for that.
+
+    Retention is unaffected, which is what this preset is for: a baseline and a
+    candidate see byte-identical inputs, and the dataset fingerprint refuses a
+    comparison across the two presets anyway.
+
+    The canonical `imagenet-1k` repo is gated behind an access request, which
+    makes it a poor default for a tool that should run on a fresh machine; both
+    presets here are ungated mirrors of the same 50k images at the same 1000
+    labels in the same order.
+    """
+    return ImageClassificationTask(
+        name="imagenet",
+        dataset=DatasetSpec(
+            source="hub",
+            path="evanarlian/imagenet_1k_resized_256",
+            split="val",
+            # Named explicitly: the repo also holds the 1.28M-image training
+            # split, and asking for "val" by name alone downloads that too.
+            data_files="data/val-*.parquet",
+            limit=limit or IMAGENET_SCREENING_LIMIT,
+        ),
+    )
+
+
+def _imagenet_original(limit: int | None) -> TaskSpec:
+    """ImageNet-1k validation at original resolution and quality.
+
+    6.7 GB, downloaded once. What it buys is an absolute number that can be
+    checked against a published one, which is the check that the implementation
+    is right rather than merely self-consistent -- the same reason `scifact`
+    exists next to `stsb`.
+
+    The split is named ``train`` in this repo, which holds only the 50k
+    validation images. That is the repo's naming, kept rather than corrected so
+    the spec says what will actually be requested.
+    """
+    return ImageClassificationTask(
+        name="imagenet-original",
+        dataset=DatasetSpec(
+            source="hub",
+            path="mrm8488/ImageNet1K-val",
+            split="train",
+            data_files="data/train-*.parquet",
+            limit=limit or IMAGENET_SCREENING_LIMIT,
+        ),
+    )
 
 
 def _scifact(limit: int | None) -> TaskSpec:
@@ -166,6 +240,8 @@ PRESETS: dict[str, PresetFactory] = {
     "piqa": _piqa,
     "stsb": _stsb,
     "scifact": _scifact,
+    "imagenet": _imagenet,
+    "imagenet-original": _imagenet_original,
 }
 
 DEFAULT_TASKS = ("wikitext2",)
@@ -175,6 +251,8 @@ _KIND_PREFIXES = {
     "perplexity": "perplexity",
     "mc": "multiple_choice",
     "multiple_choice": "multiple_choice",
+    "img": "image_classification",
+    "image_classification": "image_classification",
 }
 
 
@@ -200,7 +278,8 @@ def resolve_task(expression: str, *, limit: int | None = None) -> TaskSpec:
             return PRESETS[expression](limit)
         raise ValueError(
             f"unknown task {expression!r}. Use a preset ({', '.join(sorted(PRESETS))}) "
-            f"or a prefixed path such as 'ppl:corpus.txt' / 'mc:evals.jsonl'."
+            f"or a prefixed path such as 'ppl:corpus.txt' / 'mc:evals.jsonl' / "
+            f"'img:photos.jsonl'."
         )
 
     path = Path(target)
@@ -216,6 +295,8 @@ def resolve_task(expression: str, *, limit: int | None = None) -> TaskSpec:
 
     if kind == "perplexity":
         return PerplexityTask(name=_task_name_from_path(path), dataset=dataset)
+    if kind == "image_classification":
+        return ImageClassificationTask(name=_task_name_from_path(path), dataset=dataset)
     return MultipleChoiceTask(name=_task_name_from_path(path), dataset=dataset)
 
 

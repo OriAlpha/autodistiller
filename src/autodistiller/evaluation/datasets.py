@@ -9,6 +9,7 @@ makes that detectable.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -85,6 +86,28 @@ class SentencePairSet:
     @property
     def n_examples(self) -> int:
         return len(self.examples)
+
+
+@dataclass
+class ImageSet:
+    """Labelled images, held encoded.
+
+    Encoded rather than decoded on purpose. A JPEG is tens of kilobytes and the
+    bitmap it decodes to is a quarter of a megabyte, so holding a few thousand
+    decoded would cost more RAM than the model does -- and the evaluator needs
+    exactly one batch of them at a time. It also makes the fingerprint the file
+    bytes themselves rather than a re-encoding of somebody's decode.
+    """
+
+    images: list[bytes]
+    labels: list[int]
+    fingerprint: str
+    source: str
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def n_examples(self) -> int:
+        return len(self.images)
 
 
 @dataclass
@@ -228,6 +251,25 @@ def check_dataset_available(spec: DatasetSpec) -> None:
         raise FileNotFoundError(f"dataset file not found: {spec.path}")
 
 
+def _hub_kwargs(spec: DatasetSpec) -> dict[str, Any]:
+    """Extra ``load_dataset`` arguments this spec asks for.
+
+    Only ``data_files``, and only when set. Naming the files is what keeps a
+    split-sized download split-sized: `datasets` resolves a bare split name by
+    fetching every file in the repo first, which is fine for wikitext and is 26
+    GB for an image corpus whose validation half is under one.
+    """
+    if not spec.data_files:
+        return {}
+    # Naming the files means producing fewer splits than the repo advertises,
+    # which `datasets` treats as a failed download unless told otherwise. It is
+    # not one: the other splits were deliberately not asked for.
+    return {
+        "data_files": {spec.split: spec.data_files},
+        "verification_mode": "no_checks",
+    }
+
+
 def _load_hub_rows(spec: DatasetSpec) -> list[dict[str, Any]]:
     check_dataset_available(spec)
     try:
@@ -235,7 +277,7 @@ def _load_hub_rows(spec: DatasetSpec) -> list[dict[str, Any]]:
     except ImportError as exc:  # pragma: no cover - datasets is a hard dependency
         raise RuntimeError("`datasets` is required for hub datasets") from exc
 
-    dataset = load_dataset(spec.path, spec.name, split=spec.split)
+    dataset = load_dataset(spec.path, spec.name, split=spec.split, **_hub_kwargs(spec))
     if spec.limit is not None:
         dataset = dataset.select(range(min(spec.limit, len(dataset))))
     return [dict(row) for row in dataset]
@@ -346,6 +388,133 @@ def load_multiple_choice(
         ]
     )
     return MultipleChoiceSet(examples=examples, fingerprint=fingerprint, source=source)
+
+
+def _evenly_spaced(n_rows: int, limit: int | None) -> list[int] | None:
+    """Indices of ``limit`` rows spread across the whole split, or None for all.
+
+    Not the first ``limit``, which is what every other loader here means by a
+    limit and what would be wrong on this one. An image classification split is
+    conventionally stored grouped by class -- ImageNet's validation set runs 50
+    tench, then 50 goldfish, and so on -- so the first 256 rows are five classes
+    out of a thousand, and the accuracy over them is a number about those five.
+    Even spacing over the same rows is deterministic, reproducible, and about
+    the dataset.
+    """
+    if limit is None or limit >= n_rows:
+        return None
+    step = n_rows / limit
+    return [int(index * step) for index in range(limit)]
+
+
+def load_image_classification(
+    spec: DatasetSpec,
+    *,
+    image_column: str = "image",
+    label_column: str = "label",
+) -> ImageSet:
+    """Load labelled images from a hub dataset or a local JSONL file.
+
+    The expected JSONL schema is one object per line, with the image named by
+    path relative to the JSONL file itself::
+
+        {"image": "images/cat.jpg", "label": 281}
+
+    Labels are indices into the model's own ``id2label``, not names: what is
+    being measured is whether the classifier picks its own right answer, and
+    matching class *names* across a dataset and a checkpoint is a different
+    problem that would quietly mis-score every mismatch.
+    """
+    source = f"{spec.source}:{spec.path}"
+
+    if spec.source == "text":
+        raise ValueError("image_classification tasks need source 'jsonl' or 'hub', not 'text'")
+
+    images: list[bytes] = []
+    labels: list[int] = []
+
+    if spec.source == "jsonl":
+        path = Path(spec.path)
+        if not path.exists():
+            raise FileNotFoundError(f"dataset not found: {path}")
+        rows = _read_jsonl(path)
+        indices = _evenly_spaced(len(rows), spec.limit)
+        for row in [rows[i] for i in indices] if indices is not None else rows:
+            image_path = Path(_require_column(row, image_column, source))
+            if not image_path.is_absolute():
+                image_path = path.parent / image_path
+            if not image_path.exists():
+                raise FileNotFoundError(f"{source}: image not found: {image_path}")
+            images.append(image_path.read_bytes())
+            labels.append(int(_require_column(row, label_column, source)))
+    else:
+        images, labels = _load_hub_images(spec, image_column, label_column, source)
+
+    if not images:
+        raise ValueError(f"{source}: no images found")
+
+    fingerprint = hash_obj({"images": _hash_blobs(images), "labels": labels})
+    return ImageSet(
+        images=images,
+        labels=labels,
+        fingerprint=fingerprint,
+        source=source,
+        metadata={"n_classes": len(set(labels))},
+    )
+
+
+def _hash_blobs(blobs: list[bytes]) -> str:
+    """Fingerprint a stream of files.
+
+    Length-prefixed rather than separated by a sentinel the way
+    ``hash_text_stream`` does it. Text cannot contain a NUL byte and a JPEG
+    can, so a separator that is unambiguous for documents is not one here.
+    """
+    digest = hashlib.sha256()
+    for blob in blobs:
+        digest.update(len(blob).to_bytes(8, "big"))
+        digest.update(blob)
+    return digest.hexdigest()[:16]
+
+
+def _load_hub_images(
+    spec: DatasetSpec, image_column: str, label_column: str, source: str
+) -> tuple[list[bytes], list[int]]:
+    """Read an image column without decoding it.
+
+    ``datasets`` hands back PIL objects by default, which is the one thing not
+    wanted here: the file bytes are what gets fingerprinted and what the
+    evaluator decodes a batch at a time.
+    """
+    check_dataset_available(spec)
+    try:
+        from datasets import Image, load_dataset
+    except ImportError as exc:  # pragma: no cover - datasets is a hard dependency
+        raise RuntimeError("`datasets` is required for hub datasets") from exc
+
+    dataset = load_dataset(spec.path, spec.name, split=spec.split, **_hub_kwargs(spec))
+    if image_column not in dataset.column_names:
+        raise KeyError(
+            f"{source}: column {image_column!r} not found. "
+            f"Available columns: {sorted(dataset.column_names)}"
+        )
+    if (indices := _evenly_spaced(len(dataset), spec.limit)) is not None:
+        dataset = dataset.select(indices)
+
+    dataset = dataset.cast_column(image_column, Image(decode=False))
+    images: list[bytes] = []
+    labels: list[int] = []
+    for row in dataset:
+        encoded = row[image_column]
+        blob = encoded.get("bytes") if isinstance(encoded, dict) else None
+        if blob is None:
+            path = encoded.get("path") if isinstance(encoded, dict) else None
+            if not path:
+                raise ValueError(f"{source}: image column carries neither bytes nor a path")
+            blob = Path(path).read_bytes()
+        images.append(blob)
+        labels.append(int(_require_column(row, label_column, source)))
+    return images, labels
 
 
 def load_sentence_pairs(

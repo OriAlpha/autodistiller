@@ -57,6 +57,15 @@ class DatasetSpec(StrictModel):
     split: str = "test"
     text_column: str = "text"
     limit: int | None = Field(default=None, ge=1, description="Cap on documents/examples")
+    data_files: str | None = Field(
+        default=None,
+        description=(
+            "Glob of the files this split lives in, relative to the hub repo "
+            "(e.g. 'data/val-*.parquet'). Asking for a split by name alone "
+            "downloads every file in the repo before selecting from it, which "
+            "on an image dataset is tens of gigabytes to read fifty megabytes."
+        ),
+    )
 
     @field_validator("limit")
     @classmethod
@@ -138,6 +147,28 @@ class EmbeddingTask(StrictModel):
     score_column: str = "label"
 
 
+class ImageClassificationTask(StrictModel):
+    """Top-1 accuracy: what an image classifier is for.
+
+    The vision tower's equivalent of multiple choice, and the same kind of
+    metric -- the model picks one of a fixed set of answers and is right or
+    wrong. What differs is the input: images arrive encoded and are decoded a
+    batch at a time, and the resize and normalisation come from the
+    checkpoint's own processor rather than from anything set here.
+
+    ``limit`` means evenly spaced rather than first-N for this task alone. An
+    image classification split is stored grouped by class, so the first N rows
+    are N/50 classes and an accuracy over them is a number about those classes.
+    """
+
+    kind: Literal["image_classification"] = "image_classification"
+    name: str
+    dataset: DatasetSpec
+    batch_size: int = Field(default=32, ge=1)
+    image_column: str = "image"
+    label_column: str = "label"
+
+
 class RetrievalTask(StrictModel):
     """nDCG@k over a corpus, which is what an embedding model is usually for.
 
@@ -175,7 +206,7 @@ class RetrievalTask(StrictModel):
 
 
 TaskSpec = Annotated[
-    PerplexityTask | MultipleChoiceTask | EmbeddingTask | RetrievalTask,
+    PerplexityTask | MultipleChoiceTask | EmbeddingTask | RetrievalTask | ImageClassificationTask,
     Field(discriminator="kind"),
 ]
 
