@@ -6,7 +6,7 @@ are still plausible:
 
 ===============  ===========================  ==========================
 memory estimate  free                         arithmetic over the config
-compress         1-7 min                      one backend run
+compress         1-7 min                      a prune, a backend run, or both
 quality screen   scales with --limit          perplexity vs the baseline
 benchmark        2-3 min                      a real server, measured
 ===============  ===========================  ==========================
@@ -37,7 +37,8 @@ from pathlib import Path
 from ..cache import benchmark_key
 from ..candidates.generator import Candidate, CandidateSet
 from ..compression.backend import CompressionError
-from ..compression.pipeline import run_compression
+from ..compression.pipeline import read_cached_artifact, run_compression, write_artifact_sidecar
+from ..compression.prune import build_prune_job, run_prune
 from ..config import CompressionSpec, DeploymentSpec, ModelSpec, RunConfig
 from ..metadata.environment import EnvironmentInfo, collect_environment
 from ..metadata.hardware import HardwareInfo, detect_hardware
@@ -373,9 +374,42 @@ class Optimizer:
         if self.progress is not None:
             self.progress(message)
 
+    def _prune(self, n_drop: int) -> CompressionArtifact:
+        """Drop blocks, or hand back the identical pruned model already on disk.
+
+        Pruned artifacts are content-addressed the same way compressed ones are,
+        so the several candidates that share a depth -- every context length,
+        every KV dtype, every method stacked on top -- prune once between them.
+        """
+        job = build_prune_job(
+            self.model,
+            n_drop,
+            calibration=self.calibration,
+            output_root=self.artifacts_root,
+        )
+        if self.reuse and (cached := read_cached_artifact(job)) is not None:
+            self._say(f"  reusing {n_drop}-block prune at {job.output_dir}")
+            return cached
+
+        self._say(f"  pruning {n_drop} blocks from {self.model.id}")
+        artifact = run_prune(job, progress=lambda message: self._say(f"    {message}"))
+        write_artifact_sidecar(job, artifact)
+        return artifact
+
     def _default_compress(self, candidate: Candidate) -> CompressionArtifact:
+        model = self.model
+        if candidate.depth:
+            pruned = self._prune(candidate.depth)
+            if candidate.method is None:
+                return pruned
+            # Quantize what pruning left rather than the original. A pruned
+            # artifact is an ordinary checkpoint, so every backend takes it as
+            # its input -- which is the whole reason the two compose.
+            model = self.model.model_copy(update={"id": pruned.output_dir})
+
         if candidate.method is None:
             raise ValueError("the baseline has nothing to compress")
+
         spec = CompressionSpec(
             method=candidate.method,
             calibration=self.calibration,
@@ -383,7 +417,7 @@ class Optimizer:
             llama_cpp_wrapper=self.llama_cpp_wrapper,
             output_dir=None,
         )
-        return run_compression(self.model, spec, output_root=self.artifacts_root, reuse=self.reuse)
+        return run_compression(model, spec, output_root=self.artifacts_root, reuse=self.reuse)
 
     def run(self, candidate_set: CandidateSet) -> OptimizationResult:
         started = time.perf_counter()

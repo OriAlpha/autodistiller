@@ -247,6 +247,7 @@ this for your actual GPU, marking what it can and cannot run.
 | `evaluate` | measure a model's quality |
 | `compare` | did quality hold? |
 | `compress` | build one compressed version |
+| `prune` | drop the transformer blocks that do the least |
 | `benchmark` | measure a running server |
 | `optimize` | do all of it, and recommend |
 | `export` | make a result deployable and reproducible |
@@ -302,7 +303,7 @@ Phases 1–9 are done, which is the whole v1.0 scope.
 | 2 Deployment profiling | done | 7 Pareto analysis | done |
 | 3 Compression backends | done | 8 Export | done |
 | 4 Candidate generation | done | 9 llama.cpp | done |
-| 5 Constrained optimization | done | 10 Post-v1 research | later |
+| 5 Constrained optimization | done | 10 Post-v1 research | pruning done |
 
 Embedding-model support is beyond the original ten phases: the measurement
 spine turned out to be model-agnostic, and only the loader, the memory
@@ -320,9 +321,15 @@ uv run autodistiller compress --model Qwen/Qwen3-0.6B --method gguf-q4-k-m \
 ```
 
 v1.0 targets Hugging Face models on NVIDIA GPUs, vLLM first and llama.cpp next, with
-INT4/INT8/AWQ/GPTQ and FP8 through existing backends. Phase 10 is deliberately post-v1: knowledge
-distillation, pruning, student-model search, and Bayesian optimization — the last only if the
-discrete search space proves limiting.
+INT4/INT8/AWQ/GPTQ and FP8 through existing backends.
+
+Depth pruning landed from Phase 10: `--prune 2,4` searches block count as a dimension alongside
+quantization, and the two compose — prune first, then quantize what is left. It is measured, not
+assumed, and on small models it usually loses: dropping 4 of Qwen3-0.6B's 28 blocks took wikitext-2
+perplexity from 17.0 to 29.0, which the search reports as dominated rather than recommending it.
+2:4 sparsity is not offered, because vLLM 0.27 removed sparsity support outright and llama.cpp never
+had it. Still post-v1: knowledge distillation, student-model search, and Bayesian optimization — the
+last only if the discrete search space proves limiting.
 
 ---
 

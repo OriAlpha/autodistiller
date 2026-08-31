@@ -1097,3 +1097,99 @@ def test_not_knowing_is_not_the_same_as_nothing_helping():
 
     assert not ParetoReport([]).nothing_measurably_better
     assert not ParetoReport([_outcome(quality_retention=1.0)]).nothing_measurably_better
+
+
+def test_pruned_candidate_quantizes_the_pruned_weights():
+    """Prune, then compress what is left -- not the original.
+
+    Quantizing the source model would produce a correctly-sized artifact for the
+    wrong candidate: it would be measured and reported under a name claiming
+    blocks had been dropped.
+    """
+    from unittest import mock
+
+    from autodistiller.candidates.generator import Candidate
+    from autodistiller.candidates.memory import MemoryEstimate
+    from autodistiller.results import CompressionArtifact, CompressionRecipe
+
+    pruned = CompressionArtifact(
+        recipe=CompressionRecipe(
+            method="prune4",
+            scheme="depth",
+            algorithm="block-influence",
+            weight_bits=16,
+            activation_bits=16,
+        ),
+        backend="autodistiller-prune",
+        source_model="dummy/model",
+        output_dir="artifacts/dummy-prune4-abcd1234",
+    )
+    seen = {}
+
+    def fake_run_compression(model, spec, **kwargs):
+        seen["model"] = model.id
+        seen["method"] = spec.method
+        return _artifact("int8", GIB)
+
+    optimizer = Optimizer(model=ModelSpec(id="dummy/model"), constraints=Constraints())
+    candidate = Candidate(
+        method="int8",
+        max_model_len=2048,
+        kv_dtype="auto",
+        estimate=MemoryEstimate(weights_bytes=1, kv_cache_bytes=1, overhead_bytes=1),
+        depth=4,
+    )
+
+    with (
+        mock.patch.object(Optimizer, "_prune", lambda self, n: pruned),
+        mock.patch("autodistiller.optimize.pipeline.run_compression", fake_run_compression),
+    ):
+        optimizer._default_compress(candidate)
+
+    assert seen["model"] == "artifacts/dummy-prune4-abcd1234"
+    assert seen["method"] == "int8"
+
+
+def test_prune_only_candidate_needs_no_compression_backend():
+    """Its artifact is the pruned checkpoint itself, servable as it stands."""
+    from unittest import mock
+
+    from autodistiller.candidates.generator import Candidate
+    from autodistiller.candidates.memory import MemoryEstimate
+    from autodistiller.results import CompressionArtifact, CompressionRecipe
+
+    pruned = CompressionArtifact(
+        recipe=CompressionRecipe(
+            method="prune4",
+            scheme="depth",
+            algorithm="block-influence",
+            weight_bits=16,
+            activation_bits=16,
+        ),
+        backend="autodistiller-prune",
+        source_model="dummy/model",
+        output_dir="artifacts/dummy-prune4-abcd1234",
+    )
+
+    def explode(*args, **kwargs):
+        raise AssertionError("a prune-only candidate must not reach the quantizer")
+
+    optimizer = Optimizer(model=ModelSpec(id="dummy/model"), constraints=Constraints())
+    candidate = Candidate(
+        method=None,
+        max_model_len=2048,
+        kv_dtype="auto",
+        estimate=MemoryEstimate(weights_bytes=1, kv_cache_bytes=1, overhead_bytes=1),
+        depth=4,
+    )
+
+    with (
+        mock.patch.object(Optimizer, "_prune", lambda self, n: pruned),
+        mock.patch("autodistiller.optimize.pipeline.run_compression", explode),
+    ):
+        artifact = optimizer._default_compress(candidate)
+
+    assert artifact is pruned
+    # And it is what gets served and evaluated, rather than the source model.
+    outcome = CandidateOutcome(candidate=candidate, artifact=artifact)
+    assert outcome.served_model == "artifacts/dummy-prune4-abcd1234"

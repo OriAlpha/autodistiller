@@ -884,3 +884,97 @@ def test_batching_scales_the_activation_estimate_until_the_scheduler_caps_it():
     # And the id says which is which, or three rows read identically.
     assert by_batch[32].id.endswith("-b32")
     assert "-b" not in by_batch[1].id
+
+
+# --- depth --------------------------------------------------------------
+
+
+def test_prune_depths_are_searched_against_full_depth() -> None:
+    """A depth is only readable next to the same recipe at full depth."""
+    shape = qwen3_06b()
+
+    result = generate_candidates(
+        shape, profile=SMALL, methods=("int8-weight-only",), prune_depths=(4,)
+    )
+    depths = {c.depth for c in result.accepted}
+
+    assert depths == {0, 4}
+    assert any(c.depth == 4 and c.method is None for c in result.accepted)
+    assert any(c.depth == 4 and c.method == "int8-weight-only" for c in result.accepted)
+
+
+def test_pruned_candidate_is_not_the_baseline() -> None:
+    """It has different weights, so it cannot be the reference.
+
+    Treating it as one would skip building its artifact and then measure the
+    unpruned model, reporting perfect retention for a model nobody built.
+    """
+    shape = qwen3_06b()
+
+    result = generate_candidates(shape, profile=SMALL, methods=(), prune_depths=(2,))
+    baselines = [c for c in result.accepted if c.is_baseline]
+
+    assert len(baselines) == len({c.max_model_len for c in baselines}) * len(
+        {c.kv_dtype for c in baselines}
+    )
+    assert all(c.depth == 0 for c in baselines)
+    assert any(not c.is_baseline and c.method is None and c.depth == 2 for c in result.accepted)
+
+
+def test_pruning_shrinks_weights_and_the_kv_cache() -> None:
+    """Both scale with the layer count, and both decide whether it fits."""
+    shape = qwen3_06b()
+
+    result = generate_candidates(
+        shape, profile=SMALL, methods=(), prune_depths=(14,), context_lengths=(2048,)
+    )
+    full = next(c for c in result.accepted if c.depth == 0 and c.kv_dtype == "auto")
+    half = next(c for c in result.accepted if c.depth == 14 and c.kv_dtype == "auto")
+
+    assert half.estimate.weights_bytes < full.estimate.weights_bytes
+    assert half.estimate.kv_cache_bytes == pytest.approx(full.estimate.kv_cache_bytes / 2, rel=0.01)
+
+
+def test_depth_beyond_the_model_is_rejected_with_a_reason() -> None:
+    shape = qwen3_06b()
+
+    result = generate_candidates(shape, profile=SMALL, methods=(), prune_depths=(28,))
+
+    assert not any(c.depth == 28 for c in result.accepted)
+    assert any("depth" in reason for r in result.rejected for reason in r.reasons)
+
+
+def test_full_depth_is_proved_before_anything_pruned() -> None:
+    """Pruning costs more quality than any quantization in the list.
+
+    Dropping 4 of Qwen3-0.6B's 28 blocks moved wikitext-2 perplexity from 17.0
+    to 29.0. Search order is what makes stopping early honest, so every unpruned
+    candidate has to be tried first.
+    """
+    shape = qwen3_06b()
+
+    result = generate_candidates(shape, profile=SMALL, prune_depths=(4,), max_candidates=100)
+    depths = [c.depth for c in result.accepted]
+
+    assert depths == sorted(depths)
+    assert result.accepted[0].is_baseline
+
+
+def test_trim_keeps_both_halves_of_a_pruned_search() -> None:
+    """The same cap failure as the speculative half, in the other dimension."""
+    shape = qwen3_06b()
+
+    result = generate_candidates(shape, profile=SMALL, prune_depths=(4,), max_candidates=12)
+
+    assert len(result.accepted) == 12
+    assert any(c.depth == 4 for c in result.accepted), "the cap dropped every pruned candidate"
+
+
+def test_candidate_id_names_the_depth() -> None:
+    estimate = estimate_memory(qwen3_06b(), None, max_model_len=2048)
+
+    pruned = Candidate(method=None, max_model_len=2048, kv_dtype="auto", estimate=estimate, depth=4)
+    both = Candidate(method="int8", max_model_len=2048, kv_dtype="auto", estimate=estimate, depth=4)
+
+    assert pruned.id == "prune4-ctx2048"
+    assert both.id == "prune4-int8-ctx2048"

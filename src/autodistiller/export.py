@@ -31,6 +31,7 @@ from pathlib import Path
 from pydantic import BaseModel, ConfigDict, Field
 
 from .compression.pipeline import ARTIFACT_SIDECAR
+from .compression.prune import PRUNE_SCHEME
 from .metadata.environment import EnvironmentInfo
 from .metadata.hardware import HardwareInfo
 from .results import (
@@ -325,27 +326,52 @@ def _serve_command(backend: str, path: str, max_model_len: int | None) -> str:
     return runtime.launch_command(runtime.model_path(path), max_model_len=max_model_len)
 
 
-def _reproduce_commands(record: RunRecord, artifact: CompressionArtifact | None) -> list[str]:
-    """The commands that rebuild this result from the source model.
-
-    Compression first, because the evaluation is of the artifact it produces.
-    Both are exact: the recipe carries the calibration fingerprint, and the
-    saved config carries every evaluation setting.
-    """
-    commands: list[str] = []
-
-    if artifact is not None:
-        recipe = artifact.recipe
+def _rebuild_command(artifact: CompressionArtifact) -> str:
+    """The single command that produces one artifact from its own source."""
+    recipe = artifact.recipe
+    if recipe.scheme == PRUNE_SCHEME:
+        parts = [
+            "autodistiller prune",
+            f"--model {artifact.source_model}",
+            f"--drop {recipe.method.removeprefix('prune')}",
+        ]
+    else:
         parts = [
             "autodistiller compress",
             f"--model {artifact.source_model}",
             f"--method {recipe.method}",
         ]
-        if recipe.needs_calibration:
-            parts.append(f"--samples {recipe.n_calibration_samples}")
-            parts.append(f"--max-seq-length {recipe.max_seq_length}")
-            parts.append("--calibration <the corpus fingerprinted below>")
-        commands.append(" ".join(parts))
+    if recipe.needs_calibration:
+        parts.append(f"--samples {recipe.n_calibration_samples}")
+        parts.append(f"--max-seq-length {recipe.max_seq_length}")
+        parts.append("--calibration <the corpus fingerprinted below>")
+    return " ".join(parts)
+
+
+def _reproduce_commands(record: RunRecord, artifact: CompressionArtifact | None) -> list[str]:
+    """The commands that rebuild this result from the source model.
+
+    Compression first, because the evaluation is of the artifact it produces.
+    Every step is exact: each recipe carries its calibration fingerprint, and
+    the saved config carries every evaluation setting.
+    """
+    commands: list[str] = []
+
+    if artifact is not None:
+        # ponytail: depth 4 is enough for prune-then-quantize twice over, and
+        # bounds a sidecar that somehow points at itself. Raise it if a longer
+        # chain ever becomes real.
+        # Quantizing a pruned model names the pruned directory as its source,
+        # so the rebuild is two commands. Emitting only the last produces a
+        # bundle that reproduces nothing: it starts from the output of a step it
+        # never mentions.
+        chain = [artifact]
+        while (
+            len(chain) < 4
+            and (source := read_artifact_sidecar(Path(chain[-1].source_model))) is not None
+        ):
+            chain.append(source)
+        commands.extend(_rebuild_command(step) for step in reversed(chain))
 
     commands.append(f"autodistiller evaluate --config {CONFIG_FILENAME}")
     return commands

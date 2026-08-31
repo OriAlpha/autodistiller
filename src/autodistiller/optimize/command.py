@@ -234,6 +234,7 @@ def optimize(
     methods: tuple[str, ...] | None = None,
     context_lengths: tuple[int, ...] | None = None,
     benchmark_repeats: int = BENCHMARK_REPEATS,
+    prune_depths: tuple[int, ...] = (),
     concurrency: int = 8,
     max_candidates: int = 12,
     stop_early: bool = True,
@@ -262,6 +263,7 @@ def optimize(
         kv_dtypes=backend_spec.kv_dtypes,
         speculative=speculative,
         supports_speculative=backend_spec.supports_speculative,
+        prune_depths=prune_depths,
         concurrency=concurrency,
         max_candidates=max_candidates,
     )
