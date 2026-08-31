@@ -378,3 +378,76 @@ def test_an_explicit_interpreter_skips_the_index():
     command = LLMCompressorBackend(python_executable=sys.executable)._command()
     assert "--index" not in command
     assert command[0] == sys.executable
+
+
+# --- model kind ---------------------------------------------------------
+
+
+def test_awq_is_refused_on_an_encoder():
+    """Measured, not assumed.
+
+    AWQ smooths activations through per-architecture mappings and
+    llmcompressor registers none for encoders, so it falls back to Llama-shaped
+    names, matches nothing, and divides by zero. Refusing here costs a config
+    read; discovering it in the backend costs a calibration pass first.
+    """
+    from autodistiller.architecture import DECODER, ENCODER
+
+    awq = resolve_method("int4-awq")
+
+    assert awq.applies_to(DECODER)
+    assert not awq.applies_to(ENCODER)
+
+    refused = check_method(awq, model_kind=ENCODER)
+    assert not refused.available
+    assert any("encoder" in reason for reason in refused.reasons)
+
+
+def test_the_methods_an_encoder_can_actually_produce():
+    """The four that were run against a real BERT checkpoint and worked."""
+    from autodistiller.architecture import ENCODER
+
+    usable = {
+        availability.method.name
+        for availability in available_methods(model_kind=ENCODER)
+        if availability.available
+    }
+
+    assert usable == {"int8", "int8-weight-only", "int4-gptq", "fp8", "fp8-static"}
+
+
+def test_model_kind_defaults_to_decoder_when_unstated():
+    """Skipping the check is not the same as failing it.
+
+    An unreadable or hand-written config has no answer, and refusing every
+    method on that basis would break every local checkpoint.
+    """
+    from autodistiller.architecture import DECODER, model_kind
+
+    assert model_kind(None) == DECODER
+    assert model_kind([]) == DECODER
+    assert model_kind(["BertModel"]) == "encoder"
+    assert model_kind(["Qwen3ForCausalLM"]) == DECODER
+
+    assert check_method(resolve_method("int4-awq")).available
+
+
+def test_an_encoder_recipe_does_not_claim_to_ignore_an_lm_head():
+    """The recipe is what the artifact record carries.
+
+    A BERT model has no ``lm_head``, so a recipe naming one describes a step
+    that never happened -- and since the recipe is part of the artifact's
+    identity, it would also key two different models to the same shape.
+    """
+    from unittest import mock
+
+    spec = CompressionSpec(method="int8-weight-only")
+
+    with mock.patch("autodistiller.compression.pipeline._model_kind_of", return_value="encoder"):
+        encoder_job = build_job(ModelSpec(id="BAAI/bge-small-en-v1.5"), spec)
+    with mock.patch("autodistiller.compression.pipeline._model_kind_of", return_value="decoder"):
+        decoder_job = build_job(ModelSpec(id="Qwen/Qwen3-0.6B"), spec)
+
+    assert encoder_job.ignore == ()
+    assert encoder_job.recipe().ignore == []
+    assert decoder_job.recipe().ignore == ["lm_head"]

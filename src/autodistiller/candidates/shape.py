@@ -17,6 +17,8 @@ from typing import Any
 
 from pydantic import BaseModel
 
+from ..architecture import DECODER_SUFFIXES
+
 
 @dataclass(frozen=True)
 class ModelShape:
@@ -195,15 +197,6 @@ def text_config_of(config: Any) -> Any:
     return nested if _find_int(nested, "hidden_size", "n_embd", "d_model") else config
 
 
-_DECODER_SUFFIXES = ("ForCausalLM", "ForConditionalGeneration")
-"""Architecture names whose shape this module's arithmetic describes.
-
-A vision-language model is ``ForConditionalGeneration`` and is in scope: its
-decoder is what gets quantized. An encoder-decoder is the same suffix and is
-not, which is why ``is_encoder_decoder`` is checked separately.
-"""
-
-
 def _reject_if_not_decoder(architectures: Any) -> None:
     """Refuse to describe a model this arithmetic does not fit.
 
@@ -219,7 +212,7 @@ def _reject_if_not_decoder(architectures: Any) -> None:
     restrictive direction would block a model that works.
     """
     names = [str(name) for name in (architectures or ())]
-    if not names or any(name.endswith(_DECODER_SUFFIXES) for name in names):
+    if not names or any(name.endswith(DECODER_SUFFIXES) for name in names):
         return
     raise ValueError(
         f"{names[0]} is not a decoder-only language model. AutoDistiller's memory "

@@ -23,6 +23,7 @@ import logging
 import re
 from pathlib import Path
 
+from ..architecture import ENCODER, model_kind
 from ..config import CompressionSpec, ModelSpec
 from ..evaluation.datasets import load_text_corpus
 from ..metadata.profiles import GPUProfile
@@ -57,6 +58,26 @@ def artifact_dir(model_id: str, method: str, root: Path, key: str | None = None)
     return root / (f"{stem}-{key[:8]}" if key else stem)
 
 
+def _model_kind_of(model: ModelSpec) -> str | None:
+    """Whether these weights are a decoder or an encoder, read from the config.
+
+    A few kilobytes against a compression run that is minutes, so it is worth
+    paying to refuse ``int4-awq`` on a BERT checkpoint up front rather than
+    inside the backend. Unreadable config means no answer rather than a wrong
+    one: the check is skipped and the backend reports whatever it finds.
+    """
+    try:
+        from transformers import AutoConfig
+
+        config = AutoConfig.from_pretrained(
+            model.id, revision=model.revision, trust_remote_code=model.trust_remote_code
+        )
+    except Exception as exc:  # any failure to read it means "unknown", not "decoder"
+        logger.debug("could not read the config for %s: %s", model.id, exc)
+        return None
+    return model_kind(getattr(config, "architectures", None))
+
+
 def build_job(
     model: ModelSpec,
     spec: CompressionSpec,
@@ -81,6 +102,12 @@ def build_job(
         # Not an error, but the user probably expected it to matter.
         calibration_texts = []
 
+    # An encoder has no lm_head to leave alone. Resolved here rather than only
+    # in the backend, because the recipe is what the artifact record carries:
+    # a recipe naming a module the model does not have describes a step that
+    # never happened, and it is part of the artifact's identity besides.
+    ignore = tuple(spec.ignore) if _model_kind_of(model) != ENCODER else ()
+
     job = CompressionJob(
         model_id=model.id,
         method=method,
@@ -90,7 +117,7 @@ def build_job(
         calibration_texts=calibration_texts,
         num_calibration_samples=spec.num_calibration_samples,
         max_seq_length=spec.max_seq_length,
-        ignore=tuple(spec.ignore),
+        ignore=ignore,
         trust_remote_code=model.trust_remote_code,
         dtype=model.dtype if model.dtype != "auto" else "auto",
     )
@@ -176,7 +203,9 @@ def run_compression(
     # minutes spent reaching a useless result -- but it should not fire on a
     # default the user never chose.
     target = serving_backend or (method.backends[0] if method.backends else None)
-    availability = check_method(method, profile=profile, backend=target)
+    availability = check_method(
+        method, profile=profile, backend=target, model_kind=_model_kind_of(model)
+    )
     if not availability.available:
         raise ValueError(f"{method.name} is not usable here: {'; '.join(availability.reasons)}")
 

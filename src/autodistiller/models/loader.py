@@ -18,6 +18,7 @@ import torch
 import transformers
 from transformers import AutoConfig, AutoModel, AutoModelForCausalLM, AutoTokenizer
 
+from ..architecture import DECODER, kind_of_config
 from ..metadata.hashing import hash_obj
 from ..results import ModelInfo
 
@@ -150,15 +151,6 @@ def gguf_file_in(model_id: str) -> str | None:
     return found[0].name if found else None
 
 
-DECODER_SUFFIXES = ("ForCausalLM", "ForConditionalGeneration")
-"""Architecture names that predict a next token.
-
-The same list :mod:`autodistiller.candidates.shape` screens on, for the same
-reason: it is the property that decides how a model is loaded, measured and
-served, not the model's family name.
-"""
-
-
 def auto_class_for(config: Any) -> Any:
     """The Auto class that loads this architecture.
 
@@ -167,16 +159,8 @@ def auto_class_for(config: Any) -> Any:
     is the hidden states underneath one -- so ``AutoModel`` is both correct and
     smaller. Guessing wrong is not subtle: ``AutoModelForCausalLM`` on a BERT
     checkpoint either refuses or silently attaches a randomly initialised head.
-
-    The causal LM stays the default, and this departs from it only when the
-    config says outright that the model is something else. A config with no
-    ``architectures`` is a local or hand-written one, and reading that silence
-    as "encoder" would change how every such checkpoint has always loaded.
     """
-    names = [str(name) for name in (getattr(config, "architectures", None) or ())]
-    if names and not any(name.endswith(DECODER_SUFFIXES) for name in names):
-        return AutoModel
-    return AutoModelForCausalLM
+    return AutoModelForCausalLM if kind_of_config(config) == DECODER else AutoModel
 
 
 def load_model(spec: Any) -> LoadedModel:

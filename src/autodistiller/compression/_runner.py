@@ -25,6 +25,15 @@ from pathlib import Path
 
 ALGORITHMS = ("rtn", "gptq", "awq")
 
+DECODER_SUFFIXES = ("ForCausalLM", "ForConditionalGeneration")
+"""Deliberately a copy of ``autodistiller.architecture``.
+
+This file runs in its own environment and imports nothing from AutoDistiller, so
+the six lines below are duplicated rather than shared. Keeping them in step is
+cheaper than the alternative, which is installing AutoDistiller into an
+environment that exists to hold a conflicting transformers pin.
+"""
+
 
 def _emit(payload: dict) -> None:
     """Write the result to stdout and nothing else ever does."""
@@ -55,11 +64,10 @@ def _versions() -> dict[str, str]:
     return found
 
 
-def _build_modifier(job: dict):
+def _build_modifier(job: dict, ignore: list[str]):
     """Translate an AutoDistiller method into an llmcompressor modifier."""
     algorithm = job["algorithm"]
     scheme = job["scheme"]
-    ignore = job.get("ignore") or ["lm_head"]
 
     if algorithm == "gptq":
         from llmcompressor.modifiers.quantization import GPTQModifier
@@ -74,6 +82,36 @@ def _build_modifier(job: dict):
     from llmcompressor.modifiers.quantization import QuantizationModifier
 
     return QuantizationModifier(targets="Linear", scheme=scheme, ignore=ignore)
+
+
+def _load_model(job: dict):
+    """Load the weights with the Auto class this architecture needs.
+
+    An encoder has no causal LM head, and asking for one either refuses or
+    attaches a randomly initialised head that then gets calibrated and
+    quantized. Returns the model and what to leave alone: ``lm_head`` is a
+    decoder's output layer, and naming a module the model does not have is not
+    something the backend has to tolerate.
+    """
+    from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
+
+    model_id = job["model_id"]
+    common = {"trust_remote_code": job.get("trust_remote_code", False)}
+
+    config = AutoConfig.from_pretrained(model_id, **common)
+    names = [str(n) for n in (getattr(config, "architectures", None) or ())]
+    is_decoder = not names or any(name.endswith(DECODER_SUFFIXES) for name in names)
+
+    auto_class = AutoModelForCausalLM if is_decoder else AutoModel
+    model = auto_class.from_pretrained(
+        model_id,
+        config=config,
+        device_map=job.get("device_map", "auto"),
+        **{_dtype_kwarg(): job.get("dtype", "auto")},
+        **common,
+    )
+    ignore = list(job.get("ignore") or []) if is_decoder else []
+    return model, ignore
 
 
 def _build_calibration_dataset(job: dict, tokenizer):
@@ -116,21 +154,16 @@ def run(job: dict) -> dict:
         raise ValueError(f"unknown algorithm {job['algorithm']!r}; expected one of {ALGORITHMS}")
 
     from llmcompressor import oneshot
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoTokenizer
 
     model_id = job["model_id"]
     output_dir = job["output_dir"]
     common = {"trust_remote_code": job.get("trust_remote_code", False)}
 
     tokenizer = AutoTokenizer.from_pretrained(model_id, **common)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        device_map=job.get("device_map", "auto"),
-        **{_dtype_kwarg(): job.get("dtype", "auto")},
-        **common,
-    )
+    model, ignore = _load_model(job)
 
-    modifier = _build_modifier(job)
+    modifier = _build_modifier(job, ignore)
     dataset = _build_calibration_dataset(job, tokenizer)
 
     oneshot_kwargs: dict = {

@@ -5,7 +5,7 @@ This is the "stable AutoDistiller interface" the roadmap asks for. A user picks
 an ``AWQModifier`` targeting a ``W4A16`` scheme. When a second backend arrives,
 it maps onto these same names rather than leaking its own.
 
-Whether a method is *allowed* is two separate questions, kept separate on
+Whether a method is *allowed* is three separate questions, kept separate on
 purpose:
 
 * **Hardware** -- does the GPU have tensor cores for this numeric format? That
@@ -13,15 +13,20 @@ purpose:
   silicon.
 * **Backend** -- does the serving runtime have a kernel for it? A method can be
   physically runnable and still unsupported by vLLM.
+* **Model** -- does the algorithm apply to this kind of model at all? Measured,
+  not assumed: on an encoder, four of the five compressed-tensors methods work
+  unchanged and AWQ divides by zero.
 
-Conflating the two is how you end up recommending a configuration that
-benchmarks beautifully and then cannot be served.
+Conflating them is how you end up recommending a configuration that benchmarks
+beautifully and then cannot be served, or spending a calibration pass on an
+algorithm that was never going to apply.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from ..architecture import DECODER, ENCODER
 from ..metadata.profiles import GPUProfile, capabilities_for
 
 
@@ -49,6 +54,17 @@ class CompressionMethod:
 
     needs_calibration: bool = False
     backends: tuple[str, ...] = ("vllm",)
+
+    model_kinds: tuple[str, ...] = (DECODER, ENCODER)
+    """Kinds of model this method can be produced from.
+
+    A third question, separate from hardware and from the serving backend: an
+    algorithm can have kernels and a runtime and still not apply to the model in
+    front of it. AWQ is the case that forced this -- it smooths activations
+    through architecture-specific mappings, and llmcompressor's registry holds
+    only decoders, so on an encoder it matches nothing and divides by zero.
+    """
+
     notes: str = ""
 
     bits_per_weight: float | None = None
@@ -98,6 +114,9 @@ class CompressionMethod:
 
     def servable_by(self, backend: str) -> bool:
         return backend in self.backends
+
+    def applies_to(self, model_kind: str) -> bool:
+        return model_kind in self.model_kinds
 
     def describe_size(self) -> str:
         return f"W{self.weight_bits}A{self.activation_bits}"
@@ -154,6 +173,11 @@ METHODS: dict[str, CompressionMethod] = {
             algorithm="awq",
             required_capability="int4",
             needs_calibration=True,
+            model_kinds=(DECODER,),
+            notes="Decoder-only. AWQ smooths activations through per-architecture "
+            "mappings and llmcompressor registers none for encoders, so it falls "
+            "back to Llama-shaped names, matches nothing, and divides by zero. "
+            "GPTQ is a per-layer Hessian and needs no such map, so use it instead.",
         ),
         CompressionMethod(
             name="fp8",
@@ -189,6 +213,7 @@ METHODS: dict[str, CompressionMethod] = {
             needs_calibration=False,
             backends=("llama.cpp",),
             compression_backend="llama.cpp",
+            model_kinds=(DECODER,),
             bits_per_weight=8.5,
             quantizes_embeddings=True,
             notes="Not a K-quant: a flat 8-bit block format. The safest GGUF.",
@@ -204,6 +229,7 @@ METHODS: dict[str, CompressionMethod] = {
             needs_calibration=False,
             backends=("llama.cpp",),
             compression_backend="llama.cpp",
+            model_kinds=(DECODER,),
             bits_per_weight=6.56,
             quantizes_embeddings=True,
         ),
@@ -218,6 +244,7 @@ METHODS: dict[str, CompressionMethod] = {
             needs_calibration=False,
             backends=("llama.cpp",),
             compression_backend="llama.cpp",
+            model_kinds=(DECODER,),
             bits_per_weight=5.69,
             quantizes_embeddings=True,
         ),
@@ -232,6 +259,7 @@ METHODS: dict[str, CompressionMethod] = {
             needs_calibration=False,
             backends=("llama.cpp",),
             compression_backend="llama.cpp",
+            model_kinds=(DECODER,),
             bits_per_weight=4.85,
             quantizes_embeddings=True,
             notes="The usual llama.cpp default: the best quality-per-byte of the "
@@ -248,6 +276,7 @@ METHODS: dict[str, CompressionMethod] = {
             needs_calibration=False,
             backends=("llama.cpp",),
             compression_backend="llama.cpp",
+            model_kinds=(DECODER,),
             bits_per_weight=3.74,
             quantizes_embeddings=True,
             notes="Quality falls off here, especially below about 7B parameters.",
@@ -283,9 +312,13 @@ def check_method(
     *,
     profile: GPUProfile | None = None,
     backend: str | None = None,
+    model_kind: str | None = None,
 ) -> MethodAvailability:
     """Decide whether a method can be produced and then served here."""
     reasons: list[str] = []
+
+    if model_kind is not None and not method.applies_to(model_kind):
+        reasons.append(f"{method.name} does not apply to an {model_kind} model")
 
     if profile is not None and not method.runs_on(profile):
         reasons.append(
@@ -300,14 +333,20 @@ def check_method(
 
 
 def available_methods(
-    *, profile: GPUProfile | None = None, backend: str | None = None
+    *,
+    profile: GPUProfile | None = None,
+    backend: str | None = None,
+    model_kind: str | None = None,
 ) -> list[MethodAvailability]:
     """Every method, annotated with whether it is usable in this context.
 
     Returns the unavailable ones too. Phase 4 needs to explain why a candidate
     was filtered out, and "it silently vanished" is not an explanation.
     """
-    return [check_method(method, profile=profile, backend=backend) for method in METHODS.values()]
+    return [
+        check_method(method, profile=profile, backend=backend, model_kind=model_kind)
+        for method in METHODS.values()
+    ]
 
 
 def supported_capabilities(compute_capability: str) -> frozenset[str]:
