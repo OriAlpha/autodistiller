@@ -1,6 +1,6 @@
 # AutoDistiller
 
-**Find the best way to deploy your LLM — automatically.**
+**Find the best way to deploy your model — automatically.**
 
 [![CI](https://github.com/OriAlpha/Autodistiller/actions/workflows/ci.yml/badge.svg)](https://github.com/OriAlpha/Autodistiller/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/autodistiller)](https://pypi.org/project/autodistiller/)
@@ -256,6 +256,42 @@ this for your actual GPU, marking what it can and cannot run.
 
 ---
 
+## What it supports
+
+Decoder-only LLMs throughout — Llama, Qwen, Mistral, Phi and friends, plus the
+language half of a VLM. **Encoder / embedding models** (BERT, BGE, E5, GTE,
+MiniLM, RoBERTa) work end to end as well, with a smaller method list:
+
+| | LLMs | Embedding models |
+|---|---|---|
+| Methods | 11 (6 vLLM + 5 GGUF) | 5 — `int8`, `int8-weight-only`, `int4-gptq`, `fp8`, `fp8-static` |
+| Tasks | perplexity, multiple choice | `stsb` (similarity), `scifact` (retrieval, nDCG@10) |
+| Serving | vLLM, llama.cpp | vLLM `--runner pooling` |
+| Searched over | context length × KV dtype | sequence length × **batch size** |
+| Ranked on | tokens/s, TTFT | texts/s, request latency |
+
+`int4-awq` is decoder-only: AWQ smooths activations through per-architecture
+mappings and llmcompressor registers none for encoders. GGUF on an encoder is
+untested, so it is not offered. MoE and encoder-decoder models (Whisper) are
+refused rather than mis-estimated.
+
+Measured on an RTX 5070, `bge-small-en-v1.5` against a real vLLM pooling server:
+
+```
+| Candidate               | Quality retention | Latency p50 | Throughput      |
+| baseline batch 1        |           100.00% |        57ms |   112.6 texts/s |
+| baseline batch 8        |           100.00% |        59ms |  1126.6 texts/s |
+| int8-weight-only batch 8|           100.33% |        59ms |   995.8 texts/s |
+```
+
+Ten times the throughput for two milliseconds of latency — from batch size,
+not from quantization, which bought about one percent. And the retrieval task
+earns its place: `int4-gptq` holds 99.5% of STS-B similarity but only **96.8%**
+of nDCG@10, so a model that looks lossless on the cheap screen measurably
+changes which documents it returns.
+
+---
+
 ## Status
 
 Phases 1–9 are done, which is the whole v1.0 scope.
@@ -267,6 +303,10 @@ Phases 1–9 are done, which is the whole v1.0 scope.
 | 3 Compression backends | done | 8 Export | done |
 | 4 Candidate generation | done | 9 llama.cpp | done |
 | 5 Constrained optimization | done | 10 Post-v1 research | later |
+
+Embedding-model support is beyond the original ten phases: the measurement
+spine turned out to be model-agnostic, and only the loader, the memory
+arithmetic, the tasks and the serving flags needed a second implementation.
 
 Both backends are verified end to end against real binaries: vLLM on GPU, and llama.cpp built from
 source and actually run — CPU-only so far, so GGUF throughput has not been measured on a GPU.

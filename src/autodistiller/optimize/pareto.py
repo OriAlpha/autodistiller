@@ -398,6 +398,38 @@ def _within_noise(
     return abs(best - mine) <= SIGNIFICANCE_SIGMA * combined
 
 
+FLAT_AXIS_TOLERANCE = 0.02
+"""How close every value on an axis must be before it stops being an axis.
+
+Two percent across the whole field, which is far tighter than any decision worth
+making on it.
+"""
+
+
+def _discriminates(axis: Axis, outcomes: Sequence[CandidateOutcome]) -> bool:
+    """Whether this axis separates the candidates at all.
+
+    An axis whose values are all but identical is not a trade-off, and ranking
+    on it manufactures verdicts. Peak VRAM is the case that forced this: vLLM
+    fills to its memory-utilization flag whatever the model's size, so every
+    encoder candidate comes back within a few hundredths of a GiB of every
+    other, and a frontier built on that calls one dominated because a constant
+    wobbled.
+
+    Quality is exempt. A search where every candidate holds quality is the
+    normal, good outcome, and dropping the column would hide the one fact the
+    user most wants confirmed.
+    """
+    values = [v for v in (axis.value(o) for o in outcomes) if v is not None]
+    if axis.key.startswith("quality") or len(values) < 2:
+        return True
+
+    widest = max(values)
+    if widest == 0:
+        return max(values) != min(values)
+    return (widest - min(values)) / abs(widest) > FLAT_AXIS_TOLERANCE
+
+
 class ParetoReport:
     """Trade-offs, frontiers and named options for one search.
 
@@ -452,6 +484,7 @@ class ParetoReport:
             axis
             for axis in candidates
             if any(axis.value(outcome) is not None for outcome in self.outcomes)
+            and _discriminates(axis, self.outcomes)
         )
 
     @property

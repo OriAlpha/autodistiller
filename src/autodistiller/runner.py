@@ -17,7 +17,14 @@ import traceback
 from collections.abc import Callable
 
 from .cache import experiment_key
-from .config import EmbeddingTask, MultipleChoiceTask, PerplexityTask, RunConfig, TaskSpec
+from .config import (
+    EmbeddingTask,
+    MultipleChoiceTask,
+    PerplexityTask,
+    RetrievalTask,
+    RunConfig,
+    TaskSpec,
+)
 from .determinism import seed_everything
 from .evaluation.baseline_inference import run_baseline_inference
 from .evaluation.datasets import (
@@ -26,7 +33,7 @@ from .evaluation.datasets import (
     load_sentence_pairs,
     load_text_corpus,
 )
-from .evaluation.embedding import evaluate_embedding
+from .evaluation.embedding import evaluate_embedding, evaluate_retrieval
 from .evaluation.multiple_choice import evaluate_multiple_choice
 from .evaluation.perplexity import evaluate_perplexity
 from .evaluation.preprocessors import get_preprocessor
@@ -101,6 +108,9 @@ def _run_task(handle, task: TaskSpec, observer: RunObserver) -> TaskResult:
             ),
             progress=observer.task_progress,
         )
+
+    if isinstance(task, RetrievalTask):
+        return evaluate_retrieval(handle, task, progress=observer.task_progress)
 
     raise TypeError(f"unsupported task kind: {type(task).__name__}")
 

@@ -233,6 +233,7 @@ def optimize(
     runs_dir: Path = Path("runs"),
     methods: tuple[str, ...] | None = None,
     context_lengths: tuple[int, ...] | None = None,
+    benchmark_repeats: int = BENCHMARK_REPEATS,
     concurrency: int = 8,
     max_candidates: int = 12,
     stop_early: bool = True,
@@ -291,6 +292,7 @@ def optimize(
             backend=backend,
             prompt_text=prompt_text,
             embed=shape.is_encoder,
+            repeats=benchmark_repeats,
             progress=progress,
         )
 
@@ -312,7 +314,7 @@ def optimize(
             "prompt_tokens": BENCHMARK_PROMPT_TOKENS,
             "max_tokens": BENCHMARK_MAX_TOKENS,
             "concurrency_levels": list(BENCHMARK_CONCURRENCY),
-            "repeats": BENCHMARK_REPEATS,
+            "repeats": benchmark_repeats,
             # Only when there is one, so a default run keeps the key it already
             # has on disk: no prompt file means the filler, which is what every
             # cached benchmark was measured with.

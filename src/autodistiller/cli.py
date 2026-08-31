@@ -516,6 +516,13 @@ def history(
 @app.command()
 def methods(
     backend: str = typer.Option("vllm", "--backend", "-b", help="Serving backend to check against"),
+    model: str | None = typer.Option(
+        None,
+        "--model",
+        "-m",
+        help="Also check against this model's kind. An algorithm can have kernels "
+        "and a runtime and still not apply to the model in front of it.",
+    ),
     all_hardware: bool = typer.Option(
         False, "--all", help="Ignore the detected GPU and list every method"
     ),
@@ -524,11 +531,14 @@ def methods(
     from rich.table import Table
 
     from .compression.methods import available_methods
+    from .compression.pipeline import model_kind_of
 
     hardware = detect_hardware()
     profile = None
     if not all_hardware and hardware.gpus:
         profile = profile_from_gpu(hardware.gpus[0])
+
+    model_kind = model_kind_of(ModelSpec(id=model)) if model else None
 
     table = Table(header_style="bold")
     table.add_column("Method")
@@ -538,7 +548,7 @@ def methods(
     table.add_column("Calibration")
     table.add_column("Usable here")
 
-    for entry in available_methods(profile=profile, backend=backend):
+    for entry in available_methods(profile=profile, backend=backend, model_kind=model_kind):
         method = entry.method
         table.add_row(
             method.name,
@@ -552,6 +562,9 @@ def methods(
         )
 
     console.print(table)
+    if model_kind is not None:
+        console.print()
+        console.print(f"[dim]Checked against {model} ({model_kind}).[/dim]")
     if profile is not None:
         console.print()
         console.print(
@@ -863,6 +876,14 @@ def optimize(
         "block size minus one.",
     ),
     concurrency: int = typer.Option(8, "--concurrency", help="Sequences the KV cache must hold"),
+    benchmark_repeats: int = typer.Option(
+        3,
+        "--benchmark-repeats",
+        min=1,
+        help="Times each concurrency rung is measured. More than one buys an error "
+        "bar, without which the frontier reads every gap as real. Set 1 to halve "
+        "the benchmark stage when candidates differ by more than run-to-run noise.",
+    ),
     context: str | None = typer.Option(
         None,
         "--context",
@@ -1063,6 +1084,7 @@ def optimize(
             runs_dir=output_dir,
             methods=tuple(method) if method else None,
             concurrency=concurrency,
+            benchmark_repeats=benchmark_repeats,
             context_lengths=context_lengths,
             max_candidates=max_candidates,
             stop_early=stop_early,

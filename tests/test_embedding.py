@@ -196,3 +196,86 @@ def test_the_resolved_pooling_is_recorded(tiny_model_dir: Path):
         result = evaluate_embedding(handle, task, dataset=_pair_set())
 
     assert result.details["pooling"] == "cls"
+
+
+# --- retrieval ----------------------------------------------------------
+
+
+def test_ndcg_rewards_putting_the_answer_first():
+    """Position is the whole difference between a retriever and a filter."""
+    from autodistiller.evaluation.embedding import ndcg_at_k
+
+    relevant = {"a": 1.0}
+
+    assert ndcg_at_k(["a", "b", "c"], relevant, 10) == pytest.approx(1.0)
+    # Same document found, five places later, worth less.
+    assert 0 < ndcg_at_k(["b", "c", "d", "e", "a"], relevant, 10) < 1.0
+    assert ndcg_at_k(["b", "c", "d"], relevant, 10) == 0.0
+
+
+def test_ndcg_is_normalized_across_queries_with_different_answer_counts():
+    """One relevant document and twenty must land on the same scale.
+
+    Otherwise averaging across queries weights the easy ones by how many right
+    answers they happen to have.
+    """
+    from autodistiller.evaluation.embedding import ndcg_at_k
+
+    one = ndcg_at_k(["a", "x", "y"], {"a": 1.0}, 10)
+    many = ndcg_at_k(["a", "b", "c"], {"a": 1.0, "b": 1.0, "c": 1.0}, 10)
+
+    assert one == pytest.approx(1.0)
+    assert many == pytest.approx(1.0)
+
+
+def test_ndcg_respects_the_cut_off():
+    """A document below k was not returned, as far as the user is concerned."""
+    from autodistiller.evaluation.embedding import ndcg_at_k
+
+    ranking = ["x", "y", "z", "a"]
+
+    assert ndcg_at_k(ranking, {"a": 1.0}, 3) == 0.0
+    assert ndcg_at_k(ranking, {"a": 1.0}, 10) > 0.0
+
+
+def test_retrieval_loader_drops_queries_nobody_judged(tmp_path: Path):
+    """A query with no relevant document scores zero however good the model is.
+
+    Leaving them in measures the dataset's coverage rather than the model.
+    """
+    import json
+
+    from autodistiller.config import DatasetSpec
+    from autodistiller.evaluation.datasets import load_retrieval
+
+    def jsonl(name: str, rows: list[dict]) -> DatasetSpec:
+        path = tmp_path / name
+        path.write_text("\n".join(json.dumps(r) for r in rows), encoding="utf-8")
+        return DatasetSpec(source="jsonl", path=str(path))
+
+    corpus = jsonl(
+        "corpus.jsonl",
+        [
+            {"_id": "d1", "title": "Cats", "text": "cats purr"},
+            {"_id": "d2", "title": "", "text": "dogs bark"},
+        ],
+    )
+    queries = jsonl(
+        "queries.jsonl",
+        [{"_id": "q1", "text": "what do cats do"}, {"_id": "q2", "text": "unjudged"}],
+    )
+    qrels = jsonl(
+        "qrels.jsonl",
+        [
+            {"query-id": "q1", "corpus-id": "d1", "score": 1.0},
+            # A zero judgement is "not relevant", not a judgement to keep.
+            {"query-id": "q1", "corpus-id": "d2", "score": 0.0},
+        ],
+    )
+
+    dataset = load_retrieval(corpus, queries, qrels)
+
+    assert dataset.query_ids == ["q1"]
+    assert dataset.relevance == {"q1": {"d1": 1.0}}
+    # Title first, the way BEIR concatenates them.
+    assert dataset.documents == ["Cats cats purr", "dogs bark"]

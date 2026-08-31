@@ -855,9 +855,17 @@ def test_batch_size_is_searched_only_for_encoders():
     assert {c.batch_size for c in decoder.accepted} == {1}
 
 
-def test_batching_scales_the_activation_estimate():
-    """Texts in flight is requests times texts per request, and that product is
-    what the memory is a function of."""
+def test_batching_scales_the_activation_estimate_until_the_scheduler_caps_it():
+    """Memory grows with texts in flight, then stops.
+
+    A server admits work up to a token budget and runs the rest after, so past
+    that point asking for a bigger batch does not cost more memory -- it queues.
+    Without the cap the estimate is a function of the client's concurrency,
+    which the server never honoured: 256 texts came out at 2.44 GiB against a
+    server that peaked at 0.77 including weights and CUDA graphs.
+    """
+    from autodistiller.candidates.memory import ACTIVATION_RESIDENT_TOKEN_BUDGET
+
     result = generate_candidates(
         bge_small(),
         profile=SMALL,
@@ -868,7 +876,11 @@ def test_batching_scales_the_activation_estimate():
     by_batch = {c.batch_size: c for c in result.accepted if c.method is None}
 
     assert by_batch[8].estimate.kv_cache_bytes > by_batch[1].estimate.kv_cache_bytes
-    assert by_batch[32].estimate.kv_cache_bytes > by_batch[8].estimate.kv_cache_bytes
+    # 8 x 8 texts of 512 tokens is exactly the budget, so 32 queues rather than
+    # costing more.
+    assert ACTIVATION_RESIDENT_TOKEN_BUDGET == 8 * 8 * 512
+    assert by_batch[32].estimate.kv_cache_bytes == by_batch[8].estimate.kv_cache_bytes
+
     # And the id says which is which, or three rows read identically.
     assert by_batch[32].id.endswith("-b32")
     assert "-b" not in by_batch[1].id

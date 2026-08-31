@@ -18,7 +18,14 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Literal
 
-from ..config import DatasetSpec, EmbeddingTask, MultipleChoiceTask, PerplexityTask, TaskSpec
+from ..config import (
+    DatasetSpec,
+    EmbeddingTask,
+    MultipleChoiceTask,
+    PerplexityTask,
+    RetrievalTask,
+    TaskSpec,
+)
 
 PresetFactory = Callable[[int | None], TaskSpec]
 
@@ -28,6 +35,24 @@ DEFAULT_SCREENING_LIMIT = 256
 Phase 1 is a screening stage. A full wikitext-2 pass is minutes of GPU time that
 buys very little extra signal about whether a baseline is sane.
 """
+
+
+def _scifact(limit: int | None) -> TaskSpec:
+    """SciFact: the smallest BEIR retrieval benchmark worth reporting.
+
+    5183 documents and 300 judged queries, so a full pass is seconds on a GPU
+    and the whole corpus is encoded rather than sampled. Sampling a corpus would
+    make the score depend on whether the right document happened to be included,
+    which is not a property of the model.
+    """
+    return RetrievalTask(
+        name="scifact",
+        dataset=DatasetSpec(source="hub", path="BeIR/scifact", name="corpus", split="corpus"),
+        queries=DatasetSpec(source="hub", path="BeIR/scifact", name="queries", split="queries"),
+        qrels=DatasetSpec(
+            source="hub", path="mteb/scifact", name="default", split="test", limit=limit
+        ),
+    )
 
 
 def _stsb(limit: int | None) -> TaskSpec:
@@ -140,6 +165,7 @@ PRESETS: dict[str, PresetFactory] = {
     "hellaswag": _hellaswag,
     "piqa": _piqa,
     "stsb": _stsb,
+    "scifact": _scifact,
 }
 
 DEFAULT_TASKS = ("wikitext2",)

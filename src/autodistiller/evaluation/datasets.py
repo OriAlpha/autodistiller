@@ -87,6 +87,109 @@ class SentencePairSet:
         return len(self.examples)
 
 
+@dataclass
+class RetrievalSet:
+    """A corpus, queries, and which documents answer which query."""
+
+    doc_ids: list[str]
+    documents: list[str]
+    query_ids: list[str]
+    queries: list[str]
+    relevance: dict[str, dict[str, float]]
+    fingerprint: str
+    source: str
+
+    @property
+    def n_examples(self) -> int:
+        return len(self.queries)
+
+
+def _rows(spec: DatasetSpec) -> list[dict[str, Any]]:
+    if spec.source == "jsonl":
+        path = Path(spec.path)
+        if not path.exists():
+            raise FileNotFoundError(f"dataset not found: {path}")
+        return _read_jsonl(path, spec.limit)
+    if spec.source == "text":
+        raise ValueError("retrieval tasks need source 'jsonl' or 'hub', not 'text'")
+    return _load_hub_rows(spec)
+
+
+def load_retrieval(
+    corpus: DatasetSpec,
+    queries: DatasetSpec,
+    qrels: DatasetSpec,
+    *,
+    doc_id_column: str = "_id",
+    doc_text_column: str = "text",
+    doc_title_column: str | None = "title",
+    query_id_column: str = "_id",
+    query_text_column: str = "text",
+    qrel_query_column: str = "query-id",
+    qrel_doc_column: str = "corpus-id",
+    qrel_score_column: str = "score",
+) -> RetrievalSet:
+    """Load a BEIR-shaped retrieval benchmark.
+
+    Only the queries that have a judgement are kept. A query with no relevant
+    document scores zero however good the model is, so leaving them in measures
+    the dataset's coverage rather than the model.
+    """
+    source = f"{corpus.source}:{corpus.path}"
+
+    relevance: dict[str, dict[str, float]] = {}
+    for row in _rows(qrels):
+        score = float(_require_column(row, qrel_score_column, source))
+        if score <= 0:
+            continue
+        query_id = str(_require_column(row, qrel_query_column, source))
+        relevance.setdefault(query_id, {})[str(_require_column(row, qrel_doc_column, source))] = (
+            score
+        )
+
+    if not relevance:
+        raise ValueError(f"{source}: no relevance judgements found")
+
+    doc_ids: list[str] = []
+    documents: list[str] = []
+    for row in _rows(corpus):
+        doc_ids.append(str(_require_column(row, doc_id_column, source)))
+        text = str(_require_column(row, doc_text_column, source))
+        title = str(row.get(doc_title_column) or "") if doc_title_column else ""
+        # Title first, the way BEIR concatenates them: it is often the most
+        # retrievable sentence in the document.
+        documents.append(f"{title} {text}".strip() if title else text)
+
+    query_ids: list[str] = []
+    texts: list[str] = []
+    for row in _rows(queries):
+        query_id = str(_require_column(row, query_id_column, source))
+        if query_id not in relevance:
+            continue
+        query_ids.append(query_id)
+        texts.append(str(_require_column(row, query_text_column, source)))
+
+    if not documents or not texts:
+        raise ValueError(f"{source}: corpus or queries came back empty")
+
+    fingerprint = hash_obj(
+        {
+            "docs": hash_text_stream(documents),
+            "queries": hash_text_stream(texts),
+            "qrels": sorted((q, sorted(d)) for q, d in relevance.items()),
+        }
+    )
+    return RetrievalSet(
+        doc_ids=doc_ids,
+        documents=documents,
+        query_ids=query_ids,
+        queries=texts,
+        relevance=relevance,
+        fingerprint=fingerprint,
+        source=source,
+    )
+
+
 def _read_jsonl(path: Path, limit: int | None = None) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     with path.open("r", encoding="utf-8") as handle:

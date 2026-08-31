@@ -138,8 +138,44 @@ class EmbeddingTask(StrictModel):
     score_column: str = "label"
 
 
+class RetrievalTask(StrictModel):
+    """nDCG@k over a corpus, which is what an embedding model is usually for.
+
+    Sentence similarity is the cheap screen and a weak proxy: a model can hold
+    its STS correlation and still return different documents, and returning
+    documents is the job. This measures the job.
+
+    Three datasets rather than one, because that is the shape of the task: a
+    corpus to search, queries to search it with, and human judgements of which
+    documents answer which query.
+    """
+
+    kind: Literal["retrieval"] = "retrieval"
+    name: str
+    dataset: DatasetSpec
+    """The corpus. Named ``dataset`` like every other task so the pre-flight
+    dataset check and the fingerprinting work on it unchanged."""
+
+    queries: DatasetSpec
+    qrels: DatasetSpec
+
+    top_k: int = Field(default=10, ge=1, description="Cut-off for nDCG@k")
+    batch_size: int = Field(default=32, ge=1)
+    max_length: int | None = None
+    pooling: Literal["mean", "cls"] | None = None
+
+    doc_id_column: str = "_id"
+    doc_text_column: str = "text"
+    doc_title_column: str | None = "title"
+    query_id_column: str = "_id"
+    query_text_column: str = "text"
+    qrel_query_column: str = "query-id"
+    qrel_doc_column: str = "corpus-id"
+    qrel_score_column: str = "score"
+
+
 TaskSpec = Annotated[
-    PerplexityTask | MultipleChoiceTask | EmbeddingTask,
+    PerplexityTask | MultipleChoiceTask | EmbeddingTask | RetrievalTask,
     Field(discriminator="kind"),
 ]
 

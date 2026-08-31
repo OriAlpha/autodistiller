@@ -30,9 +30,9 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from ..config import EmbeddingTask
+from ..config import EmbeddingTask, RetrievalTask
 from ..results import MetricValue, TaskResult
-from .datasets import SentencePairSet, load_sentence_pairs
+from .datasets import RetrievalSet, SentencePairSet, load_retrieval, load_sentence_pairs
 
 logger = logging.getLogger(__name__)
 
@@ -186,6 +186,112 @@ def encode(
     return torch.cat(vectors), n_tokens
 
 
+def ndcg_at_k(ranked: list[str], relevant: dict[str, float], k: int) -> float:
+    """Normalized discounted cumulative gain over one query's ranking.
+
+    Discounted because position matters: a right answer at rank 10 is worth
+    less than the same answer at rank 1, which is the whole difference between
+    a retriever and a filter. Normalized against the best possible ordering, so
+    a query with one relevant document and a query with twenty are on the same
+    scale and can be averaged.
+    """
+    gain = sum(
+        relevant.get(doc_id, 0.0) / math.log2(rank + 2) for rank, doc_id in enumerate(ranked[:k])
+    )
+    ideal = sum(
+        score / math.log2(rank + 2)
+        for rank, score in enumerate(sorted(relevant.values(), reverse=True)[:k])
+    )
+    return gain / ideal if ideal > 0 else 0.0
+
+
+def evaluate_retrieval(
+    handle,
+    task: RetrievalTask,
+    *,
+    dataset: RetrievalSet | None = None,
+    progress=None,
+) -> TaskResult:
+    """Score an embedding model on what it is usually for: finding documents.
+
+    Exhaustive search rather than an index. The corpora that fit on a screening
+    budget are thousands of documents, one matrix multiply wide, and an
+    approximate index would put its own recall loss on top of the model's --
+    which is the thing being measured.
+    """
+    started = time.perf_counter()
+    dataset = dataset or load_retrieval(
+        task.dataset,
+        task.queries,
+        task.qrels,
+        doc_id_column=task.doc_id_column,
+        doc_text_column=task.doc_text_column,
+        doc_title_column=task.doc_title_column,
+        query_id_column=task.query_id_column,
+        query_text_column=task.query_text_column,
+        qrel_query_column=task.qrel_query_column,
+        qrel_doc_column=task.qrel_doc_column,
+        qrel_score_column=task.qrel_score_column,
+    )
+
+    max_length = task.max_length or handle.context_length
+    pooling = task.pooling or detect_pooling(handle.info.id)
+    corpus_vectors, corpus_tokens = encode(
+        handle,
+        dataset.documents,
+        batch_size=task.batch_size,
+        max_length=max_length,
+        pooling=pooling,
+    )
+    query_vectors, query_tokens = encode(
+        handle,
+        dataset.queries,
+        batch_size=task.batch_size,
+        max_length=max_length,
+        pooling=pooling,
+    )
+    if progress is not None:
+        progress(len(dataset.queries), len(dataset.queries))
+
+    # Vectors are already L2-normalized, so the product is cosine similarity.
+    scores = query_vectors @ corpus_vectors.T
+    k = min(task.top_k, len(dataset.doc_ids))
+    top = torch.topk(scores, k=k, dim=-1).indices
+
+    per_query = [
+        ndcg_at_k(
+            [dataset.doc_ids[i] for i in row.tolist()],
+            dataset.relevance.get(query_id, {}),
+            task.top_k,
+        )
+        for query_id, row in zip(dataset.query_ids, top, strict=True)
+    ]
+
+    n = len(per_query)
+    mean = float(np.mean(per_query))
+    # Across queries, which is the unit that varies. A tighter bound would need
+    # to model the corpus too, and this is the one the literature reports.
+    stderr = float(np.std(per_query, ddof=1) / math.sqrt(n)) if n > 1 else None
+
+    return TaskResult(
+        name=task.name,
+        kind=task.kind,
+        metrics=[
+            MetricValue(name=f"ndcg@{task.top_k}", value=mean, higher_is_better=True, stderr=stderr)
+        ],
+        n_samples=n,
+        n_tokens=corpus_tokens + query_tokens,
+        duration_s=time.perf_counter() - started,
+        dataset_fingerprint=dataset.fingerprint,
+        details={
+            "source": dataset.source,
+            "pooling": pooling,
+            "n_documents": len(dataset.doc_ids),
+            "max_length": max_length,
+        },
+    )
+
+
 def evaluate_embedding(
     handle,
     task: EmbeddingTask,
@@ -268,6 +374,8 @@ __all__ = [
     "detect_pooling",
     "encode",
     "evaluate_embedding",
+    "evaluate_retrieval",
+    "ndcg_at_k",
     "pool",
     "spearman",
 ]

@@ -949,3 +949,84 @@ def test_latency_and_request_rate_constrain_a_non_streaming_endpoint():
     assert Constraints(max_request_latency_s=0.1).needs_benchmark
     assert Constraints(min_requests_per_s=1.0).needs_benchmark
     assert not Constraints(max_vram_bytes=GIB).needs_benchmark
+
+
+def test_a_throughput_gap_inside_the_error_bar_is_called_noise():
+    """The whole reason each rung is measured more than once.
+
+    Two candidates 8 texts/s apart is a real difference or a coin toss depending
+    entirely on how much the number moves between runs, and before there was a
+    spread to consult the frontier called it real either way.
+    """
+    from autodistiller.optimize.pareto import THROUGHPUT, _within_noise
+    from autodistiller.results import ConcurrencyResult, DeploymentBenchmark
+
+    def outcome(throughput: float, stderr: float | None) -> CandidateOutcome:
+        return _outcome(
+            stage="benchmarked",
+            benchmark=DeploymentBenchmark(
+                backend="vllm",
+                endpoint="http://fake",
+                served_model="m",
+                phases=[
+                    ConcurrencyResult(
+                        concurrency=1,
+                        n_requests=8,
+                        duration_s=1.0,
+                        items_per_s=throughput,
+                        requests_per_s=throughput,
+                        n_repeats=3 if stderr is not None else 1,
+                        throughput_stderr=stderr,
+                    )
+                ],
+            ),
+        )
+
+    leader = outcome(112.0, 8.0)
+    assert _within_noise(outcome(104.0, 8.0), [leader], THROUGHPUT, 104.0, 112.0)
+
+    # The same gap, measured precisely, is a real difference.
+    tight = outcome(112.0, 0.2)
+    assert not _within_noise(outcome(104.0, 0.2), [tight], THROUGHPUT, 104.0, 112.0)
+
+    # And measured once there is no basis to call anything noise, which is not
+    # the same as knowing the gap is real.
+    once = outcome(112.0, None)
+    assert not _within_noise(outcome(104.0, None), [once], THROUGHPUT, 104.0, 112.0)
+
+
+def test_an_axis_that_separates_nothing_is_dropped():
+    """vLLM fills to its memory-utilization flag whatever the model's size.
+
+    Every encoder candidate then comes back within a few hundredths of a GiB of
+    every other, and ranking on that calls one dominated because a constant
+    wobbled.
+    """
+    from autodistiller.optimize.pareto import ParetoReport
+    from autodistiller.results import ConcurrencyResult, DeploymentBenchmark
+
+    def outcome(vram: int, quality: float) -> CandidateOutcome:
+        return _outcome(
+            stage="benchmarked",
+            quality_retention=quality,
+            benchmark=DeploymentBenchmark(
+                backend="vllm",
+                endpoint="http://fake",
+                served_model="m",
+                phases=[
+                    ConcurrencyResult(
+                        concurrency=1,
+                        n_requests=8,
+                        duration_s=1.0,
+                        output_tokens_per_s=100.0,
+                        peak_vram_bytes=vram,
+                    )
+                ],
+            ),
+        )
+
+    flat = ParetoReport([outcome(GIB, 1.0), outcome(GIB, 0.98)])
+    assert "vram" not in {axis.key for axis in flat.axes}
+
+    spread = ParetoReport([outcome(GIB, 1.0), outcome(4 * GIB, 0.98)])
+    assert "vram" in {axis.key for axis in spread.axes}

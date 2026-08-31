@@ -443,9 +443,9 @@ def test_an_encoder_recipe_does_not_claim_to_ignore_an_lm_head():
 
     spec = CompressionSpec(method="int8-weight-only")
 
-    with mock.patch("autodistiller.compression.pipeline._model_kind_of", return_value="encoder"):
+    with mock.patch("autodistiller.compression.pipeline.model_kind_of", return_value="encoder"):
         encoder_job = build_job(ModelSpec(id="BAAI/bge-small-en-v1.5"), spec)
-    with mock.patch("autodistiller.compression.pipeline._model_kind_of", return_value="decoder"):
+    with mock.patch("autodistiller.compression.pipeline.model_kind_of", return_value="decoder"):
         decoder_job = build_job(ModelSpec(id="Qwen/Qwen3-0.6B"), spec)
 
     assert encoder_job.ignore == ()

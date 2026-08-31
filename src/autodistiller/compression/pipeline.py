@@ -58,7 +58,7 @@ def artifact_dir(model_id: str, method: str, root: Path, key: str | None = None)
     return root / (f"{stem}-{key[:8]}" if key else stem)
 
 
-def _model_kind_of(model: ModelSpec) -> str | None:
+def model_kind_of(model: ModelSpec) -> str | None:
     """Whether these weights are a decoder or an encoder, read from the config.
 
     A few kilobytes against a compression run that is minutes, so it is worth
@@ -106,7 +106,7 @@ def build_job(
     # in the backend, because the recipe is what the artifact record carries:
     # a recipe naming a module the model does not have describes a step that
     # never happened, and it is part of the artifact's identity besides.
-    ignore = tuple(spec.ignore) if _model_kind_of(model) != ENCODER else ()
+    ignore = tuple(spec.ignore) if model_kind_of(model) != ENCODER else ()
 
     job = CompressionJob(
         model_id=model.id,
@@ -204,7 +204,7 @@ def run_compression(
     # default the user never chose.
     target = serving_backend or (method.backends[0] if method.backends else None)
     availability = check_method(
-        method, profile=profile, backend=target, model_kind=_model_kind_of(model)
+        method, profile=profile, backend=target, model_kind=model_kind_of(model)
     )
     if not availability.available:
         raise ValueError(f"{method.name} is not usable here: {'; '.join(availability.reasons)}")
@@ -239,6 +239,7 @@ __all__ = [
     "ARTIFACT_SIDECAR",
     "artifact_dir",
     "build_job",
+    "model_kind_of",
     "read_cached_artifact",
     "run_compression",
     "write_artifact_sidecar",

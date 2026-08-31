@@ -70,6 +70,21 @@ candidates that OOM at serve time and over-estimating only costs a candidate
 that would have fit.
 """
 
+ACTIVATION_RESIDENT_TOKEN_BUDGET = 32768
+"""Tokens a serving runtime holds resident at once, whatever is in flight.
+
+A scheduler does not encode every queued text simultaneously -- it admits work
+up to a token budget and runs the rest after. Without this cap the estimate is a
+function of the client's concurrency, which the server does not honour:
+256 texts of 512 tokens came out at 2.44 GiB against a server that peaked at
+0.77 GiB including weights and CUDA graphs, so it rejected configurations that
+run comfortably.
+
+# ponytail: one budget, calibrated against one measured vLLM pooling run rather
+# than read out of its scheduler config, which is version-dependent. Revisit if
+# a runtime lands far from it.
+"""
+
 ACTIVATION_BLOCK_COPIES = 2
 """Live copies of a block's widened activations during one forward pass.
 
@@ -205,12 +220,19 @@ def activation_bytes(shape: ModelShape, *, seq_len: int, batch: int) -> int:
     why an encoder's memory question is a different question rather than the
     same one with the cache removed.
 
+    Bounded by what a scheduler will hold at once rather than by what the client
+    asks for: see ``ACTIVATION_RESIDENT_TOKEN_BUDGET``.
+
     # ponytail: two terms, not a per-op accounting. It is a screen, and the
     # quadratic one dominates well before anything else would matter.
     """
-    tokens = batch * seq_len
+    tokens = min(batch * seq_len, ACTIVATION_RESIDENT_TOKEN_BUDGET)
+    # Whole sequences, because the score matrix is per sequence and at least one
+    # is always resident however long it is.
+    resident = max(tokens // seq_len, 1)
+
     linear = tokens * (shape.hidden_size + shape.intermediate_size) * 2 * ACTIVATION_BLOCK_COPIES
-    scores = batch * shape.n_attention_heads * seq_len * seq_len * 2
+    scores = resident * shape.n_attention_heads * seq_len * seq_len * 2
     return linear + scores
 
 
