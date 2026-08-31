@@ -20,7 +20,7 @@ from autodistiller.architecture import DECODER, ENCODER, VISION, model_kind
 from autodistiller.candidates.generator import generate_candidates
 from autodistiller.candidates.memory import estimate_memory, weight_bytes
 from autodistiller.candidates.shape import shape_from_config
-from autodistiller.compression.methods import METHODS
+from autodistiller.compression.methods import METHODS, check_method
 from autodistiller.config import ImageClassificationTask
 from autodistiller.evaluation.datasets import _evenly_spaced, load_image_classification
 from autodistiller.evaluation.image_classification import evaluate_image_classification
@@ -131,6 +131,14 @@ def test_sequence_length_is_not_a_search_axis_for_a_vit():
     result = generate_candidates(shape, backend="vllm", context_lengths=(128, 512, 2048))
     lengths = {c.max_model_len for c in result.accepted + [r.candidate for r in result.rejected]}
     assert lengths == {197}
+
+
+def test_calibrated_methods_do_not_apply_to_a_vision_model():
+    """Calibration pushes text through a tokenizer, and a ViT has neither."""
+    for name in ("int8", "int4-gptq", "int4-awq", "fp8-static"):
+        assert not check_method(METHODS[name], model_kind=VISION).available
+    for name in ("int8-weight-only", "fp8"):
+        assert check_method(METHODS[name], model_kind=VISION).available
 
 
 # --- the subset ----------------------------------------------------------
@@ -256,3 +264,25 @@ def test_a_label_the_model_cannot_predict_is_refused():
 
     with pytest.raises(ValueError, match="out of range"):
         evaluate_image_classification(_handle(_FakeClassifier(n_labels=10)), task, dataset=dataset)
+
+
+# --- export --------------------------------------------------------------
+
+
+def test_an_image_processor_counts_as_a_preprocessor(tmp_path):
+    """A ViT artifact has no tokenizer and is not missing one."""
+    import json
+
+    from autodistiller.export import inspect_artifact
+
+    directory = tmp_path / "art"
+    directory.mkdir()
+    (directory / "config.json").write_text("{}", encoding="utf-8")
+    (directory / "model.safetensors").write_bytes(b"0")
+    (directory / "preprocessor_config.json").write_text(
+        json.dumps({"image_mean": [0.5, 0.5, 0.5]}), encoding="utf-8"
+    )
+
+    checks = {c.name: c for c in inspect_artifact(directory)}
+    assert checks["processor"].ok
+    assert "tokenizer" not in checks

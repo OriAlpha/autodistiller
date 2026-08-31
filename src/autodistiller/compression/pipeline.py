@@ -24,7 +24,7 @@ import re
 from pathlib import Path
 from typing import Protocol
 
-from ..architecture import ENCODER, model_kind
+from ..architecture import DECODER, model_kind
 from ..config import CompressionSpec, ModelSpec
 from ..evaluation.datasets import load_text_corpus
 from ..metadata.profiles import GPUProfile
@@ -60,7 +60,7 @@ def artifact_dir(model_id: str, method: str, root: Path, key: str | None = None)
 
 
 def model_kind_of(model: ModelSpec) -> str | None:
-    """Whether these weights are a decoder or an encoder, read from the config.
+    """Which kind of model these weights are, read from the config.
 
     A few kilobytes against a compression run that is minutes, so it is worth
     paying to refuse ``int4-awq`` on a BERT checkpoint up front rather than
@@ -103,11 +103,12 @@ def build_job(
         # Not an error, but the user probably expected it to matter.
         calibration_texts = []
 
-    # An encoder has no lm_head to leave alone. Resolved here rather than only
-    # in the backend, because the recipe is what the artifact record carries:
-    # a recipe naming a module the model does not have describes a step that
-    # never happened, and it is part of the artifact's identity besides.
-    ignore = tuple(spec.ignore) if model_kind_of(model) != ENCODER else ()
+    # Only a decoder has an lm_head to leave alone; an encoder and a vision
+    # tower have no such module. Resolved here rather than only in the backend,
+    # because the recipe is what the artifact record carries: a recipe naming a
+    # module the model does not have describes a step that never happened, and
+    # it is part of the artifact's identity besides.
+    ignore = tuple(spec.ignore) if model_kind_of(model) == DECODER else ()
 
     job = CompressionJob(
         model_id=model.id,

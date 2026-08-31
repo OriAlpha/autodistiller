@@ -65,6 +65,14 @@ MANIFEST_SCHEMA_VERSION = 1
 WEIGHT_PATTERNS = ("*.safetensors", "*.bin", "*.pt")
 TOKENIZER_FILES = ("tokenizer.json", "tokenizer.model", "tokenizer_config.json", "vocab.json")
 
+IMAGE_PROCESSOR_FILES = ("preprocessor_config.json",)
+"""What a vision checkpoint carries instead of a tokenizer.
+
+Same job under a different name: it is the file that says how to turn an input
+into the tensors the weights expect. Without it in the list, a perfectly good
+ViT artifact is reported as unservable for missing a tokenizer it never had.
+"""
+
 SERVABLE_QUANT_METHODS = {
     "vllm": {
         "compressed-tensors",
@@ -195,12 +203,19 @@ def inspect_artifact(directory: Path, *, backend: str = "vllm") -> list[Check]:
         )
     )
 
+    # Whichever this model uses. A text model has a tokenizer and a vision model
+    # has an image processor, and an artifact missing its own is equally
+    # undeployable either way -- so the check is "can this turn an input into
+    # tensors", not "is there a tokenizer".
+    processor = [name for name in IMAGE_PROCESSOR_FILES if (directory / name).is_file()]
     tokenizer = [name for name in TOKENIZER_FILES if (directory / name).is_file()]
     checks.append(
         Check(
-            "tokenizer",
-            bool(tokenizer),
-            ", ".join(tokenizer) if tokenizer else "no tokenizer files; the server cannot encode",
+            "tokenizer" if not processor or tokenizer else "processor",
+            bool(tokenizer or processor),
+            ", ".join(tokenizer + processor)
+            if (tokenizer or processor)
+            else "no tokenizer files; the server cannot encode",
         )
     )
 
