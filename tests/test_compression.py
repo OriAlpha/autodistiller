@@ -463,10 +463,15 @@ def test_a_float32_checkpoint_is_compressed_at_sixteen_bits():
     bfloat16 brought it to 46.4 MB with the STS-B score unmoved.
     """
     import importlib.util
+    from pathlib import Path
 
-    spec = importlib.util.spec_from_file_location(
-        "_ad_runner", "src/autodistiller/compression/_runner.py"
-    )
+    import autodistiller.compression as compression
+
+    # Located through the package rather than a path relative to the working
+    # directory: the runner is not importable (it must not import AutoDistiller),
+    # but where it lives is not a guess.
+    runner_path = Path(compression.__file__).with_name("_runner.py")
+    spec = importlib.util.spec_from_file_location("_ad_runner", runner_path)
     runner = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(runner)
 
