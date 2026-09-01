@@ -58,6 +58,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   identically doomed rows and a summary naming whichever constraint happened to
   be passed.
 
+### Fixed
+
+- **Modern encoder blocks are no longer under-estimated by up to a fifth.** The
+  encoder arithmetic described the original BERT block -- two-matrix
+  feed-forward, learned position table -- and several embedding models have
+  since replaced both. ModernBERT came out at 90.75% of its real parameter
+  count, Jina v2 at 83.48%, Nomic v1.5 at 80.42%; all three now land above
+  99.5%. Under is the direction that admits a candidate which then runs out of
+  memory at serve time, so this was the dangerous half of being approximate.
+
+  A config that names a gated activation (`swiglu`, `geglu`, `glu`) or a
+  non-absolute position type is now read correctly on its own. The three above
+  say neither -- ModernBERT's config even claims `position_embedding_type:
+  absolute` while using rotary -- so they are corrected by architecture stem,
+  each entry carrying its measured before and after.
+
+- **A config with no `architectures` is no longer assumed to be a decoder.**
+  DeBERTa-v3 ships one, and reading it as a decoder gave it a gated MLP and a
+  KV cache it does not have: 0.21B estimated against the 184M its own model
+  card states. `model_type` is consulted first now, and says `deberta-v2`. The
+  decoder fallback remains for a config that says nothing at all, which is what
+  a local or hand-written one has always been treated as.
+
+- **A vision model's sequence length comes from its processor, not its config.**
+  DINOv2 was trained at 518 pixels and stores a position table with a row per
+  patch at that resolution, while its own processor centre-crops to 224. The
+  run record said 1370 tokens where 257 ran, and the memory screen modelled five
+  times the activations. The two are now separate numbers: the table belongs to
+  the weights, the sequence to the forward pass. ViT, DeiT and BEiT are
+  unchanged, their config and processor agreeing.
+
 ### Refused, with reasons
 
 - **No serving backend runs a vision tower.** vLLM 0.27's registry has no

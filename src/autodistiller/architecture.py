@@ -54,7 +54,21 @@ mistake this module exists to stop.
 """
 
 
-def model_kind(architectures: Any) -> str | None:
+ENCODER_MODEL_TYPES = tuple(stem.lower() for stem in ENCODER_FAMILIES)
+"""The same stems, matched against ``model_type`` instead of a class name.
+
+For configs that carry no ``architectures`` at all. DeBERTa-v3 is the one that
+forced this: `microsoft/deberta-v3-base` omits the key entirely, and the rule
+below reads that as a decoder -- which gave it a gated MLP and a KV cache it
+does not have, a 0.21B estimate for a 184M encoder. Its ``model_type`` says
+``deberta-v2`` and was sitting there unread.
+
+Substring matching, so ``deberta-v2`` matches ``deberta`` and ``xlm-roberta``
+matches both of its halves.
+"""
+
+
+def model_kind(architectures: Any, model_type: Any = None) -> str | None:
     """``decoder``, ``encoder``, ``vision``, or ``None`` when the name does not say.
 
     Absence of a decoder suffix is not evidence of an encoder. A speculative
@@ -65,12 +79,16 @@ def model_kind(architectures: Any) -> str | None:
     recognised positively and everything else returns ``None`` for the caller
     to decide about.
 
-    A config with no ``architectures`` is the one exception: that is a local or
-    hand-written config, and it is read as a decoder because that is how every
-    such checkpoint has been treated since before encoders were described here.
+    A config with no ``architectures`` falls back to ``model_type``, and then to
+    ``decoder`` if that says nothing either -- a local or hand-written config is
+    read as a decoder because that is how every such checkpoint has been treated
+    since before encoders were described here.
     """
     names = [str(name) for name in (architectures or ())]
     if not names:
+        spelling = str(model_type or "").lower()
+        if spelling and any(stem in spelling for stem in ENCODER_MODEL_TYPES):
+            return ENCODER
         return DECODER
     if any(name.endswith(DECODER_SUFFIXES) for name in names):
         return DECODER
@@ -86,7 +104,7 @@ def model_kind(architectures: Any) -> str | None:
 
 def kind_of_config(config: Any) -> str | None:
     """``model_kind`` for an already-loaded Hugging Face config object."""
-    return model_kind(getattr(config, "architectures", None))
+    return model_kind(getattr(config, "architectures", None), getattr(config, "model_type", None))
 
 
 __all__ = [
@@ -94,6 +112,7 @@ __all__ = [
     "DECODER_SUFFIXES",
     "ENCODER",
     "ENCODER_FAMILIES",
+    "ENCODER_MODEL_TYPES",
     "ENCODER_SUFFIXES",
     "VISION",
     "VISION_SUFFIXES",

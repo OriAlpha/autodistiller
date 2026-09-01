@@ -76,7 +76,7 @@ def model_kind_of(model: ModelSpec) -> str | None:
     except Exception as exc:  # any failure to read it means "unknown", not "decoder"
         logger.debug("could not read the config for %s: %s", model.id, exc)
         return None
-    return model_kind(getattr(config, "architectures", None))
+    return model_kind(getattr(config, "architectures", None), getattr(config, "model_type", None))
 
 
 def build_job(

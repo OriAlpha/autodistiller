@@ -105,6 +105,32 @@ def test_a_staged_backbone_is_refused_rather_than_measured():
         shape_from_config("microsoft/swin-tiny", config)
 
 
+def test_a_stored_position_table_can_outlast_the_resolution_that_runs():
+    """DINOv2 trains at 518px and its own processor crops to 224.
+
+    Two numbers, not one. The position table has a row per patch at 518 and is
+    part of the weights; 257 tokens actually go through the blocks. Using the
+    training resolution for both models five times the activations and records
+    an evaluation context that describes something that did not happen.
+    """
+    config = _vit_config(image_size=518, patch_size=14)
+    shape = shape_from_config("dinov2", config, inference_image_size=224)
+
+    assert shape.position_tokens == 1370  # 37x37 patches plus the class token
+    assert shape.n_image_tokens == 257  # 16x16 plus the class token
+    assert "trained at 518px" in shape.describe()
+
+    # Without a processor to consult, the config's resolution stands in.
+    assert shape_from_config("dinov2", config).n_image_tokens == 1370
+
+
+def test_a_vit_whose_processor_agrees_is_unaffected():
+    shape = shape_from_config("vit", _vit_config(), inference_image_size=224)
+
+    assert shape.position_tokens == shape.n_image_tokens == 197
+    assert "trained at" not in shape.describe()
+
+
 # --- memory --------------------------------------------------------------
 
 

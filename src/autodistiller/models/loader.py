@@ -99,7 +99,14 @@ def resolve_dtype(requested: str, device: torch.device) -> torch.dtype:
     return torch.float32  # CPU fp16 is slow and often unsupported
 
 
-def resolve_context_length(config: Any, override: int | None) -> int:
+def resolve_context_length(config: Any, override: int | None, image_size: int | None = None) -> int:
+    """The sequence length a run will actually use.
+
+    ``image_size`` is what a vision model's own processor produces, which is not
+    always what its config advertises: DINOv2 stores a position table for 518
+    pixels and its processor crops to 224, so the config says 1370 tokens and
+    257 run. Recording the first would describe something that did not happen.
+    """
     if override:
         return override
     if kind_of_config(config) == VISION:
@@ -107,7 +114,7 @@ def resolve_context_length(config: Any, override: int | None) -> int:
         # plus the class token. The 2048 default below would be a number this
         # model cannot be asked for.
         patch = getattr(config, "patch_size", None)
-        image = getattr(config, "image_size", None)
+        image = image_size if isinstance(image_size, int) else getattr(config, "image_size", None)
         if isinstance(patch, int) and isinstance(image, int) and patch > 0:
             return (image // patch) ** 2 + 1
     for attr in ("max_position_embeddings", "n_positions", "seq_length", "max_seq_len"):
@@ -164,6 +171,23 @@ def gguf_file_in(model_id: str) -> str | None:
         return None
     found = sorted(directory.glob("*.gguf"))
     return found[0].name if found else None
+
+
+def _processor_image_size(processor: Any) -> int | None:
+    """The image side this processor produces, or None if it is a tokenizer.
+
+    Crop wins over resize where there is one: it is applied last, so it is the
+    size the model actually sees.
+    """
+    for attribute in ("crop_size", "size"):
+        spec = getattr(processor, attribute, None)
+        if spec is None:
+            continue
+        for key in ("height", "width", "shortest_edge"):
+            value = spec[key] if isinstance(spec, dict) else getattr(spec, key, None)
+            if isinstance(value, int) and value > 0:
+                return value
+    return None
 
 
 def auto_class_for(config: Any) -> Any:
@@ -249,7 +273,9 @@ def load_model(spec: Any) -> LoadedModel:
         dtype=str(dtype).replace("torch.", ""),
         device=str(device),
         n_parameters=sum(p.numel() for p in model.parameters()),
-        context_length=resolve_context_length(config, spec.max_position_embeddings),
+        context_length=resolve_context_length(
+            config, spec.max_position_embeddings, _processor_image_size(tokenizer)
+        ),
         vocab_size=getattr(config, "vocab_size", None),
         weights_size_bytes=_weights_size_bytes(model),
         architecture_fingerprint=_architecture_fingerprint(model),

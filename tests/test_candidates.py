@@ -978,3 +978,103 @@ def test_candidate_id_names_the_depth() -> None:
 
     assert pruned.id == "prune4-ctx2048"
     assert both.id == "prune4-int8-ctx2048"
+
+
+# --- encoders whose block is not BERT's ----------------------------------
+
+
+def _config(**fields):
+    """A stand-in for a Hugging Face config: attributes and nothing else."""
+    return type("Config", (), fields)()
+
+
+def test_a_config_with_no_architectures_falls_back_to_model_type():
+    """DeBERTa-v3 ships no `architectures` key, and it is not a decoder.
+
+    Read as one it got a gated MLP and a KV cache it does not have: 0.21B
+    estimated for a model whose own card says 184M. The `model_type` that says
+    so was sitting in the same file, unread.
+    """
+    from autodistiller.architecture import DECODER, ENCODER, model_kind
+
+    assert model_kind(None, "deberta-v2") == ENCODER
+    assert model_kind([], "xlm-roberta") == ENCODER
+    # Still a decoder when nothing says otherwise, which is what a local or
+    # hand-written config has always been treated as.
+    assert model_kind(None, None) == DECODER
+    assert model_kind(None, "llama") == DECODER
+    # An architecture name is more specific and keeps precedence.
+    assert model_kind(["BertLMHeadModel"], "bert") == ENCODER
+    assert model_kind(["LlamaForCausalLM"], "llama") == DECODER
+
+
+def test_deberta_v3_is_sized_as_the_encoder_it_is():
+    """184M by its own model card, against 0.21B before the fallback existed."""
+    from autodistiller.architecture import ENCODER
+
+    shape = shape_from_config(
+        "microsoft/deberta-v3-base",
+        _config(
+            model_type="deberta-v2",
+            hidden_size=768,
+            num_hidden_layers=12,
+            num_attention_heads=12,
+            intermediate_size=3072,
+            vocab_size=128100,
+            max_position_embeddings=512,
+        ),
+    )
+
+    assert shape.kind == ENCODER
+    assert shape.kv_bytes_per_token == 0
+    assert shape.n_parameters == pytest.approx(184e6, rel=0.01)
+
+
+def test_a_gated_encoder_mlp_is_counted_as_three_matrices():
+    """Nomic's config says `swiglu`, which names the third matrix outright.
+
+    Counting two under-estimated it by a fifth -- 80.42% of the real
+    checkpoint -- and under is the direction that admits a candidate which then
+    runs out of memory at serve time.
+    """
+    nomic = _config(
+        architectures=["NomicBertModel"],
+        model_type="nomic_bert",
+        hidden_size=768,
+        num_hidden_layers=12,
+        num_attention_heads=12,
+        intermediate_size=3072,
+        vocab_size=30528,
+        max_position_embeddings=2048,
+        activation_function="swiglu",
+        rotary_emb_fraction=1.0,
+    )
+    shape = shape_from_config("nomic-ai/nomic-embed-text-v1.5", nomic)
+
+    assert shape.gated_mlp
+    assert not shape.has_position_table  # rotary, so nothing is stored
+    assert shape.dense_mlp_params_per_layer == 3 * 768 * 3072
+    assert shape.n_parameters == pytest.approx(136.7e6, rel=0.01)
+
+
+def test_a_classic_bert_block_is_unchanged():
+    """The five encoders already measured must not move."""
+    shape = shape_from_config(
+        "BAAI/bge-base-en-v1.5",
+        _config(
+            architectures=["BertModel"],
+            model_type="bert",
+            hidden_size=768,
+            num_hidden_layers=12,
+            num_attention_heads=12,
+            intermediate_size=3072,
+            vocab_size=30522,
+            max_position_embeddings=512,
+            hidden_act="gelu",
+            position_embedding_type="absolute",
+        ),
+    )
+
+    assert not shape.gated_mlp
+    assert shape.has_position_table
+    assert shape.n_parameters == pytest.approx(109.5e6, rel=0.01)

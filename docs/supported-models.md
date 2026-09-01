@@ -101,10 +101,22 @@ against the real checkpoint:
 | `thenlper/gte-base` | `BertModel` | 99.35% |
 | `sentence-transformers/all-MiniLM-L6-v2` | `BertModel` | 99.21% |
 | `FacebookAI/roberta-base` | `RobertaForMaskedLM` | 99.39% |
+| `microsoft/deberta-v3-base` | *(config names none)* | 99.8% of its card's 184M |
+| `answerdotai/ModernBERT-base` | `ModernBertForMaskedLM` | 99.55% |
+| `jinaai/jina-embeddings-v2-base-en` | `JinaBertForMaskedLM` | 99.51% |
+| `nomic-ai/nomic-embed-text-v1.5` | `NomicBertModel` | 99.97% |
 
-That is the original BERT block: two-matrix feed-forward, learned absolute
-position table. **A modernised encoder is recognised but mis-sized** — see the
-gap below before pointing the memory screen at one.
+The first five are the original BERT block: two-matrix feed-forward, learned
+absolute position table. The last four are not, and each needed the arithmetic
+to be told so — see `ENCODER_BLOCK_OVERRIDES` in
+[`candidates/shape.py`](../src/autodistiller/candidates/shape.py). An encoder
+family that is not listed there and does not spell out a gated activation in its
+config keeps the classic-BERT assumption, so **check a new family's estimate
+before trusting the memory screen on it**:
+
+```bash
+uv run autodistiller candidates --model <your-encoder>
+```
 
 Five of the eleven methods apply: `int8`, `int8-weight-only`, `int4-gptq`, `fp8`,
 `fp8-static`. Tasks are `stsb` (similarity) and `scifact` (retrieval, nDCG@10).
@@ -125,6 +137,11 @@ processor where a text model carries a tokenizer.
 | `google/vit-base-patch16-224` | `ViTForImageClassification` | 86M | 78.03% |
 | `facebook/deit-base-patch16-224` | `ViTForImageClassification` | 86M | 78.37% |
 | `facebook/dinov2-small-imagenet1k-1-layer` | `Dinov2ForImageClassification` | 22M | 80.08% |
+
+DINOv2 is the case that separates two resolutions: it was trained at 518 pixels,
+so its position table stores 1370 rows, while its own processor crops to 224 and
+257 tokens actually run. The estimate counts the first and the search uses the
+second. ViT, DeiT and BEiT have one number for both.
 
 Top-1 on the `imagenet` preset, whose images are re-encoded and so score about
 two points below a published figure — see the README for why, and use
@@ -168,38 +185,21 @@ of them is a crash, and none produces a number.
 
 ## Known gaps
 
-Two places where the tool is not wrong so much as imprecise, both found by
-running it and neither fixed yet.
+**An unlisted encoder family may still be mis-sized.** The three that were
+measured are corrected by name, and a config that spells out a gated activation
+(`swiglu`, `geglu`, `glu`) or a non-absolute position type is read correctly
+without being listed. A family that does neither — a gated MLP its config does
+not mention — keeps the classic-BERT assumption and will be under-estimated,
+which is the direction that admits a candidate that then runs out of memory at
+serve time. Checking a new family against its real parameter count costs one
+command.
 
-**Modernised encoders are under-estimated.** The encoder arithmetic describes
-the original BERT block, and several newer embedding models have replaced its
-feed-forward with a gated one — three matrices where the estimate counts two —
-or dropped the position table for rotary embeddings. They are recognised as
-encoders, so the kind is right and the shape is not:
+**Vision estimates run 1–2% low.** DINOv2 is the loosest at 98.0%: register
+tokens, layer-scale parameters and the like are not modelled. Inside the
+overhead floor's margin, but it is under rather than over.
 
-| Model | Estimate vs actual |
-|---|---|
-| `answerdotai/ModernBERT-base` | 90.75% |
-| `jinaai/jina-embeddings-v2-base-en` | 83.48% |
-| `nomic-ai/nomic-embed-text-v1.5` | 80.42% |
+**GGUF on an encoder is refused for want of trying.** Not "impossible" — the
+weakest claim in the tree, and the first one to revisit.
 
-Under, which is the dangerous direction: a screen that under-estimates admits a
-candidate that then runs out of memory at serve time. Evaluation and compression
-are unaffected — those load the real weights — so this is a caution about
-`candidates` and `optimize`, not about the numbers those produce.
-
-**DeBERTa-v3 is read as a decoder.** `microsoft/deberta-v3-base` ships a
-`config.json` with no `architectures` key, and the rule for that case — written
-when every model here was an LLM — is "assume decoder". The result is a
-confident wrong shape: 0.21B parameters and a KV cache it does not have. Its
-`model_type` says `deberta-v2` and is not consulted. Other encoders are
-unaffected, because they all name their architecture.
-
-**A DINOv2 classifier reports the wrong sequence length.** Its config advertises
-`image_size: 518` (1370 patch tokens) because that is what its position table was
-trained at, while its image processor crops to 224 (257 tokens) — so that is what
-actually runs. The recorded evaluation context says 1370, and the memory screen
-models five times the activations it needs. The estimate errs high, so it would
-reject a configuration that fits rather than accept one that does not, and no
-runtime serves vision anyway. The accuracy numbers are unaffected. ViT, DeiT and
-BEiT are unaffected: their config and their processor agree.
+**No runtime serves a vision model**, so `candidates` and `optimize` have
+nothing to search and the pipeline stops after quality and size.
