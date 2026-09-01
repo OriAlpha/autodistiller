@@ -269,8 +269,9 @@ this for your actual GPU, marking what it can and cannot run.
 
 Decoder-only LLMs throughout — Llama, Qwen, Mistral, Phi and friends, plus the
 language half of a VLM. **Encoder / embedding models** (BERT, BGE, E5, GTE,
-MiniLM, RoBERTa) work end to end as well. **Vision transformers** (ViT, DeiT)
-go as far as there is a runtime to take them:
+MiniLM, RoBERTa, and the modern blocks — DeBERTa-v3, ModernBERT, Nomic, Jina)
+work end to end as well. **Vision transformers** (ViT, DeiT, BEiT, DINOv2) go as
+far as there is a runtime to take them:
 
 | | LLMs | Embedding models | Vision (ViT) |
 |---|---|---|---|
@@ -293,7 +294,10 @@ text; and **serving**, because vLLM 0.27's registry has no
 `PrithviGeoSpatialMAE`, routed out to terratorch). So `candidates` and
 `optimize` say there is nothing to search rather than printing a launch command
 that cannot work, while `evaluate`, `compress` and `compare` work end to end.
-Staged and convolutional backbones (Swin, ConvNeXt) are refused: their width
+An encoder whose feed-forward is gated is sized as such rather than as a classic
+BERT block — counting two matrices where there are three under-estimated Nomic
+by a fifth, and under is the direction that admits a candidate which then runs
+out of memory. Staged and convolutional backbones (Swin, ConvNeXt) are refused: their width
 changes every stage, so one `hidden_size` does not describe them.
 
 Measured on an RTX 5070, `bge-small-en-v1.5` against a real vLLM pooling server:
