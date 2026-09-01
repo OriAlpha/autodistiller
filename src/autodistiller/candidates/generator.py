@@ -20,6 +20,7 @@ from dataclasses import dataclass, field, replace
 
 from ..compression.methods import METHODS, CompressionMethod, check_method, resolve_method
 from ..metadata.profiles import GPUProfile
+from ..serving.backends import resolve_backend
 from .memory import MemoryEstimate, estimate_memory
 from .shape import ModelShape
 from .speculative import SpeculativeSpec
@@ -27,7 +28,7 @@ from .speculative import SpeculativeSpec
 DEFAULT_CONTEXT_LENGTHS = (2048, 4096, 8192)
 
 ENCODER_BATCH_SIZES = (1, 8, 32)
-"""Texts per request, searched for an encoder and fixed at one otherwise.
+"""Texts (or images) per request, searched for an encoder and fixed at one otherwise.
 
 The dimension that actually moves an embedding server's throughput. A generation
 request carries one prompt and is batched by the runtime's scheduler; an
@@ -138,6 +139,27 @@ class CandidateSet:
     def baseline(self) -> Candidate | None:
         return next((c for c in self.accepted if c.is_baseline), None)
 
+    @property
+    def blocking_reason(self) -> str | None:
+        """The one reason that rejected the entire search space, if there is one.
+
+        Not the same information as the rejection summary. When nothing was
+        accepted and every rejection shares a reason, that reason *is* the
+        result -- "no runtime here serves a vision model" -- and printing it
+        under a table of thirty-six identically doomed rows buries it. Returns
+        None whenever anything was accepted, or when the rejections disagree.
+        """
+        if self.accepted or not self.rejected:
+            return None
+        shared = set(self.rejected[0].reasons)
+        for rejection in self.rejected[1:]:
+            shared &= set(rejection.reasons)
+            if not shared:
+                return None
+        # The most specific of the shared reasons: the longest one carries the
+        # most detail, and a tie between equally shared reasons is arbitrary.
+        return max(shared, key=len) if shared else None
+
     def rejection_summary(self) -> dict[str, int]:
         """How many candidates each reason removed, most common first."""
         counts: dict[str, int] = {}
@@ -175,6 +197,12 @@ def _sort_key(candidate: Candidate) -> tuple:
 
 
 def _context_lengths(shape: ModelShape, requested: tuple[int, ...] | None) -> list[int]:
+    if shape.is_vision:
+        # Not an axis at all. A vision tower's sequence is its patch grid plus
+        # the class token, decided when the checkpoint was trained; any other
+        # value describes a model that does not exist, so searching over it
+        # would enumerate configurations nothing can serve.
+        return [shape.n_image_tokens]
     default = ENCODER_SEQUENCE_LENGTHS if shape.is_encoder else DEFAULT_CONTEXT_LENGTHS
     lengths = requested or default
     # A context longer than the model's positional range is not a candidate,
@@ -205,8 +233,22 @@ def generate_candidates(
 
     # An FP8 KV cache is not a dimension when there is no cache to hold. Left as
     # one, every encoder candidate would be enumerated twice, identically.
-    if shape.is_encoder:
+    if not shape.has_kv_cache:
         kv_dtypes = ("auto",)
+
+    # A candidate is a configuration to *serve*, so a runtime that cannot serve
+    # this kind of model at all rejects every one of them for the same reason.
+    # Named once here rather than discovered per candidate, and phrased as a
+    # rejection rather than an empty list: "no runtime serves a vision tower"
+    # is an answer, and a silently empty search space is not.
+    try:
+        unservable_kind = (
+            None
+            if resolve_backend(backend).serves(shape.kind)
+            else f"backend: {backend} has no server for a {shape.kind} model"
+        )
+    except KeyError:  # an unknown backend name is the caller's problem, not ours
+        unservable_kind = None
 
     chosen: list[CompressionMethod | None] = [None] if include_baseline else []
     names = methods or tuple(METHODS)
@@ -227,10 +269,11 @@ def generate_candidates(
     if speculative is not None:
         speculations.append(speculative)
 
-    # Only an encoder searches it. A generation request carries one prompt and
-    # is batched by the runtime's own scheduler, so offering the dimension there
-    # would enumerate identical candidates.
-    batch_sizes = ENCODER_BATCH_SIZES if shape.is_encoder else (1,)
+    # Only an encoder searches it -- of either kind, texts per request or images
+    # per request. A generation request carries one prompt and is batched by the
+    # runtime's own scheduler, so offering the dimension there would enumerate
+    # identical candidates.
+    batch_sizes = (1,) if shape.has_kv_cache else ENCODER_BATCH_SIZES
 
     # Zero always, for the same reason: a depth is only worth searching against
     # the same recipe at full depth, or there is nothing to read the cost off.
@@ -242,6 +285,8 @@ def generate_candidates(
                 for kv_dtype in kv_dtypes:
                     for spec, batch_size in ((s, b) for s in speculations for b in batch_sizes):
                         reasons: list[str] = []
+                        if unservable_kind:
+                            reasons.append(unservable_kind)
 
                         if method is not None:
                             availability = check_method(

@@ -16,7 +16,13 @@ def test_presets_are_all_resolvable():
     for name in PRESETS:
         task = resolve_task(name)
         assert task.name == name
-        assert task.kind in {"perplexity", "multiple_choice", "embedding", "retrieval"}
+        assert task.kind in {
+            "perplexity",
+            "multiple_choice",
+            "embedding",
+            "retrieval",
+            "image_classification",
+        }
 
 
 def test_preset_limit_is_applied():

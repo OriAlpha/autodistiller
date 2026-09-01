@@ -16,9 +16,16 @@ from typing import Any
 
 import torch
 import transformers
-from transformers import AutoConfig, AutoModel, AutoModelForCausalLM, AutoTokenizer
+from transformers import (
+    AutoConfig,
+    AutoImageProcessor,
+    AutoModel,
+    AutoModelForCausalLM,
+    AutoModelForImageClassification,
+    AutoTokenizer,
+)
 
-from ..architecture import ENCODER, kind_of_config
+from ..architecture import ENCODER, VISION, kind_of_config
 from ..metadata.hashing import hash_obj
 from ..results import ModelInfo
 
@@ -92,9 +99,24 @@ def resolve_dtype(requested: str, device: torch.device) -> torch.dtype:
     return torch.float32  # CPU fp16 is slow and often unsupported
 
 
-def resolve_context_length(config: Any, override: int | None) -> int:
+def resolve_context_length(config: Any, override: int | None, image_size: int | None = None) -> int:
+    """The sequence length a run will actually use.
+
+    ``image_size`` is what a vision model's own processor produces, which is not
+    always what its config advertises: DINOv2 stores a position table for 518
+    pixels and its processor crops to 224, so the config says 1370 tokens and
+    257 run. Recording the first would describe something that did not happen.
+    """
     if override:
         return override
+    if kind_of_config(config) == VISION:
+        # Fixed by the patch grid rather than advertised: one token per patch
+        # plus the class token. The 2048 default below would be a number this
+        # model cannot be asked for.
+        patch = getattr(config, "patch_size", None)
+        image = image_size if isinstance(image_size, int) else getattr(config, "image_size", None)
+        if isinstance(patch, int) and isinstance(image, int) and patch > 0:
+            return (image // patch) ** 2 + 1
     for attr in ("max_position_embeddings", "n_positions", "seq_length", "max_seq_len"):
         value = getattr(config, attr, None)
         if isinstance(value, int) and value > 0:
@@ -151,6 +173,23 @@ def gguf_file_in(model_id: str) -> str | None:
     return found[0].name if found else None
 
 
+def _processor_image_size(processor: Any) -> int | None:
+    """The image side this processor produces, or None if it is a tokenizer.
+
+    Crop wins over resize where there is one: it is applied last, so it is the
+    size the model actually sees.
+    """
+    for attribute in ("crop_size", "size"):
+        spec = getattr(processor, attribute, None)
+        if spec is None:
+            continue
+        for key in ("height", "width", "shortest_edge"):
+            value = spec[key] if isinstance(spec, dict) else getattr(spec, key, None)
+            if isinstance(value, int) and value > 0:
+                return value
+    return None
+
+
 def auto_class_for(config: Any) -> Any:
     """The Auto class that loads this architecture.
 
@@ -160,11 +199,21 @@ def auto_class_for(config: Any) -> Any:
     smaller. Guessing wrong is not subtle: ``AutoModelForCausalLM`` on a BERT
     checkpoint either refuses or silently attaches a randomly initialised head.
 
+    An image classifier is the opposite case: its head is the whole point, since
+    the label it predicts is what the task scores. ``AutoModel`` there would
+    load the tower and drop the classifier, and the run would report an accuracy
+    measured on nothing.
+
     An architecture matching neither shape keeps the causal LM. Loading is not
     the memory screen: getting it wrong raises immediately and loudly, so the
     default that has always worked is the right one to fall back to.
     """
-    return AutoModel if kind_of_config(config) == ENCODER else AutoModelForCausalLM
+    kind = kind_of_config(config)
+    if kind == ENCODER:
+        return AutoModel
+    if kind == VISION:
+        return AutoModelForImageClassification
+    return AutoModelForCausalLM
 
 
 def load_model(spec: Any) -> LoadedModel:
@@ -185,10 +234,24 @@ def load_model(spec: Any) -> LoadedModel:
         common["gguf_file"] = gguf_file
 
     config = AutoConfig.from_pretrained(spec.id, **common)
-    tokenizer = AutoTokenizer.from_pretrained(spec.id, use_fast=True, **common)
-    if tokenizer.pad_token_id is None:
-        # Needed for batched evaluation; padded positions are always masked out.
-        tokenizer.pad_token = tokenizer.eos_token
+    if kind_of_config(config) == VISION:
+        # A vision tower has no tokenizer to load -- asking for one raises. What
+        # it has instead is an image processor, and it is not interchangeable
+        # cosmetics: the resize, crop and normalisation it applies are part of
+        # how the checkpoint was trained, so scoring with the wrong ones costs
+        # real accuracy. It rides in the same field because every caller that
+        # touches it already knows which kind of model it has.
+        # `use_fast` is left off deliberately, and False rather than default on
+        # Transformers v5: the fast processors resize through torchvision, which
+        # is a second heavyweight install, and their resampling does not match
+        # the PIL pipeline the published accuracies were measured with. This is
+        # a reference measurement, so it uses the reference preprocessing.
+        tokenizer: Any = AutoImageProcessor.from_pretrained(spec.id, use_fast=False, **common)
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(spec.id, use_fast=True, **common)
+        if tokenizer.pad_token_id is None:
+            # Needed for batched evaluation; padded positions are always masked out.
+            tokenizer.pad_token = tokenizer.eos_token
 
     load_kwargs: dict[str, Any] = {**common, _DTYPE_KWARG: dtype}
     if spec.attn_implementation:
@@ -210,7 +273,9 @@ def load_model(spec: Any) -> LoadedModel:
         dtype=str(dtype).replace("torch.", ""),
         device=str(device),
         n_parameters=sum(p.numel() for p in model.parameters()),
-        context_length=resolve_context_length(config, spec.max_position_embeddings),
+        context_length=resolve_context_length(
+            config, spec.max_position_embeddings, _processor_image_size(tokenizer)
+        ),
         vocab_size=getattr(config, "vocab_size", None),
         weights_size_bytes=_weights_size_bytes(model),
         architecture_fingerprint=_architecture_fingerprint(model),

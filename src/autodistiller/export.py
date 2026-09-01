@@ -30,6 +30,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from .architecture import model_kind
 from .compression.pipeline import ARTIFACT_SIDECAR
 from .compression.prune import PRUNE_SCHEME
 from .metadata.environment import EnvironmentInfo
@@ -64,6 +65,14 @@ MANIFEST_SCHEMA_VERSION = 1
 
 WEIGHT_PATTERNS = ("*.safetensors", "*.bin", "*.pt")
 TOKENIZER_FILES = ("tokenizer.json", "tokenizer.model", "tokenizer_config.json", "vocab.json")
+
+IMAGE_PROCESSOR_FILES = ("preprocessor_config.json",)
+"""What a vision checkpoint carries instead of a tokenizer.
+
+Same job under a different name: it is the file that says how to turn an input
+into the tensors the weights expect. Without it in the list, a perfectly good
+ViT artifact is reported as unservable for missing a tokenizer it never had.
+"""
 
 SERVABLE_QUANT_METHODS = {
     "vllm": {
@@ -195,12 +204,19 @@ def inspect_artifact(directory: Path, *, backend: str = "vllm") -> list[Check]:
         )
     )
 
+    # Whichever this model uses. A text model has a tokenizer and a vision model
+    # has an image processor, and an artifact missing its own is equally
+    # undeployable either way -- so the check is "can this turn an input into
+    # tensors", not "is there a tokenizer".
+    processor = [name for name in IMAGE_PROCESSOR_FILES if (directory / name).is_file()]
     tokenizer = [name for name in TOKENIZER_FILES if (directory / name).is_file()]
     checks.append(
         Check(
-            "tokenizer",
-            bool(tokenizer),
-            ", ".join(tokenizer) if tokenizer else "no tokenizer files; the server cannot encode",
+            "tokenizer" if not processor or tokenizer else "processor",
+            bool(tokenizer or processor),
+            ", ".join(tokenizer + processor)
+            if (tokenizer or processor)
+            else "no tokenizer files; the server cannot encode",
         )
     )
 
@@ -312,7 +328,9 @@ class ExportManifest(BaseModel):
         return cls.model_validate_json(Path(path).read_text(encoding="utf-8"))
 
 
-def _serve_command(backend: str, path: str, max_model_len: int | None) -> str:
+def _serve_command(
+    backend: str, path: str, max_model_len: int | None, model_kind: str | None = None
+) -> str:
     """The command that serves this artifact, as that runtime spells it.
 
     Two things a raw ``launch_command`` call gets wrong, and both are silent.
@@ -323,6 +341,13 @@ def _serve_command(backend: str, path: str, max_model_len: int | None) -> str:
     the machine it was exported to.
     """
     runtime = resolve_backend(backend)
+    if not runtime.serves(model_kind):
+        # There is no command. Saying so is the honest export; printing one that
+        # cannot work makes the bundle look deployable when it is not.
+        return (
+            f"# no serving backend here runs a {model_kind} model. "
+            f"The weights and the recipe are complete; the runtime is what is missing."
+        )
     return runtime.launch_command(runtime.model_path(path), max_model_len=max_model_len)
 
 
@@ -426,7 +451,16 @@ def build_manifest(
         deployment=record.deployment,
         hardware=record.hardware,
         environment=record.environment,
-        serve_command=_serve_command(backend, served, max_model_len),
+        serve_command=_serve_command(
+            backend,
+            served,
+            max_model_len,
+            # A list, because the record stores one architecture name and
+            # `model_kind` takes the config's list of them. Handed the bare
+            # string it iterates characters, matches no suffix, and answers
+            # "unknown" -- which reads as servable.
+            model_kind=model_kind([record.model.architecture]),
+        ),
         reproduce=_reproduce_commands(record, artifact),
         gguf=gguf_note(
             artifact_format(directory) if directory else None,

@@ -5,6 +5,115 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-09-01
+
+### Added
+
+- **Vision transformers are evaluated and compressed.** ViT and DeiT go through
+  `evaluate` -> `compress` -> `compare` with the same machinery as everything
+  else: a third model kind (`vision`) beside decoder and encoder, its own shape
+  arithmetic (a patch grid instead of a vocabulary, no KV cache), and top-1 /
+  top-5 accuracy as the quality metric.
+
+  Measured on `google/vit-base-patch16-224`, 2048 ImageNet validation images:
+  `int8-weight-only` holds 100.0% of top-1 at 84.7 MiB against 165.1 MiB, and
+  `fp8` holds 100.4% at 83.6 MiB. The parameter estimate lands within 0.15% of
+  what the checkpoint actually loads, and the artifact size estimates within 1%
+  of what was written.
+
+- **Two ImageNet presets, because image quality is part of the measurement.**
+  `imagenet` is an ungated 870 MB mirror whose images were resized to a
+  256-pixel short side and re-encoded; `imagenet-original` is the same 50k
+  validation images at original quality, 6.7 GB. The difference is not
+  cosmetic: the same checkpoint through the same processor scores 78.0% on the
+  first and 79.8% on the second.
+
+  With timm's eval transform on the originals the same code scores 81.40%
+  against a published 81.4-81.8%, which is the check that the implementation is
+  right rather than merely self-consistent. The 1.4 points between that and
+  AutoDistiller's own number are the preprocessing recipe: the tool uses the
+  *checkpoint's own* image processor, which is what a server would do, and not
+  the resize-and-crop the papers measured with. Reproduced on DeiT-B/16.
+
+- **`DatasetSpec.data_files`**, naming the files a split lives in. Asking
+  `datasets` for a split by name alone downloads every file in the repo first,
+  which is fine for wikitext and was 26 GB for an image corpus whose validation
+  half is under one.
+
+- **`img:` task prefix** for a local JSONL image set, beside `ppl:` and `mc:`.
+
+### Changed
+
+- **A limit on an image task takes evenly spaced rows, not the first N.** An
+  ImageNet validation split is stored sorted by class -- 50 tench, then 50
+  goldfish -- so the first 256 rows are five classes out of a thousand, and an
+  accuracy over them is a number about those five.
+
+- **The generation smoke test is skipped for models that cannot generate**,
+  rather than attempted and recorded as a failed run. Encoders were already in
+  this position.
+
+- **An empty search space reports why.** When one reason rejected every
+  candidate, `candidates` and `optimize` print that reason instead of a table of
+  identically doomed rows and a summary naming whichever constraint happened to
+  be passed.
+
+### Fixed
+
+- **Modern encoder blocks are no longer under-estimated by up to a fifth.** The
+  encoder arithmetic described the original BERT block -- two-matrix
+  feed-forward, learned position table -- and several embedding models have
+  since replaced both. ModernBERT came out at 90.75% of its real parameter
+  count, Jina v2 at 83.48%, Nomic v1.5 at 80.42%; all three now land above
+  99.5%. Under is the direction that admits a candidate which then runs out of
+  memory at serve time, so this was the dangerous half of being approximate.
+
+  A config that names a gated activation (`swiglu`, `geglu`, `glu`) or a
+  non-absolute position type is now read correctly on its own. The three above
+  say neither -- ModernBERT's config even claims `position_embedding_type:
+  absolute` while using rotary -- so they are corrected by architecture stem,
+  each entry carrying its measured before and after.
+
+- **A config with no `architectures` is no longer assumed to be a decoder.**
+  DeBERTa-v3 ships one, and reading it as a decoder gave it a gated MLP and a
+  KV cache it does not have: 0.21B estimated against the 184M its own model
+  card states. `model_type` is consulted first now, and says `deberta-v2`. The
+  decoder fallback remains for a config that says nothing at all, which is what
+  a local or hand-written one has always been treated as.
+
+- **A vision model's sequence length comes from its processor, not its config.**
+  DINOv2 was trained at 518 pixels and stores a position table with a row per
+  patch at that resolution, while its own processor centre-crops to 224. The
+  run record said 1370 tokens where 257 ran, and the memory screen modelled five
+  times the activations. The two are now separate numbers: the table belongs to
+  the weights, the sequence to the forward pass. ViT, DeiT and BEiT are
+  unchanged, their config and processor agreeing.
+
+### Refused, with reasons
+
+- **No serving backend runs a vision tower.** vLLM 0.27's registry has no
+  `ForImageClassification` entry -- its one image tower is
+  `PrithviGeoSpatialMAE`, routed out to terratorch -- so the candidate
+  generator says there is nothing to search rather than printing a `vllm serve`
+  command that cannot work. The artifacts are real and measurable; what is
+  missing is a runtime.
+
+- **Calibrated methods and depth pruning do not apply to a vision model.** Both
+  work by pushing sample *text* through a tokenizer, and a vision tower has
+  neither. That leaves `int8-weight-only` and `fp8`, the two that need no
+  calibration pass.
+
+- **Staged and convolutional backbones are refused rather than mis-estimated.**
+  Swin doubles its width every stage and ConvNeXt has no attention at all, so
+  neither is described by one `hidden_size` and one block count.
+
+### Dependencies
+
+- `pillow` and `torchvision`, both load-bearing for image tasks: `datasets`
+  decodes an image column through PIL, and Transformers v5 dropped its
+  PIL-based image processors, so `AutoImageProcessor` resizes through
+  torchvision or not at all.
+
 ## [1.1.0] - 2026-08-31
 
 ### Added
@@ -524,7 +633,9 @@ First release. Phase 1 of the roadmap: the evaluation engine.
 - Metadata capture for hardware, CUDA, and library versions.
 - CLI: `env`, `tasks`, `evaluate`, `compare`, `runs`, `show`.
 
-[Unreleased]: https://github.com/OriAlpha/Autodistiller/compare/v1.0.1...HEAD
+[Unreleased]: https://github.com/OriAlpha/Autodistiller/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/OriAlpha/Autodistiller/releases/tag/v1.2.0
+[1.1.0]: https://github.com/OriAlpha/Autodistiller/releases/tag/v1.1.0
 [1.0.1]: https://github.com/OriAlpha/Autodistiller/releases/tag/v1.0.1
 [1.0.0]: https://github.com/OriAlpha/Autodistiller/releases/tag/v1.0.0
 [0.3.0]: https://github.com/OriAlpha/Autodistiller/releases/tag/v0.3.0

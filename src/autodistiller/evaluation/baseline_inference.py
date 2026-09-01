@@ -1,4 +1,4 @@
-"""Greedy generation smoke test.
+"""Greedy generation smoke test, for models that generate.
 
 This proves the loaded model actually produces text, captures its output so
 drift is human-inspectable, and records rough timings.
@@ -23,6 +23,15 @@ from ..results import GenerationSample, InferenceResult
 @torch.inference_mode()
 def run_baseline_inference(handle: LoadedModel, spec: BaselineInferenceSpec) -> InferenceResult:
     if not spec.enabled or not spec.prompts:
+        return InferenceResult()
+
+    # An encoder or a vision tower has nothing to generate: no head that
+    # predicts a next token, and for a vision tower no tokenizer to build a
+    # prompt with either. Transformers answers this itself, so the check is its
+    # answer rather than a second list of which kinds can. Skipped rather than
+    # attempted-and-failed: a smoke test that does not apply is not a failure of
+    # the model, and recording it as one would mark every such run failed.
+    if not handle.model.can_generate():
         return InferenceResult()
 
     tokenizer = handle.tokenizer

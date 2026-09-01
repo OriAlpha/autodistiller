@@ -22,14 +22,16 @@ import sys
 import time
 import traceback
 from pathlib import Path
+from typing import Any
 
 ALGORITHMS = ("rtn", "gptq", "awq")
 
 DECODER_SUFFIXES = ("ForCausalLM", "ForConditionalGeneration")
+VISION_SUFFIXES = ("ForImageClassification",)
 """Deliberately a copy of ``autodistiller.architecture``.
 
 This file runs in its own environment and imports nothing from AutoDistiller, so
-the six lines below are duplicated rather than shared. Keeping them in step is
+the lines below are duplicated rather than shared. Keeping them in step is
 cheaper than the alternative, which is installing AutoDistiller into an
 environment that exists to hold a conflicting transformers pin.
 """
@@ -117,8 +119,17 @@ def _load_model(job: dict):
     quantized. Returns the model and what to leave alone: ``lm_head`` is a
     decoder's output layer, and naming a module the model does not have is not
     something the backend has to tolerate.
+    An image classifier has the opposite problem: its head is not incidental,
+    it is the thing being measured, and ``AutoModel`` would drop it. Saving a
+    tower with no classifier produces an artifact that loads with a randomly
+    initialised one -- which does not fail, it just scores like noise.
     """
-    from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
+    from transformers import (
+        AutoConfig,
+        AutoModel,
+        AutoModelForCausalLM,
+        AutoModelForImageClassification,
+    )
 
     model_id = job["model_id"]
     common = {"trust_remote_code": job.get("trust_remote_code", False)}
@@ -126,8 +137,15 @@ def _load_model(job: dict):
     config = AutoConfig.from_pretrained(model_id, **common)
     names = [str(n) for n in (getattr(config, "architectures", None) or ())]
     is_decoder = not names or any(name.endswith(DECODER_SUFFIXES) for name in names)
+    is_vision = any(name.endswith(VISION_SUFFIXES) for name in names)
 
-    auto_class = AutoModelForCausalLM if is_decoder else AutoModel
+    auto_class: Any
+    if is_decoder:
+        auto_class = AutoModelForCausalLM
+    elif is_vision:
+        auto_class = AutoModelForImageClassification
+    else:
+        auto_class = AutoModel
     dtype = _resolve_dtype(job, config)
     model = auto_class.from_pretrained(
         model_id,
@@ -151,12 +169,34 @@ def _load_model(job: dict):
     return model, ignore
 
 
+def _load_preprocessor(model_id: str, model, common: dict):
+    """The tokenizer or the image processor, whichever this model has.
+
+    Saved into the artifact either way: a compressed checkpoint that cannot say
+    how to turn an input into tensors is not deployable, and for an image model
+    those numbers are not a default anyone can guess.
+    """
+    names = [str(n) for n in (getattr(model.config, "architectures", None) or ())]
+    if any(name.endswith(VISION_SUFFIXES) for name in names):
+        from transformers import AutoImageProcessor
+
+        return AutoImageProcessor.from_pretrained(model_id, **common)
+
+    from transformers import AutoTokenizer
+
+    return AutoTokenizer.from_pretrained(model_id, **common)
+
+
 def _build_calibration_dataset(job: dict, tokenizer):
     """Tokenize the caller's calibration texts.
 
     AutoDistiller supplies the text rather than naming a dataset for
     llmcompressor to fetch, so the calibration data is fingerprinted upstream
     and the same bytes are reproducible later.
+
+    Text only. A vision tower would need calibration *images* pushed through
+    its own processor, so the methods that need calibration are refused for one
+    upstream rather than half-implemented here.
     """
     texts = job.get("calibration_texts") or []
     if not texts:
@@ -191,17 +231,19 @@ def run(job: dict) -> dict:
         raise ValueError(f"unknown algorithm {job['algorithm']!r}; expected one of {ALGORITHMS}")
 
     from llmcompressor import oneshot
-    from transformers import AutoTokenizer
 
     model_id = job["model_id"]
     output_dir = job["output_dir"]
     common = {"trust_remote_code": job.get("trust_remote_code", False)}
 
-    tokenizer = AutoTokenizer.from_pretrained(model_id, **common)
     model, ignore = _load_model(job)
+    # A vision tower has no tokenizer to load or to save beside the weights;
+    # what has to travel with it is the image processor, because the resize and
+    # normalisation it applies are part of the checkpoint.
+    preprocessor = _load_preprocessor(model_id, model, common)
 
     modifier = _build_modifier(job, ignore)
-    dataset = _build_calibration_dataset(job, tokenizer)
+    dataset = _build_calibration_dataset(job, preprocessor)
 
     oneshot_kwargs: dict = {
         "model": model,
@@ -220,7 +262,7 @@ def run(job: dict) -> dict:
         )
 
     oneshot(**oneshot_kwargs)
-    tokenizer.save_pretrained(output_dir)
+    preprocessor.save_pretrained(output_dir)
 
     return {
         "ok": True,

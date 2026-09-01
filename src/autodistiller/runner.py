@@ -19,6 +19,7 @@ from collections.abc import Callable
 from .cache import experiment_key
 from .config import (
     EmbeddingTask,
+    ImageClassificationTask,
     MultipleChoiceTask,
     PerplexityTask,
     RetrievalTask,
@@ -29,11 +30,13 @@ from .determinism import seed_everything
 from .evaluation.baseline_inference import run_baseline_inference
 from .evaluation.datasets import (
     check_dataset_available,
+    load_image_classification,
     load_multiple_choice,
     load_sentence_pairs,
     load_text_corpus,
 )
 from .evaluation.embedding import evaluate_embedding, evaluate_retrieval
+from .evaluation.image_classification import evaluate_image_classification
 from .evaluation.multiple_choice import evaluate_multiple_choice
 from .evaluation.perplexity import evaluate_perplexity
 from .evaluation.preprocessors import get_preprocessor
@@ -111,6 +114,18 @@ def _run_task(handle, task: TaskSpec, observer: RunObserver) -> TaskResult:
 
     if isinstance(task, RetrievalTask):
         return evaluate_retrieval(handle, task, progress=observer.task_progress)
+
+    if isinstance(task, ImageClassificationTask):
+        return evaluate_image_classification(
+            handle,
+            task,
+            dataset=load_image_classification(
+                task.dataset,
+                image_column=task.image_column,
+                label_column=task.label_column,
+            ),
+            progress=observer.task_progress,
+        )
 
     raise TypeError(f"unsupported task kind: {type(task).__name__}")
 

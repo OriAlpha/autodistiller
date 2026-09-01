@@ -127,8 +127,20 @@ def build_prune_job(
     the CLI and the optimizer reach a pruned artifact by the same path and land
     on the same content-addressed directory.
     """
+    from ..architecture import VISION
     from ..evaluation.datasets import load_text_corpus
-    from .pipeline import artifact_dir
+    from .pipeline import artifact_dir, model_kind_of
+
+    if model_kind_of(model) == VISION:
+        # Block influence is measured by pushing calibration *text* through the
+        # model and watching the residual stream. A vision tower has no
+        # tokenizer to build that input with, so the score would have to come
+        # from images -- a different implementation, not a different argument.
+        raise ValueError(
+            f"{model.id} is a vision model. Depth pruning scores blocks against "
+            f"calibration text pushed through a tokenizer, and this model has "
+            f"neither, so there is nothing to score it with here."
+        )
 
     if calibration is None:
         raise ValueError(

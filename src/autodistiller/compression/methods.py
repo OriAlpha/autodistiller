@@ -26,7 +26,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from ..architecture import DECODER, ENCODER
+from ..architecture import DECODER, ENCODER, VISION
 from ..metadata.profiles import GPUProfile, capabilities_for
 
 
@@ -63,6 +63,10 @@ class CompressionMethod:
     front of it. AWQ is the case that forced this -- it smooths activations
     through architecture-specific mappings, and llmcompressor's registry holds
     only decoders, so on an encoder it matches nothing and divides by zero.
+
+    Vision is opted into rather than assumed, and only by the methods that need
+    no calibration: calibration here means pushing sample *text* through a
+    tokenizer, and a vision tower has neither.
     """
 
     notes: str = ""
@@ -152,6 +156,7 @@ METHODS: dict[str, CompressionMethod] = {
             algorithm="rtn",
             required_capability="int8",
             needs_calibration=False,
+            model_kinds=(DECODER, ENCODER, VISION),
             notes="No calibration required. The safest first candidate.",
         ),
         CompressionMethod(
@@ -188,6 +193,7 @@ METHODS: dict[str, CompressionMethod] = {
             algorithm="rtn",
             required_capability="fp8",
             needs_calibration=False,
+            model_kinds=(DECODER, ENCODER, VISION),
             notes="Dynamic activation scales, so no calibration pass. Ada (sm_89) or newer.",
         ),
         CompressionMethod(
